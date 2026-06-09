@@ -1,0 +1,51 @@
+{
+  "name": "@aauth/praca",
+  "version": "0.1.0",
+  "description": "The user's AAuth agent in MCP form — discovery, identity, interaction relay",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "aauth-praca": "./dist/server.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "aauth",
+    "mcp",
+    "agent",
+    "identity"
+  ],
+  "author": "Dick Hardt <dick.hardt@hello.coop>",
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aauth-dev/praca"
+  },
+  "dependencies": {
+    "@aauth/local-keys": "^1.1.0",
+    "@hellocoop/httpsig": "^1.6.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}
