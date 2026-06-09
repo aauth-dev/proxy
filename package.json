@@ -19,6 +19,8 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "dev": "tsx src/server.ts",
+    "watch": "reloaderoo proxy --watch src --log-frames /tmp/praca-frames.ndjson --quiet -- tsx src/server.ts",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -43,6 +45,7 @@
     "zod": "^4.0.0"
   },
   "devDependencies": {
+    "@hellocoop/reloaderoo": "file:../../HelloCoop/reloaderoo",
     "@types/node": "^20.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
