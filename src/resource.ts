@@ -98,23 +98,46 @@ function pickVocabs(advertised: Record<string, string>): PickedVocab[] {
 
 // ── Vocab doc loading + operation resolution ──
 //
-// Loaded vocab docs are cached in memory for the lifetime of the praca process.
-// Cold-start re-fetch is the only cost; for a long-lived MCP server (Claude
-// Code's typical mode) this is amortized across the whole session. Disk cache
-// at ~/.aauth/praca/catalog/{host}/{vocab}.json is a future refinement.
+// Loaded vocab docs (L3) are cached via the injectable DocCache. The default is
+// an in-memory Map for the lifetime of the praca process — cold-start re-fetch
+// is the only cost, amortized across a long-lived MCP session (Claude Code's
+// typical mode). A host can inject a shared/persistent cache (e.g. R2/KV) so
+// cold isolates don't all re-fetch large specs.
 
-const docCache = new Map<string, unknown>()
+// Cache for fetched vocabulary docs (OpenAPI/AsyncAPI specs etc.), keyed by
+// host+vocabUri. Async so non-memory backends can implement it.
+export interface DocCache {
+  get(key: string): Promise<unknown | undefined>
+  set(key: string, doc: unknown): Promise<void>
+}
+
+export function createMemoryDocCache(): DocCache {
+  const m = new Map<string, unknown>()
+  return {
+    async get(key) {
+      return m.get(key)
+    },
+    async set(key, doc) {
+      m.set(key, doc)
+    },
+  }
+}
+
+// Process-wide default so callers that don't inject a cache (e.g. agent.ts's
+// invoke path) still share one cache for the process lifetime — unchanged
+// behavior from the previous module-level Map.
+const defaultDocCache = createMemoryDocCache()
 
 function cacheKey(host: string, vocabUri: string): string {
   return `${host}|${vocabUri}`
 }
 
-async function loadDoc(host: string, vocab: PickedVocab): Promise<unknown> {
+async function loadDoc(host: string, vocab: PickedVocab, cache: DocCache): Promise<unknown> {
   const key = cacheKey(host, vocab.vocabUri)
-  let doc = docCache.get(key)
+  let doc = await cache.get(key)
   if (doc === undefined) {
     doc = await vocab.adapter.load(vocab.docUrl)
-    docCache.set(key, doc)
+    await cache.set(key, doc)
   }
   return doc
 }
@@ -132,10 +155,11 @@ function rehydrate(picked: L1Entry['picked_vocabs']): PickedVocab[] {
 export async function listOperationsForResource(
   l1: L1Entry,
   query?: string,
+  docCache: DocCache = defaultDocCache,
 ): Promise<OpSummary[]> {
   const out: OpSummary[] = []
   for (const v of rehydrate(l1.picked_vocabs)) {
-    const doc = await loadDoc(l1.resource, v)
+    const doc = await loadDoc(l1.resource, v, docCache)
     for (const summary of v.adapter.listOperations(doc, query)) {
       out.push(summary)
     }
@@ -146,10 +170,11 @@ export async function listOperationsForResource(
 export async function getOperationsForResource(
   l1: L1Entry,
   opIds: string[],
+  docCache: DocCache = defaultDocCache,
 ): Promise<OpDetail[]> {
   const out: OpDetail[] = []
   for (const v of rehydrate(l1.picked_vocabs)) {
-    const doc = await loadDoc(l1.resource, v)
+    const doc = await loadDoc(l1.resource, v, docCache)
     for (const detail of v.adapter.getOperations(doc, opIds)) {
       out.push(detail)
     }
@@ -170,9 +195,10 @@ export async function routeOperation(
   l1: L1Entry,
   opId: string,
   args: InvokeArgs,
+  docCache: DocCache = defaultDocCache,
 ): Promise<RoutedOperation> {
   for (const v of rehydrate(l1.picked_vocabs)) {
-    const doc = await loadDoc(l1.resource, v)
+    const doc = await loadDoc(l1.resource, v, docCache)
     try {
       const plan = v.adapter.buildInvocation(doc, opId, args)
       return { adapter: v.adapter, plan }

@@ -2,7 +2,9 @@
 //
 // The registry is an AAuth resource itself (access_mode: agent-token), so
 // listing requires praca's agent token + HTTP signature — the same path used
-// for any other agent-token resource. Cached at ~/.aauth/praca/catalog/registry.json.
+// for any other agent-token resource. The ETag cache is injected via
+// RegistryCache; the stdio server uses the filesystem default
+// (createFsRegistryCache), backed by ~/.aauth/praca/catalog/registry.json.
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -26,44 +28,49 @@ export interface RegistryIndex {
   resources: RegistryEntry[]
 }
 
-interface CachedIndex {
+export interface CachedIndex {
   etag?: string
   fetched: string
   index: RegistryIndex
 }
 
-const CACHE_PATH = join(homedir(), '.aauth', 'praca', 'catalog', 'registry.json')
+// ETag cache for the registry index. Async so non-filesystem backends (e.g. a
+// shared KV namespace) can implement it.
+export interface RegistryCache {
+  read(): Promise<CachedIndex | undefined>
+  write(c: CachedIndex): Promise<void>
+}
 
 export function registryUrl(): string {
   return (process.env.PRACA_REGISTRY_URL ?? 'https://registry.aauth.dev').replace(/\/+$/, '')
 }
 
-function readCache(): CachedIndex | undefined {
-  if (!existsSync(CACHE_PATH)) return undefined
-  try {
-    return JSON.parse(readFileSync(CACHE_PATH, 'utf8')) as CachedIndex
-  } catch {
-    return undefined
+// Filesystem-backed RegistryCache — the default for the stdio server. `dir`
+// overrides the state directory (default ~/.aauth/praca).
+export function createFsRegistryCache(opts: { dir?: string } = {}): RegistryCache {
+  const cachePath = join(opts.dir ?? join(homedir(), '.aauth', 'praca'), 'catalog', 'registry.json')
+  return {
+    async read() {
+      if (!existsSync(cachePath)) return undefined
+      try {
+        return JSON.parse(readFileSync(cachePath, 'utf8')) as CachedIndex
+      } catch {
+        return undefined
+      }
+    },
+    async write(c) {
+      mkdirSync(dirname(cachePath), { recursive: true })
+      writeFileSync(cachePath, JSON.stringify(c, null, 2))
+    },
   }
-}
-
-function writeCache(c: CachedIndex): void {
-  mkdirSync(dirname(CACHE_PATH), { recursive: true })
-  writeFileSync(CACHE_PATH, JSON.stringify(c, null, 2))
-}
-
-// Cheap synchronous read of the cached index — for find_resources between
-// background refreshes. Returns undefined if no cache exists yet.
-export function readCachedRegistry(): RegistryIndex | undefined {
-  return readCache()?.index
 }
 
 // Fetch the registry's /resources, signed with the agent token. Honors
 // If-None-Match against the cached ETag — on 304 returns the cached index;
 // on 200 updates the cache.
-export async function fetchRegistry(cfg: PracaConfig): Promise<RegistryIndex> {
+export async function fetchRegistry(cfg: PracaConfig, cache: RegistryCache): Promise<RegistryIndex> {
   const url = `${registryUrl()}/resources`
-  const cached = readCache()
+  const cached = await cache.read()
   const headers: Record<string, string> = { accept: 'application/json' }
   if (cached?.etag) headers['if-none-match'] = cached.etag
 
@@ -79,6 +86,6 @@ export async function fetchRegistry(cfg: PracaConfig): Promise<RegistryIndex> {
 
   const index = (await res.json()) as RegistryIndex
   const etag = res.headers.get('etag') ?? undefined
-  writeCache({ ...(etag ? { etag } : {}), fetched: new Date().toISOString(), index })
+  await cache.write({ ...(etag ? { etag } : {}), fetched: new Date().toISOString(), index })
   return index
 }

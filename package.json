@@ -7,6 +7,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./local": {
+      "types": "./dist/identity-local.d.ts",
+      "default": "./dist/identity-local.js"
     }
   },
   "bin": {
@@ -20,7 +24,6 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "dev": "tsx src/server.ts",
-    "watch": "reloaderoo proxy --watch src --log-frames /tmp/praca-frames.ndjson --quiet -- tsx src/server.ts",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -34,6 +37,9 @@
   "publishConfig": {
     "access": "public"
   },
+  "engines": {
+    "node": ">=22"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/aauth-dev/praca"
@@ -45,7 +51,6 @@
     "zod": "^4.0.0"
   },
   "devDependencies": {
-    "@hellocoop/reloaderoo": "^1.2.0",
     "@types/node": "^20.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
