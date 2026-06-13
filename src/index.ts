@@ -15,7 +15,7 @@ export type {
 } from './agent.js'
 
 export { buildPracaTools } from './tools.js'
-export type { PracaDeps } from './tools.js'
+export type { PracaDeps, InteractionContext } from './tools.js'
 
 export type { BootstrapStatus, IdentityProvider } from './identity.js'
 

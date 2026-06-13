@@ -44,12 +44,25 @@ export interface PracaDeps {
   //   'await': block — relay the interaction (onInteraction), poll until terminal
   //     (heartbeat each round via onPoll), and return the completed result on the
   //     original call. For HTTP hosts that hold a long-running tool call open.
+  //
+  // The callbacks receive an InteractionContext bound to THIS invoke request, so
+  // the host can push messages to the client over the held connection (e.g. emit
+  // an MCP progress notification carrying the interaction URL, and heartbeats).
   interaction?: {
     mode?: 'surface' | 'await'
-    onInteraction?: (url: string, code: string) => void | Promise<void>
-    onPoll?: (elapsedMs: number) => void | Promise<void>
+    onInteraction?: (url: string, code: string, ctx: InteractionContext) => void | Promise<void>
+    onPoll?: (elapsedMs: number, ctx: InteractionContext) => void | Promise<void>
     pollTimeoutMs?: number
   }
+}
+
+// Per-request hooks the host can use to talk to the client during an awaited
+// interaction. `sendNotification` writes a JSON-RPC notification to the active
+// transport; `progressToken` (if the client supplied one) correlates
+// notifications/progress frames to this call.
+export interface InteractionContext {
+  sendNotification: (n: { method: string; params?: Record<string, unknown> }) => Promise<void>
+  progressToken?: string | number
 }
 
 const text = (s: string) => ({ content: [{ type: 'text' as const, text: s }] })
@@ -309,7 +322,7 @@ export async function buildPracaTools(server: McpServer, deps: PracaDeps): Promi
         body: z.record(z.string(), z.unknown()).optional(),
       },
     },
-    async ({ resource, op_id, path_params, query, body }) => {
+    async ({ resource, op_id, path_params, query, body }, extra) => {
       const c = await getConfig()
       if (!c.ok) return text(BOOTSTRAP_GUIDANCE)
       const found = await requireL1(resource)
@@ -319,16 +332,22 @@ export async function buildPracaTools(server: McpServer, deps: PracaDeps): Promi
         // 'await' mode: block — relay + poll the interaction to completion, return
         // the result on this original call. (HTTP hosts holding a long call open.)
         if (deps.interaction?.mode === 'await') {
-          const handler = deps.interaction.onInteraction ?? (() => {})
+          const inter = deps.interaction
+          // Per-request context so host callbacks can push to the client (e.g.
+          // emit notifications/progress carrying the interaction URL + heartbeats).
+          const ctx: InteractionContext = {
+            sendNotification: (n) => extra.sendNotification(n as never),
+            progressToken: extra._meta?.progressToken,
+          }
           const completed = await invokeAtResourceComplete(
             c.cfg,
             found.l1,
             op_id,
-            handler,
+            (url, code) => inter.onInteraction?.(url, code, ctx),
             invokeArgs,
             5,
-            deps.interaction.pollTimeoutMs ?? 180_000,
-            deps.interaction.onPoll,
+            inter.pollTimeoutMs ?? 180_000,
+            (elapsedMs) => inter.onPoll?.(elapsedMs, ctx),
           )
           if (completed.status >= 200 && completed.status < 300) await l1.touch(found.l1.resource)
           return json(completed)
