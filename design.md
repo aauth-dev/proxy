@@ -1,13 +1,13 @@
 # praca — the user's AAuth agent in MCP form
 
-**Status: v1 invoke spine ✅ proven live (2026-05-25); discovery layer redesigned 2026-06-09.** praca drove the authorize-first R3 flow end-to-end against prod `person.hello.coop` + a real proxy, signing with the bootstrapped `@aauth/local-keys` (enclave) identity. Discovery now generalizes to multi-resource: signed-call registry client, three-layer state (added / discoverable / per-resource ops), vocabulary-adapter abstraction (OpenAPI today, AsyncAPI partial, MCP-tools/GraphQL later). Token-bloat research (Cloudflare Code Mode ~99.9% cut, Anthropic ~98.7%, Speakeasy ~100×) validates the meta-tool/hierarchical pattern we already landed on. v.next (sub-agents, WASM runtime) is still ahead. Repo split + roadmap: `v1-plan.md`.
+**Status: v1 invoke spine ✅ proven live (2026-05-25); discovery layer redesigned 2026-06-09.** praca drives the authorize-first R3 flow end-to-end against a real Person Server + AAuth resource, signing with the bootstrapped `@aauth/local-keys` identity. Discovery generalizes to multi-resource: signed-call registry client, three-layer state (added / discoverable / per-resource ops), vocabulary-adapter abstraction (OpenAPI today, AsyncAPI partial, MCP-tools/GraphQL later). v.next (sub-agents, WASM runtime) is still ahead.
 
-Reference implementation of an AAuth agent for MCP-aware agent hosts. praca represents the user as an AAuth agent, exposes that agent's capabilities to an LLM via MCP, and relays AAuth interactions to PS. Published as `@aauth/praca` from `aauth-dev/praca`.
+Reference implementation of an AAuth agent for MCP-aware agent hosts. praca represents the user as an AAuth agent, exposes that agent's capabilities to an LLM via MCP, and relays AAuth interactions to the user's Person Server. Published as `@aauth/praca` from `aauth-dev/praca`.
 
 ## Objectives
 
 1. Demonstrate AAuth's value end-to-end: cross-domain agent access with genuine user oversight.
-2. Give MCP hosts (Claude Desktop, Claude Code, NanoClaw, CLI tools) access to popular services via a single integration.
+2. Give MCP hosts (Claude Code, Claude Desktop, Cursor, CLI tools) access to AAuth resources via a single integration.
 3. Reusable across agent platforms. Nothing in praca is host-specific.
 4. No raw credentials in praca. praca's compromise surface is one AAuth agent identity, not a vault of third-party credentials.
 5. Cryptographic identity per user. Parent agent keypair (software) + AP signing key (enclave-backed via `@aauth/local-keys`).
@@ -18,7 +18,7 @@ Reference implementation of an AAuth agent for MCP-aware agent hosts. praca repr
 
 ```
 ┌──────────────────────────────────────────────────┐
-│ Agent host  (Claude Desktop / NanoClaw / CLI)    │
+│ Agent host  (Claude Code / Claude Desktop / CLI) │
 │                                                  │
 │   LLM ──MCP tool calls─────────┐                 │
 └────────────────────────────────┼─────────────────┘
@@ -43,7 +43,7 @@ Reference implementation of an AAuth agent for MCP-aware agent hosts. praca repr
                 │ auth_tokens, hosts user
                 │ approval flows
    ┌────────────┴────────────────────────────────┐
-   │ PS  (person.hello.coop or other)            │
+   │ Person Server (e.g. person.hello.coop)      │
    └─────────────────────────────────────────────┘
 ```
 
@@ -87,7 +87,7 @@ Each saved function is a real MCP tool surfaced in `tools/list` via `notificatio
 
 ## Transport
 
-stdio MCP server in v1. The same code can be exposed over HTTP for container-resident hosts (e.g., NanoClaw reaching praca at `host.docker.internal`); host-launched stdio ships first.
+stdio MCP server in v1. The same code can be exposed over HTTP for container-resident hosts (reaching praca at `host.docker.internal`); host-launched stdio ships first.
 
 ## State
 
@@ -127,9 +127,9 @@ The discovery layer is built around the three-layer state model (`L1` added / `L
 
 ### L2 — discoverable resources (the registry)
 
-The registry at `registry.aauth.dev` is a live agent-token-gated Worker (KV + R2; see `~/github/AAuth-dev/registry`). praca calls `GET /resources` over a **signed** request using the same agent-token + HTTP-signature path it already uses for any AAuth resource. The response is `{ resources: RegistryEntry[], updated }`; each entry carries `{ issuer, name, description, access_mode, logo_uri?, added, submitted_by }` — and only that. praca caches at `~/.aauth/praca/catalog/registry.json`, refreshes on startup + 24h background, ETag-conditional.
+The registry at `registry.aauth.dev` is an agent-token-gated Worker. praca calls `GET /resources` over a **signed** request using the same agent-token + HTTP-signature path it already uses for any AAuth resource. The response is `{ resources: RegistryEntry[], updated }`; each entry carries `{ issuer, name, description, access_mode, logo_uri?, added, submitted_by }` — and only that. praca caches at `~/.aauth/praca/catalog/registry.json`, refreshes on startup + 24h background, ETag-conditional.
 
-`PRACA_REGISTRY_URL` overrides the default for tests / self-hosted registries.
+`PRACA_REGISTRY_URL` overrides the default for tests / self-hosted registries. Operators may also publish their own resource directory: for example, Hello's Ponte operator advertises its hosted proxies at `ponte.hello-proxy.net` and praca treats it as a registry source under the same signed-call contract.
 
 ### L1 — added resources
 
@@ -182,7 +182,7 @@ When the catalog holds more than one entry sharing a `wraps` value — several o
 }
 ```
 
-Defaults on a fresh install: empty `pins`, `trust_set` seeded with the agent vendor's operator (`hello`), `fallback` of `["hello"]`, empty `always_ask` — so out of the box praca silently prefers the first-party operator and prompts only when a needed upstream has no first-party option. praca needs nothing more from the registry than the `kind`, `operator`, and `wraps` fields it already exposes to run this policy.
+Defaults on a fresh install: all four lists empty. With no trust set and no fallback, praca prompts the user (and the LLM) the first time an upstream resolves to more than one operator. Distributions / agent vendors may ship a populated `fallback` and `trust_set` to silently prefer their first-party operator; that's a packaging concern, not a praca-core default. praca needs nothing more from the registry than the `kind`, `operator`, and `wraps` fields it already exposes to run this policy.
 
 ## Vocabularies
 
@@ -199,7 +199,7 @@ The vocabulary is **internal to praca**. The LLM never sees the URN, the adapter
 | `urn:aauth:vocabulary:mcp-tools` | future | MCP tool-list as a vocab — useful for resources that ARE MCP servers fronted by AAuth. |
 | `urn:aauth:vocabulary:graphql` | future | GraphQL schema as a vocab. |
 
-URN convention is praca-design today; the right long-term home is the AAuth spec at `~/github/DickHardt/AAuth` (alongside `r3_vocabularies` itself). Lift it when a second adapter ships.
+URN convention is praca-design today; the right long-term home is the AAuth spec itself (alongside `r3_vocabularies`). Lift it when a second adapter ships.
 
 ### Adapter interface
 
@@ -264,7 +264,7 @@ Sensitive operations follow the AAuth escalation path: resource mints a resource
 
 ### Notification fallback
 
-When PS can't reach the user via mobile push (offline, no app installed), PS may fall back to host-provided notification surfaces. praca does not participate in that fallback — it's a PS↔host arrangement, not an praca concern. (For Hello-operated PS + NanoClaw, see Hello's internal notification routing.)
+When PS can't reach the user via mobile push (offline, no app installed), PS may fall back to host-provided notification surfaces. praca does not participate in that fallback — it's a PS↔host arrangement, not a praca concern.
 
 ## v1 scope (locked)
 
@@ -426,7 +426,7 @@ Get these right in v1 and v.next is a runtime bolt-on.
 - MCP-tools and GraphQL vocabulary adapters
 - Operator-selection policy (waiting on registry `kind`/`wraps`/`operator` signals)
 - AAuth issue #22's `class` claim for distinguishing hosts on shared per-machine praca
-- AAuth-spec home for the vocabulary URN registry — lift from this doc to `~/github/DickHardt/AAuth` once we have a second adapter to validate against
+- AAuth-spec home for the vocabulary URN registry — lift from this doc into the AAuth spec once we have a second adapter to validate against
 - Daemon mode with Unix-socket bridge
 - AP separation from praca for multi-tenant deployments
 - Snapshot/resume of WASM linear memory during long blocking interactions
@@ -436,8 +436,8 @@ Get these right in v1 and v.next is a runtime bolt-on.
 ## Phased plan
 
 1. ✅ **Phase 0 — Skeleton.** praca stdio MCP server with single-resource `discover`/`invoke`/`connect`. Central `hostCall` dispatcher, catalog-driven, caller identity as parameter. Validated against Claude Code.
-2. ✅ **Phase 1 — First real resource.** Connected to `api-hubapi-com.hello-proxy.net` (Ponte/HubSpot). Full AAuth dance: resource_tokens, escalation, interactions. Interaction relay wired. W1/W2 demos proven.
-3. ✅ **Phase 2 — Discovery layer (multi-resource).** Refactored `catalog.ts` into a `VocabAdapter` interface (one OpenAPI adapter); added registry client (signed `GET registry.aauth.dev/resources` + ETag); added L1 store at `~/.aauth/praca/resources.json`; rewired `server.ts` to the eight-tool surface; dropped `PRACA_PONTE_BASE` (+ legacy `invoke`/`invokeComplete` wrappers + demo scripts) in Phase A cleanup; added `PRACA_REGISTRY_URL`.
+2. ✅ **Phase 1 — First real resource.** Connected to a real AAuth-fronted upstream and ran the full AAuth dance end-to-end: resource_tokens, escalation, interactions, interaction relay.
+3. ✅ **Phase 2 — Discovery layer (multi-resource).** Refactored `catalog.ts` into a `VocabAdapter` interface (one OpenAPI adapter); added registry client (signed `GET /resources` + ETag); added L1 store at `~/.aauth/praca/resources.json`; rewired `server.ts` to the eight-tool surface; added `PRACA_REGISTRY_URL`.
 4. **Phase 3 — AsyncAPI partial.** AsyncAPI adapter listing `send` + `receive` ops; `invoke` runs `async.send`; `async.receive` returns `async_subscribe_requires_subagent`. Drives the second-vocab validation of the adapter interface.
 5. **Phase 4 — Container host bridge.** praca exposes HTTP listener for container-resident hosts. Register via host's MCP config pointing at `host.docker.internal:<port>`. Validate signing + invoke from inside container.
 6. **Phase 5 — Approval UX.** Wire up notification fallback path (PS → host notification surface) for cases where mobile push is unavailable.

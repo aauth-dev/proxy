@@ -1,97 +1,74 @@
 # @aauth/praca
 
-The user's AAuth agent in MCP form. Praca is an MCP stdio server that brokers
-discovery to AAuth resources, holds the user's agent identity (via
-[`@aauth/local-keys`](../local-keys)), and relays interactions between
-resources and the Person Server. The LLM sees a fixed eight-tool meta-surface;
-new resources and operations are surfaced through the same tools regardless of
-scale.
+MCP stdio server that represents you as an agent in the [AAuth](https://github.com/DickHardt/AAuth) protocol. The LLM sees a fixed eight-tool surface; new resources and operations are surfaced through the same tools, regardless of how many you add.
 
-Design: see [`design.md`](./design.md).
+Your AAuth signing key is bound to this machine via [`@aauth/local-keys`](https://www.npmjs.com/package/@aauth/local-keys) — non-extractable when a Secure Enclave, TPM, or YubiKey is available; software-backed otherwise. Praca holds no upstream service credentials.
+
+Design and protocol details: [`design.md`](./design.md).
+
+## Prerequisites
+
+- Node ≥ 22.
+- An AAuth identity on this machine. If none exists, praca's MCP server still starts; the first tool call returns a bootstrap prompt that points the LLM at [`@aauth/bootstrap`](https://www.npmjs.com/package/@aauth/bootstrap). Praca picks the identity up on the next call — no restart.
+
+```sh
+npx @aauth/bootstrap setup
+```
 
 ## Install
 
-```sh
-npm install @aauth/praca
-```
-
-## v1 tool surface
-
-```
-find_resources(query)               → search the registry for discoverable resources
-add_resource(host_or_url)           → fetch well-known, validate, add to your local set
-list_resources()                    → your added resources
-remove_resource(resource)           → praca-local unregister (does NOT revoke PS grants)
-connect(resource)                   → pre-authorize (no-op for agent-token resources)
-list_operations(resource, query?)   → free-text or path-prefix search over ops
-get_operations(resource, op_ids[])  → batch fetch full schemas
-invoke(resource, op_id, args)       → execute; surfaces an auth URL if needed
-```
-
-State lives at `~/.aauth/praca/`:
-
-| Path | What |
-|---|---|
-| `resources.json` | added resources (L1) |
-| `catalog/registry.json` | cached registry list (L2) |
-| `catalog/{host}/{vocab}.json` | (future) cached vocab docs (L3) |
-| `connections/{host}.json` | per-resource session state |
-
-## Claude Code
-
-Add to `.mcp.json` (or your Claude Code MCP config):
+### Claude Code
 
 ```json
 {
   "mcpServers": {
-    "praca": {
-      "command": "npx",
-      "args": ["-y", "@aauth/praca"]
-    }
+    "praca": { "command": "npx", "args": ["-y", "@aauth/praca"] }
   }
 }
 ```
 
-Then ask Claude to e.g. "add `api-hubapi-com.hello-proxy.net`" → "list my
-HubSpot contacts". Claude finds the resource via `find_resources` (or you
-hand it the URL directly via `add_resource`), then runs `list_operations` /
-`invoke`. The first invoke against an unauthorized `aauth-access-token`
-resource returns a consent URL for you to open.
+### Claude Desktop
 
-The MCP server stays up even with no identity configured and surfaces a
-bootstrap message to the LLM on first tool call when `@aauth/bootstrap` hasn't
-been run yet.
+Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows):
 
-## Configuration
-
-Identity comes from `@aauth/local-keys` (`~/.aauth/`) bootstrapped via
-`npx @aauth/bootstrap`. Praca reads it lazily on first tool call. Override
-hooks (all optional):
-
-| Var | What |
-|---|---|
-| `PRACA_REGISTRY_URL` | registry URL (default `https://registry.aauth.dev`) |
-| `PRACA_PS_URL` | Person Server URL (default: from local-keys agent config) |
-| `PRACA_AGENT_URL` | agent provider URL (default: first configured) |
-| `PRACA_AGENT_TOKEN` + `PRACA_AGENT_PRIVATE_JWK` (or `PRACA_AGENT_KEY_FILE`) | software-identity override that bypasses local-keys; intended for tests |
-
-## Programmatic use
-
-`@aauth/praca` is also importable as a library — useful for building tooling
-on top of the same agent flow:
-
-```ts
-import {
-  fetchResource,
-  toL1Entry,
-  invokeAtResource,
-  buildConfigFromLocalKeys,
-} from '@aauth/praca'
-
-const cfg = await buildConfigFromLocalKeys()
-const resource = toL1Entry(await fetchResource('api-hubapi-com.hello-proxy.net'))
-const result = await invokeAtResource(cfg, resource, 'get-/crm/v3/objects/contacts_getPage', {})
+```json
+{
+  "mcpServers": {
+    "praca": { "command": "npx", "args": ["-y", "@aauth/praca"] }
+  }
+}
 ```
+
+### Cursor
+
+Settings → MCP → Add new server, then add:
+
+```json
+{
+  "praca": { "command": "npx", "args": ["-y", "@aauth/praca"] }
+}
+```
+
+### Other MCP hosts
+
+Any stdio MCP host: `npx -y @aauth/praca`.
+
+## CLI flags
+
+| Flag | Purpose |
+|---|---|
+| `--log` | Tee JSON-RPC frames to `~/.aauth/praca/logs/<ISO>.jsonl` for debugging. |
+
+## Environment variables
+
+All optional; sensible defaults come from `@aauth/local-keys`.
+
+| Var | Default | Purpose |
+|---|---|---|
+| `PRACA_REGISTRY_URL` | `https://registry.aauth.dev` | AAuth resource registry |
+| `PRACA_PS_URL` | from local-keys | Person Server URL |
+| `PRACA_AGENT_URL` | first configured | Agent provider URL |
+| `PRACA_AGENT_TOKEN` + `PRACA_AGENT_PRIVATE_JWK` (or `PRACA_AGENT_KEY_FILE`) | — | Test-only software-identity override that bypasses local-keys |
 
 ## License
 
