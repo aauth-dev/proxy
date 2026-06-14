@@ -57,7 +57,7 @@ const server = new McpServer({ name: 'aauth-proxy', version: PKG_VERSION })
 // silently no-ops if the log directory can't be created or a line isn't JSON.
 function setupFrameLog(): void {
   if (!process.argv.includes('--log')) return
-  const dir = join(homedir(), '.aauth', 'praca', 'logs')
+  const dir = join(homedir(), '.aauth', 'proxy', 'logs')
   let stream: ReturnType<typeof createWriteStream>
   try {
     mkdirSync(dir, { recursive: true })

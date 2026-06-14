@@ -42,13 +42,13 @@ export interface RegistryCache {
 }
 
 export function registryUrl(): string {
-  return (process.env.PRACA_REGISTRY_URL ?? 'https://registry.aauth.dev').replace(/\/+$/, '')
+  return (process.env.PROXY_REGISTRY_URL ?? 'https://registry.aauth.dev').replace(/\/+$/, '')
 }
 
 // Filesystem-backed RegistryCache — the default for the stdio server. `dir`
 // overrides the state directory (default ~/.aauth/proxy).
 export function createFsRegistryCache(opts: { dir?: string } = {}): RegistryCache {
-  const cachePath = join(opts.dir ?? join(homedir(), '.aauth', 'praca'), 'catalog', 'registry.json')
+  const cachePath = join(opts.dir ?? join(homedir(), '.aauth', 'proxy'), 'catalog', 'registry.json')
   return {
     async read() {
       if (!existsSync(cachePath)) return undefined

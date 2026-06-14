@@ -13,9 +13,9 @@ describe('agent proxy MCP server', () => {
       args: ['tsx', 'src/server.ts'],
       env: {
         ...(process.env as Record<string, string>),
-        PRACA_PS_URL: 'http://localhost:2',
-        PRACA_AGENT_TOKEN: 'x.y.z',
-        PRACA_AGENT_PRIVATE_JWK: JSON.stringify({ kty: 'OKP', crv: 'Ed25519', x: 'AAAA', d: 'BBBB' }),
+        PROXY_PS_URL: 'http://localhost:2',
+        PROXY_AGENT_TOKEN: 'x.y.z',
+        PROXY_AGENT_PRIVATE_JWK: JSON.stringify({ kty: 'OKP', crv: 'Ed25519', x: 'AAAA', d: 'BBBB' }),
       },
     })
     const client = new Client({ name: 'aauth-proxy-test', version: '0.0.0' })

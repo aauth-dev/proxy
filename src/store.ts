@@ -44,7 +44,7 @@ interface L1File {
 // Filesystem-backed L1Store — the default for the stdio server. `dir` overrides
 // the state directory (default ~/.aauth/proxy).
 export function createFsL1Store(opts: { dir?: string } = {}): L1Store {
-  const stateDir = opts.dir ?? join(homedir(), '.aauth', 'praca')
+  const stateDir = opts.dir ?? join(homedir(), '.aauth', 'proxy')
   const l1Path = join(stateDir, 'resources.json')
 
   function load(): L1File {

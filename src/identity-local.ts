@@ -2,7 +2,7 @@
 //
 // This is the only place @aauth/local-keys is imported, so the package's core
 // entry point stays enclave-free (and bundleable for workerd). Two sources:
-//  - env: a software agent token + key (PRACA_AGENT_PRIVATE_JWK / *_KEY_FILE) —
+//  - env: a software agent token + key (PROXY_AGENT_PRIVATE_JWK / *_KEY_FILE) —
 //    tests and simple software-only use.
 //  - @aauth/local-keys: the real path — the bootstrapped AP key (Secure Enclave
 //    / YubiKey) mints the agent token, binding a fresh software ephemeral key.
@@ -21,12 +21,12 @@ function required(name: string): string {
 }
 
 export function loadIdentity(): ProxyConfig {
-  const psUrl = required('PRACA_PS_URL')
-  const agentToken = required('PRACA_AGENT_TOKEN')
+  const psUrl = required('PROXY_PS_URL')
+  const agentToken = required('PROXY_AGENT_TOKEN')
 
   const jwkJson =
-    process.env.PRACA_AGENT_PRIVATE_JWK ??
-    readFileSync(process.env.PRACA_AGENT_KEY_FILE ?? '.secrets/praca-agent-key.json', 'utf8')
+    process.env.PROXY_AGENT_PRIVATE_JWK ??
+    readFileSync(process.env.PROXY_AGENT_KEY_FILE ?? '.secrets/proxy-agent-key.json', 'utf8')
 
   return { psUrl, agentToken, agentPrivateJwk: JSON.parse(jwkJson) }
 }
@@ -34,13 +34,13 @@ export function loadIdentity(): ProxyConfig {
 export async function buildConfigFromLocalKeys(
   opts: { agentUrl?: string; psUrl?: string; local?: string } = {},
 ): Promise<ProxyConfig> {
-  const agentUrl = opts.agentUrl ?? process.env.PRACA_AGENT_URL ?? listAgentProviders()[0]
+  const agentUrl = opts.agentUrl ?? process.env.PROXY_AGENT_URL ?? listAgentProviders()[0]
   if (!agentUrl) {
-    throw new Error('agent proxy: no agent configured (run @aauth/bootstrap) and no PRACA_AGENT_URL set')
+    throw new Error('agent proxy: no agent configured (run @aauth/bootstrap) and no PROXY_AGENT_URL set')
   }
 
-  const psUrl = opts.psUrl ?? process.env.PRACA_PS_URL ?? getAgentConfig(agentUrl)?.personServerUrl
-  if (!psUrl) throw new Error(`agent proxy: no Person Server configured for ${agentUrl}; set PRACA_PS_URL`)
+  const psUrl = opts.psUrl ?? process.env.PROXY_PS_URL ?? getAgentConfig(agentUrl)?.personServerUrl
+  if (!psUrl) throw new Error(`agent proxy: no Person Server configured for ${agentUrl}; set PROXY_PS_URL`)
 
   // The AP key (enclave/yubikey) signs the agent token, binding a fresh software
   // ephemeral key returned as signingKey.
@@ -67,11 +67,11 @@ export function createLocalKeysIdentityProvider(): IdentityProvider {
   return {
     async resolve({ local }) {
       if (cached) return { kind: 'ready', cfg: cached }
-      if (process.env.PRACA_AGENT_PRIVATE_JWK) {
+      if (process.env.PROXY_AGENT_PRIVATE_JWK) {
         cached = loadIdentity()
         return { kind: 'ready', cfg: cached }
       }
-      const agentUrl = process.env.PRACA_AGENT_URL ?? listAgentProviders()[0]
+      const agentUrl = process.env.PROXY_AGENT_URL ?? listAgentProviders()[0]
       if (!agentUrl) return { kind: 'needsBootstrap' }
       cached = await buildConfigFromLocalKeys({ local })
       return { kind: 'ready', cfg: cached }
