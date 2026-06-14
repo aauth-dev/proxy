@@ -1,11 +1,11 @@
 // Fetch + validate a resource's well-known doc; pick vocabulary adapters
-// praca supports. The caller (add_resource) decides what to do with the
+// the agent proxy supports. The caller (add_resource) decides what to do with the
 // FetchedResource — typically convert to an L1Entry and store.
 //
 // Mirrors registry/validate.ts:fetchResourceMetadata in spirit: manual
 // redirect, basic shape validation, issuer === origin anti-spoof. The SSRF
 // guards the registry applies (no localhost, no IPs, no non-default ports)
-// are not enforced here because praca runs on the user's machine, and the
+// are not enforced here because the agent proxy runs on the user's machine, and the
 // user explicitly typed the host they want to add.
 
 import { canonicalizeHost } from './host.js'
@@ -80,7 +80,7 @@ function validate(meta: AAuthResourceMeta, host: string, origin: string): void {
   ) {
     throw new Error(`resource ${host}: invalid access_mode ${meta.access_mode}`)
   }
-  // description is enforced at the registry on submit; praca-side is lenient
+  // description is enforced at the registry on submit; agent-proxy-side is lenient
   // so direct-URL adds of resources without a description still work.
 }
 
@@ -99,7 +99,7 @@ function pickVocabs(advertised: Record<string, string>): PickedVocab[] {
 // ── Vocab doc loading + operation resolution ──
 //
 // Loaded vocab docs (L3) are cached via the injectable DocCache. The default is
-// an in-memory Map for the lifetime of the praca process — cold-start re-fetch
+// an in-memory Map for the lifetime of the agent proxy process — cold-start re-fetch
 // is the only cost, amortized across a long-lived MCP session (Claude Code's
 // typical mode). A host can inject a shared/persistent cache (e.g. R2/KV) so
 // cold isolates don't all re-fetch large specs.
@@ -190,7 +190,7 @@ export interface RoutedOperation {
 // Resolve an opId on a resource by trying each picked vocab in order. First
 // adapter that builds a plan wins. v1 has a single adapter (OpenAPI), so
 // "first wins" is unambiguous; the collision-prefix rule for multi-adapter
-// resources is a praca-side concern at list time, not invoke time.
+// resources is an agent-proxy-side concern at list time, not invoke time.
 export async function routeOperation(
   l1: L1Entry,
   opId: string,

@@ -1,7 +1,7 @@
 // Registry client: signed GET registry.aauth.dev/resources with ETag cache.
 //
 // The registry is an AAuth resource itself (access_mode: agent-token), so
-// listing requires praca's agent token + HTTP signature — the same path used
+// listing requires the agent proxy's agent token + HTTP signature — the same path used
 // for any other agent-token resource. The ETag cache is injected via
 // RegistryCache; the stdio server uses the filesystem default
 // (createFsRegistryCache), backed by ~/.aauth/praca/catalog/registry.json.
@@ -10,7 +10,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fetch as signedFetch } from '@hellocoop/httpsig'
-import type { PracaConfig } from './agent.js'
+import type { ProxyConfig } from './agent.js'
 import type { AccessMode } from './store.js'
 
 export interface RegistryEntry {
@@ -68,7 +68,7 @@ export function createFsRegistryCache(opts: { dir?: string } = {}): RegistryCach
 // Fetch the registry's /resources, signed with the agent token. Honors
 // If-None-Match against the cached ETag — on 304 returns the cached index;
 // on 200 updates the cache.
-export async function fetchRegistry(cfg: PracaConfig, cache: RegistryCache): Promise<RegistryIndex> {
+export async function fetchRegistry(cfg: ProxyConfig, cache: RegistryCache): Promise<RegistryIndex> {
   const url = `${registryUrl()}/resources`
   const cached = await cache.read()
   const headers: Record<string, string> = { accept: 'application/json' }

@@ -1,5 +1,5 @@
-// praca — the user's AAuth agent. v0 core: the authorize-first R3 invoke flow
-// against Ponte, exchanging at the PS.
+// agent proxy — the user's AAuth agent. v0 core: the authorize-first R3 invoke flow
+// against the resource proxy, exchanging at the PS.
 //
 // invoke() is non-blocking: when an interaction is required (PS consent or the
 // resource's OAuth bootstrap) it RETURNS the interaction (url + code + poll URL)
@@ -17,7 +17,7 @@ import type { L1Entry } from './store.js'
 
 export type AgentSigningKey = Parameters<typeof signedFetch>[1]['signingKey']
 
-export interface PracaConfig {
+export interface ProxyConfig {
   psUrl: string
   agentPrivateJwk: AgentSigningKey // the agent's private JWK
   agentToken: string // aa-agent+jwt (cnf = agent pubkey, ps = psUrl)
@@ -42,7 +42,7 @@ export type InvokeResult =
 
 export type InteractionHandler = (url: string, code: string) => Promise<void> | void
 
-function signWith(cfg: PracaConfig, token: string) {
+function signWith(cfg: ProxyConfig, token: string) {
   return (url: string, init: { method?: string; headers?: Record<string, string>; body?: string } = {}) =>
     signedFetch(url, { ...init, signingKey: cfg.agentPrivateJwk, signatureKey: { type: 'jwt', jwt: token } })
 }
@@ -168,9 +168,9 @@ async function exchangeAtPS(signAgent: SignedFetch, tokenEndpoint: string, resou
 
 // Resource-parameterized invoke. The new tool surface in server.ts calls into
 // this directly with an L1 entry from store.ts; the legacy invoke() below
-// wraps it for cfg.ponteBase-based callers (tests, demo scripts).
+// wraps it for cfg.resourceProxyBase-based callers (tests, demo scripts).
 export async function invokeAtResource(
-  cfg: PracaConfig,
+  cfg: ProxyConfig,
   l1: L1Entry,
   operationId: string,
   args: InvokeArgs = {},
@@ -277,7 +277,7 @@ export async function invokeAtResource(
 // use; the MCP tool surface is non-blocking by design and surfaces interaction
 // URLs to the LLM caller instead.
 export async function invokeAtResourceComplete(
-  cfg: PracaConfig,
+  cfg: ProxyConfig,
   l1: L1Entry,
   operationId: string,
   onInteraction: InteractionHandler,

@@ -11,7 +11,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import { invokeAtResource, invokeAtResourceComplete } from './agent.js'
-import type { PracaConfig } from './agent.js'
+import type { ProxyConfig } from './agent.js'
 import { canonicalizeHost } from './host.js'
 import type { IdentityProvider } from './identity.js'
 import { fetchRegistry } from './registry.js'
@@ -25,7 +25,7 @@ import {
 import type { DocCache } from './resource.js'
 import type { L1Entry, L1Store } from './store.js'
 
-export interface PracaDeps {
+export interface ProxyDeps {
   l1: L1Store
   registryCache: RegistryCache
   identity: IdentityProvider
@@ -68,7 +68,7 @@ export interface InteractionContext {
 const text = (s: string) => ({ content: [{ type: 'text' as const, text: s }] })
 const json = (v: unknown) => text(JSON.stringify(v, null, 2))
 
-const BOOTSTRAP_GUIDANCE = `praca has no AAuth identity on this machine yet.
+const BOOTSTRAP_GUIDANCE = `The agent proxy has no AAuth identity on this machine yet.
 
 To set one up, run:
 
@@ -81,16 +81,16 @@ To set one up, run:
 That guide walks through generating a keypair (Secure Enclave / YubiKey / software),
 binding a Person Server, and publishing the JWKS. When it's done, call this tool again.`
 
-// Registers praca's eight tools on `server`. Async because the L1 snapshot
+// Registers the agent proxy's eight tools on `server`. Async because the L1 snapshot
 // embedded in tool descriptions is read once at build time from the (possibly
 // async) store.
-export async function buildPracaTools(server: McpServer, deps: PracaDeps): Promise<void> {
+export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promise<void> {
   const { l1, registryCache, identity, docCache } = deps
 
   // Identity is resolved lazily per call; the provider owns any caching (which
   // must be per-principal — a shared process-global cache would leak identities
   // across tenants in a multi-user host).
-  async function getConfig(): Promise<{ ok: true; cfg: PracaConfig } | { ok: false }> {
+  async function getConfig(): Promise<{ ok: true; cfg: ProxyConfig } | { ok: false }> {
     const status = await identity.resolve({ local: deps.agentLocal?.() })
     if (status.kind === 'needsBootstrap') return { ok: false }
     return { ok: true, cfg: status.cfg }
@@ -175,7 +175,7 @@ export async function buildPracaTools(server: McpServer, deps: PracaDeps): Promi
     'add_resource',
     {
       description: describeWithL1(
-        'Add an AAuth resource to your local set. Pass a bare host, host:port, or full URL — praca canonicalizes. Fetches the resource\'s well-known doc, validates, picks supported vocabularies. After adding: agent-token resources are immediately invokable; aauth-access-token/auth-token resources need `connect` or a first `invoke` that surfaces the auth URL.',
+        'Add an AAuth resource to your local set. Pass a bare host, host:port, or full URL — the agent proxy canonicalizes. Fetches the resource\'s well-known doc, validates, picks supported vocabularies. After adding: agent-token resources are immediately invokable; aauth-access-token/auth-token resources need `connect` or a first `invoke` that surfaces the auth URL.',
       ),
       inputSchema: { resource: z.string() },
     },
@@ -200,7 +200,7 @@ export async function buildPracaTools(server: McpServer, deps: PracaDeps): Promi
     'list_resources',
     {
       description:
-        'Return your locally added resources with name, description, access_mode, last_used, and how many vocabularies praca picked. Cheap; safe to call anytime.',
+        'Return your locally added resources with name, description, access_mode, last_used, and how many vocabularies the agent proxy picked. Cheap; safe to call anytime.',
     },
     async () => {
       const entries = (await l1.list()).map((e) => ({
@@ -220,7 +220,7 @@ export async function buildPracaTools(server: McpServer, deps: PracaDeps): Promi
     'remove_resource',
     {
       description: describeWithL1(
-        'Remove a resource from your local set. Praca-local only — does NOT revoke any user grants at the Person Server; re-adding picks up existing grants transparently.',
+        'Remove a resource from your local set. Agent-proxy-local only — does NOT revoke any user grants at the Person Server; re-adding picks up existing grants transparently.',
       ),
       inputSchema: { resource: z.string() },
     },

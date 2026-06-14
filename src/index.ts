@@ -1,8 +1,8 @@
-// Public API for @aauth/praca (core, workerd-safe — no fs/stdio/local-keys at
+// Public API for @aauth/proxy (core, workerd-safe — no fs/stdio/local-keys at
 // import time). Consumers get the agent flow, the transport-agnostic tool
 // factory, the injectable storage/identity ports, and the default filesystem
 // adapters. The Node-only @aauth/local-keys identity adapter is exported
-// separately from "@aauth/praca/local".
+// separately from "@aauth/proxy/local".
 
 export { invokeAtResource, invokeAtResourceComplete } from './agent.js'
 export type {
@@ -11,11 +11,11 @@ export type {
   InteractionHandler,
   InvokeArgs,
   InvokeResult,
-  PracaConfig,
+  ProxyConfig,
 } from './agent.js'
 
-export { buildPracaTools } from './tools.js'
-export type { PracaDeps, InteractionContext } from './tools.js'
+export { buildProxyTools } from './tools.js'
+export type { ProxyDeps, InteractionContext } from './tools.js'
 
 export type { BootstrapStatus, IdentityProvider } from './identity.js'
 

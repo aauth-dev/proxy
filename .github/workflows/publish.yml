@@ -1,16 +1,16 @@
 name: Publish to npm
 
-# Publishes @aauth/praca when a version tag (vX.Y.Z) is pushed. Uses npm Trusted
+# Publishes @aauth/proxy when a version tag (vX.Y.Z) is pushed. Uses npm Trusted
 # Publishing (OIDC) — no NPM_TOKEN secret in CI — and attaches a signed
 # provenance attestation linking the tarball to this commit + workflow run.
 #
 # One-time trusted-publisher setup (npm >= 11; run locally after the first
 # manual publish so the package exists in the registry):
-#   npm trust github @aauth/praca \
+#   npm trust github @aauth/proxy \
 #     --repository aauth-dev/praca \
 #     --file publish.yml \
 #     --allow-publish
-#   npm trust list @aauth/praca   # verify
+#   npm trust list @aauth/proxy   # verify
 # After this the workflow publishes via OIDC without any stored token.
 #
 # Release flow:

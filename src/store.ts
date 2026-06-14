@@ -2,9 +2,9 @@
 // backend; the stdio server uses the filesystem default (createFsL1Store),
 // backed by ~/.aauth/praca/resources.json.
 //
-// Praca writes here on add_resource (always), on first successful auth at a
+// The agent proxy writes here on add_resource (always), on first successful auth at a
 // resource (touches last_used), and on remove_resource. No PS-side state is
-// mutated by this module; remove is praca-local only.
+// mutated by this module; remove is agent-proxy-local only.
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -14,7 +14,7 @@ export type AccessMode = 'agent-token' | 'aauth-access-token' | 'auth-token'
 
 export interface L1Entry {
   resource: string // canonical host (LLM-facing identifier)
-  origin: string // https://{host} or http://{host} for local — what praca calls
+  origin: string // https://{host} or http://{host} for local — what the agent proxy calls
   issuer: string // https://{host} (or http for local) — from well-known
   name: string
   description: string

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// praca as an MCP stdio server: wires the transport-agnostic eight-tool surface
-// (buildPracaTools) to filesystem-backed state and @aauth/local-keys identity,
+// the agent proxy as an MCP stdio server: wires the transport-agnostic eight-tool surface
+// (buildProxyTools) to filesystem-backed state and @aauth/local-keys identity,
 // adds an OS-browser interaction launcher, and connects over stdio. The tool
 // logic itself lives in tools.ts so an HTTP host can reuse it unchanged.
 
@@ -14,13 +14,13 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { createLocalKeysIdentityProvider } from './identity-local.js'
 import { createFsRegistryCache } from './registry.js'
 import { createFsL1Store } from './store.js'
-import { buildPracaTools } from './tools.js'
+import { buildProxyTools } from './tools.js'
 
 // Layer 2 of the interaction-driver hierarchy: when the PS couldn't reach the
-// user via its own channels (AAuth#34 interaction_unavailable), praca runs on
+// user via its own channels (AAuth#34 interaction_unavailable), the agent proxy runs on
 // the user's machine and can spawn the OS's default-browser launcher. Best
 // effort — silently no-ops on unsupported platforms or when the binary is
-// missing. The text fallback (layer 3) is still emitted by buildPracaTools so a
+// missing. The text fallback (layer 3) is still emitted by buildProxyTools so a
 // remote MCP or headless caller can surface the URL.
 function tryOpenBrowser(url: string): void {
   const cmd =
@@ -50,7 +50,7 @@ function slugifyClientName(name: string | undefined): string {
 }
 
 const { version: PKG_VERSION } = createRequire(import.meta.url)('../package.json') as { version: string }
-const server = new McpServer({ name: 'praca', version: PKG_VERSION })
+const server = new McpServer({ name: 'aauth-proxy', version: PKG_VERSION })
 
 // `--log` tees stdio JSON-RPC frames to ~/.aauth/praca/logs/<ISO>.jsonl as
 // `{ts, dir, frame}` lines (same shape reloaderoo writes). Opt-in; best-effort —
@@ -112,7 +112,7 @@ function setupFrameLog(): void {
 }
 
 setupFrameLog()
-await buildPracaTools(server, {
+await buildProxyTools(server, {
   l1: createFsL1Store(),
   registryCache: createFsRegistryCache(),
   identity: createLocalKeysIdentityProvider(),

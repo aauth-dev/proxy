@@ -1,5 +1,5 @@
 {
-  "name": "@aauth/praca",
+  "name": "@aauth/proxy",
   "version": "0.1.3",
   "description": "The user's AAuth agent in MCP form — discovery, identity, interaction relay",
   "type": "module",
@@ -14,7 +14,7 @@
     }
   },
   "bin": {
-    "aauth-praca": "./dist/server.js"
+    "aauth-proxy": "./dist/server.js"
   },
   "files": [
     "dist"

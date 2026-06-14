@@ -1,4 +1,4 @@
-// Vocabulary adapter registry. Praca picks adapters at resource-load time by
+// Vocabulary adapter registry. The agent proxy picks adapters at resource-load time by
 // walking `r3_vocabularies` from the well-known doc and selecting every URN
 // it has an adapter for.
 

@@ -3,9 +3,9 @@
 //   - fetch + parse the doc
 //   - enumerate operations as bounded summaries (for list_operations)
 //   - return full schemas for chosen op_ids (for get_operations)
-//   - turn (opId, args) into an InvocationPlan praca's `invoke` can execute
+//   - turn (opId, args) into an InvocationPlan the agent proxy's `invoke` can execute
 //
-// See praca-design.md §"Vocabularies". The LLM never sees `vocab` — it sees
+// See design.md §"Vocabularies". The LLM never sees `vocab` — it sees
 // `kind` (sync.request | async.send | async.receive) on each OpSummary.
 
 export type OpKind = 'sync.request' | 'async.send' | 'async.receive'

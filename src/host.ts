@@ -1,8 +1,8 @@
-// Host normalization. Praca's canonical resource identifier is the bare
-// lowercased host (with port if non-default), e.g. `api-hubapi-com.hello-proxy.net`
+// Host normalization. The agent proxy's canonical resource identifier is the bare
+// lowercased host (with port if non-default), e.g. `api-hubapi-com.proxy.aauth.dev`
 // or `localhost:8787` for local dev tunnels. The origin (`https://host` or
 // `http://host` for local) is also returned and stored on each L1 entry so the
-// scheme survives across praca restarts.
+// scheme survives across agent proxy restarts.
 //
 // Production AAuth resources are https; we allow http for local dev + the test
 // harness.

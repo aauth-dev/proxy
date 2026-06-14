@@ -1,15 +1,15 @@
-# praca — the user's AAuth agent in MCP form
+# agent proxy — the user's AAuth agent in MCP form
 
-**Status: v1 invoke spine ✅ proven live (2026-05-25); discovery layer redesigned 2026-06-09.** praca drives the authorize-first R3 flow end-to-end against a real Person Server + AAuth resource, signing with the bootstrapped `@aauth/local-keys` identity. Discovery generalizes to multi-resource: signed-call registry client, three-layer state (added / discoverable / per-resource ops), vocabulary-adapter abstraction (OpenAPI today, AsyncAPI partial, MCP-tools/GraphQL later). v.next (sub-agents, WASM runtime) is still ahead.
+**Status: v1 invoke spine ✅ proven live (2026-05-25); discovery layer redesigned 2026-06-09.** The agent proxy drives the authorize-first R3 flow end-to-end against a real Person Server + AAuth resource, signing with the bootstrapped `@aauth/local-keys` identity. Discovery generalizes to multi-resource: signed-call registry client, three-layer state (added / discoverable / per-resource ops), vocabulary-adapter abstraction (OpenAPI today, AsyncAPI partial, MCP-tools/GraphQL later). v.next (sub-agents, WASM runtime) is still ahead.
 
-Reference implementation of an AAuth agent for MCP-aware agent hosts. praca represents the user as an AAuth agent, exposes that agent's capabilities to an LLM via MCP, and relays AAuth interactions to the user's Person Server. Published as `@aauth/praca` from `aauth-dev/praca`.
+Reference implementation of an AAuth agent for MCP-aware agent hosts. The agent proxy represents the user as an AAuth agent, exposes that agent's capabilities to an LLM via MCP, and relays AAuth interactions to the user's Person Server. Published as `@aauth/proxy` from `aauth-dev/praca`.
 
 ## Objectives
 
 1. Demonstrate AAuth's value end-to-end: cross-domain agent access with genuine user oversight.
 2. Give MCP hosts (Claude Code, Claude Desktop, Cursor, CLI tools) access to AAuth resources via a single integration.
-3. Reusable across agent platforms. Nothing in praca is host-specific.
-4. No raw credentials in praca. praca's compromise surface is one AAuth agent identity, not a vault of third-party credentials.
+3. Reusable across agent platforms. Nothing in the agent proxy is host-specific.
+4. No raw credentials in the agent proxy. The agent proxy's compromise surface is one AAuth agent identity, not a vault of third-party credentials.
 5. Cryptographic identity per user. Parent agent keypair (software) + AP signing key (enclave-backed via `@aauth/local-keys`).
 6. Real oversight via AAuth missions / resource tokens / interactions.
 7. Trust integrity for PS↔user interactions — never relayed through agents, hosts, or chat platforms.
@@ -24,7 +24,7 @@ Reference implementation of an AAuth agent for MCP-aware agent hosts. praca repr
 └────────────────────────────────┼─────────────────┘
                                  ▼
             ┌─────────────────────────────────┐
-            │ praca  (stdio MCP server)       │   ← this doc
+            │ agent proxy  (stdio MCP server) │   ← this doc
             │  - AAuth agent for the user     │
             │  - software parent keypair      │
             │  - AP signing key in enclave    │
@@ -47,11 +47,11 @@ Reference implementation of an AAuth agent for MCP-aware agent hosts. praca repr
    └─────────────────────────────────────────────┘
 ```
 
-praca sits between the MCP host and AAuth resources. It is the user's signing principal; resources verify its AAuth signature, and PS holds the grants that praca's identity is authorized against. AAuth resources may be native AAuth services or AAuth-fronted wrappers over OAuth APIs — praca doesn't care which.
+The agent proxy sits between the MCP host and AAuth resources. It is the user's signing principal; resources verify its AAuth signature, and PS holds the grants that the agent proxy's identity is authorized against. AAuth resources may be native AAuth services or AAuth-fronted wrappers over OAuth APIs — the agent proxy doesn't care which.
 
 ## Tool surface
 
-A small fixed set of meta-tools — Mechanism B in the dynamic-discovery taxonomy (Stainless, Speakeasy, GitHub MCP) — keeps init-time tool-definition tokens flat regardless of how many resources the user has added or how many ops each resource exposes. Token-bloat research (`docs/research-notes.md` if we keep one) puts naive one-tool-per-endpoint at ~1.17M tokens for the Cloudflare API and ~405K for a 400-tool static MCP server; the meta-tool pattern keeps praca at ~1K of tool descriptions regardless of L1/L2 size.
+A small fixed set of meta-tools — Mechanism B in the dynamic-discovery taxonomy (Stainless, Speakeasy, GitHub MCP) — keeps init-time tool-definition tokens flat regardless of how many resources the user has added or how many ops each resource exposes. Token-bloat research (`docs/research-notes.md` if we keep one) puts naive one-tool-per-endpoint at ~1.17M tokens for the Cloudflare API and ~405K for a 400-tool static MCP server; the meta-tool pattern keeps the agent proxy at ~1K of tool descriptions regardless of L1/L2 size.
 
 Each tool's description embeds a short literal snapshot of L1 ("currently added resources: a, b, c") so the common path needs no extra round-trip; `list_resources` gives the canonical fresh view.
 
@@ -61,7 +61,7 @@ Each tool's description embeds a short literal snapshot of L1 ("currently added 
 - `find_resources(query)` — search the registry (L2). Returns `{ resource, name, description, access_mode, added: bool }[]`.
 - `add_resource(host_or_url)` — fetch `{host}/.well-known/aauth-resource.json`, validate, pick the resource's vocabularies, write to L1. Accepts bare host, `https://host`, or full URL; canonicalizes to bare lowercased host.
 - `list_resources()` — return L1 with `{ resource, name, description, access_mode, ops_count, last_used }`.
-- `remove_resource(resource)` — unregister from L1. Praca-local only; does not revoke PS-side grants.
+- `remove_resource(resource)` — unregister from L1. Agent-proxy-local only; does not revoke PS-side grants.
 - `connect(resource)` — pre-authorize a resource (typically a PS-side consent step). No-op for `access_mode: agent-token` resources.
 
 **Operations within a resource (L3):**
@@ -69,13 +69,13 @@ Each tool's description embeds a short literal snapshot of L1 ("currently added 
 - `get_operations(resource, op_ids[])` — batch fetch full schemas for one or more operations. Schemas dominate token cost, so this is intentionally separate from `list_operations` (per Speakeasy / OpenMCP).
 - `invoke(resource, op_id, args)` — execute. Routes internally on the op's `kind`: `sync.request` → R3 HTTP call; `async.send` → publish via the resource's send channel; `async.receive` → returns `async_subscribe_requires_subagent` (v.next). On first call to an aauth-access-token or auth-token resource that hasn't been authorized, returns the interaction URL — the LLM hands it to the user, then retries.
 
-`kind` values: `sync.request` | `async.send` | `async.receive`. The LLM never sees `vocab`; that's a praca-internal routing detail (see "Vocabularies"). OpIds are the natural value from the vocab doc; praca deterministically prefixes (`openapi:`/`asyncapi:`) only when two vocabularies at the same resource happen to expose colliding ids.
+`kind` values: `sync.request` | `async.send` | `async.receive`. The LLM never sees `vocab`; that's an agent-proxy-internal routing detail (see "Vocabularies"). OpIds are the natural value from the vocab doc; the agent proxy deterministically prefixes (`openapi:`/`asyncapi:`) only when two vocabularies at the same resource happen to expose colliding ids.
 
-`resource` is always the canonical bare lowercased host (e.g., `api-hubapi-com.hello-proxy.net`). Input accepts host / scheme+host / full URL; praca normalizes.
+`resource` is always the canonical bare lowercased host (e.g., `api-hubapi-com.proxy.aauth.dev`). Input accepts host / scheme+host / full URL; the agent proxy normalizes.
 
 ### v.next surface (saved-function runtime)
 
-Each saved function is a real MCP tool surfaced in `tools/list` via `notifications/tools/list_changed` (Option A). The LLM calls it like any other tool; praca runs the saved code in a QuickJS-WASM isolate as an AAuth sub-agent (per issue #23). The runtime is also driven by a small lifecycle meta-surface:
+Each saved function is a real MCP tool surfaced in `tools/list` via `notifications/tools/list_changed` (Option A). The LLM calls it like any other tool; the agent proxy runs the saved code in a QuickJS-WASM isolate as an AAuth sub-agent (per issue #23). The runtime is also driven by a small lifecycle meta-surface:
 
 - `run_code(code, scope?)` — ephemeral one-shot in a disposable isolate.
 - `register_function(name, description, code, scope)` — promote a snippet to a saved tool. Adds to `tools/list`.
@@ -83,19 +83,19 @@ Each saved function is a real MCP tool surfaced in `tools/list` via `notificatio
 - `remove_function(name)` — delete; removes from `tools/list`.
 - (v.next.next) `register_handler(name, event_pattern, code, scope)` — webhook/event handler; only fires when matching events arrive over the DO event tier.
 
-`scope` is the AAuth scope (resources + operations the function may use). At register time, praca seeds the isolate's import closure with bindings only for those operations; identity is captured in the closure so sub-agent code can't impersonate or escalate. See "v.next: programmable runtime + sub-agents".
+`scope` is the AAuth scope (resources + operations the function may use). At register time, the agent proxy seeds the isolate's import closure with bindings only for those operations; identity is captured in the closure so sub-agent code can't impersonate or escalate. See "v.next: programmable runtime + sub-agents".
 
 ## Transport
 
-stdio MCP server in v1. The same code can be exposed over HTTP for container-resident hosts (reaching praca at `host.docker.internal`); host-launched stdio ships first.
+stdio MCP server in v1. The same code can be exposed over HTTP for container-resident hosts (reaching the agent proxy at `host.docker.internal`); host-launched stdio ships first.
 
 ## State
 
 Three layers, all file-backed, all per-machine.
 
-**Agent identity** lives outside praca, in `~/.aauth/` via `@aauth/local-keys` (bootstrapped once per machine via `@aauth/bootstrap`). Praca reads from it at startup; it owns no key material itself. This is what lets the same identity back multiple agent surfaces (praca, future CLI tools) without each carrying its own bootstrap.
+**Agent identity** lives outside the agent proxy, in `~/.aauth/` via `@aauth/local-keys` (bootstrapped once per machine via `@aauth/bootstrap`). The agent proxy reads from it at startup; it owns no key material itself. This is what lets the same identity back multiple agent surfaces (the agent proxy, future CLI tools) without each carrying its own bootstrap.
 
-**Praca's own state** at `~/.aauth/praca/`:
+**The agent proxy's own state** at `~/.aauth/praca/`:
 
 | Path | What | Refresh |
 |---|---|---|
@@ -110,14 +110,14 @@ JSON files for v1; promote to SQLite if concurrent writes get painful. File-lock
 v.next adds:
 - `functions/{name}.json` — saved-function source + scope + sub-agent identity
 - `functions/{name}.wasm` (optional) — pre-compiled QuickJS bytecode if we end up caching that
-- daemon mode (one persistent praca per user, hosts connect via Unix socket — the SSH_AUTH_SOCK pattern)
+- daemon mode (one persistent agent proxy per user, hosts connect via Unix socket — the SSH_AUTH_SOCK pattern)
 
 ## Bootstrap
 
 Once per machine:
 
-1. praca generates the parent keypair (software)
-2. praca-as-AP signs the parent's agent token (one enclave signature)
+1. the agent proxy generates the parent keypair (software)
+2. the agent-proxy-as-AP signs the parent's agent token (one enclave signature)
 3. User completes parent grant at PS (mobile app, web)
 4. Subsequent host launches reuse all of this
 
@@ -127,13 +127,13 @@ The discovery layer is built around the three-layer state model (`L1` added / `L
 
 ### L2 — discoverable resources (the registry)
 
-The registry at `registry.aauth.dev` is an agent-token-gated Worker. praca calls `GET /resources` over a **signed** request using the same agent-token + HTTP-signature path it already uses for any AAuth resource. The response is `{ resources: RegistryEntry[], updated }`; each entry carries `{ issuer, name, description, access_mode, logo_uri?, added, submitted_by }` — and only that. praca caches at `~/.aauth/praca/catalog/registry.json`, refreshes on startup + 24h background, ETag-conditional.
+The registry at `registry.aauth.dev` is an agent-token-gated Worker. The agent proxy calls `GET /resources` over a **signed** request using the same agent-token + HTTP-signature path it already uses for any AAuth resource. The response is `{ resources: RegistryEntry[], updated }`; each entry carries `{ issuer, name, description, access_mode, logo_uri?, added, submitted_by }` — and only that. The agent proxy caches at `~/.aauth/praca/catalog/registry.json`, refreshes on startup + 24h background, ETag-conditional.
 
-`PRACA_REGISTRY_URL` overrides the default for tests / self-hosted registries. Operators may also publish their own resource directory: for example, Hello's Ponte operator advertises its hosted proxies at `ponte.hello-proxy.net` and praca treats it as a registry source under the same signed-call contract.
+`PRACA_REGISTRY_URL` overrides the default for tests / self-hosted registries. Operators may also publish their own resource directory: for example, Hello's resource proxy operator advertises its hosted proxies at `proxy.aauth.dev` and the agent proxy treats it as a registry source under the same signed-call contract.
 
 ### L1 — added resources
 
-The agent calls `add_resource(host_or_url)`. praca:
+The agent calls `add_resource(host_or_url)`. The agent proxy:
 
 1. Normalizes the input to a bare lowercased host.
 2. Fetches `https://{host}/.well-known/aauth-resource.json` (manual redirect, timeout, size cap — same SSRF guards the registry applies).
@@ -145,33 +145,33 @@ After `add_resource`:
 - `access_mode: agent-token` resources are immediately invokable.
 - `access_mode: aauth-access-token` / `auth-token` resources are *added* but `invoke` will return an interaction URL on first call; `connect(resource)` is the explicit pre-auth path.
 
-`add_resource` is the canonical entry point for both registry-found and direct-URL resources. No registry inclusion is required — direct URL is first-class. Praca never gatekeeps on registry membership.
+`add_resource` is the canonical entry point for both registry-found and direct-URL resources. No registry inclusion is required — direct URL is first-class. The agent proxy never gatekeeps on registry membership.
 
 ### L3 — operations within a resource
 
-Per-resource ops are fetched on first `list_operations`/`get_operations` call against that resource, cached at `~/.aauth/praca/catalog/{host}/{vocab}.json`. praca reads the resource's `r3_vocabularies` and loads each one through the matching adapter; vocab docs are cached with a TTL and refreshed lazily.
+Per-resource ops are fetched on first `list_operations`/`get_operations` call against that resource, cached at `~/.aauth/praca/catalog/{host}/{vocab}.json`. The agent proxy reads the resource's `r3_vocabularies` and loads each one through the matching adapter; vocab docs are cached with a TTL and refreshed lazily.
 
 `list_operations` returns a bounded summary list (no schemas); `get_operations` is the explicit "give me the full schemas for these op_ids" call. This separation matters because schemas dominate token cost — Speakeasy's published numbers show schema-bearing tool listings 5-10× larger than summary-only listings. (See "Tool surface".)
 
 ## Operator selection
 
-> **Deferred (2026-06-09).** Operator-selection policy needs `kind`/`wraps`/`operator` signals per registry entry to operate on. The live `registry.aauth.dev` does not carry those fields today — entries are `{ issuer, name, description, access_mode, logo_uri?, added, submitted_by }`. Until praca can either (a) get those fields surfaced in the registry or (b) derive them from each resource's well-known (`kind` is implicit from the resource being a proxy at all; `wraps` is not currently advertised; `operator` would need a new well-known field), there's nothing to choose between, so the design below is held against future need rather than implemented. The deferred path is most likely (a) — extend the registry schema once we have a second operator fronting the same upstream.
+> **Deferred (2026-06-09).** Operator-selection policy needs `kind`/`wraps`/`operator` signals per registry entry to operate on. The live `registry.aauth.dev` does not carry those fields today — entries are `{ issuer, name, description, access_mode, logo_uri?, added, submitted_by }`. Until the agent proxy can either (a) get those fields surfaced in the registry or (b) derive them from each resource's well-known (`kind` is implicit from the resource being a proxy at all; `wraps` is not currently advertised; `operator` would need a new well-known field), there's nothing to choose between, so the design below is held against future need rather than implemented. The deferred path is most likely (a) — extend the registry schema once we have a second operator fronting the same upstream.
 
-When the catalog holds more than one entry sharing a `wraps` value — several operators fronting the same upstream (e.g., Hello and Acme both proxy `api.hubapi.com`) — praca picks one **by default, without prompting**. The registry carries no ranking signals (it stays pure discovery); the selection policy lives here, in the agent.
+When the catalog holds more than one entry sharing a `wraps` value — several operators fronting the same upstream (e.g., Hello and Acme both proxy `api.hubapi.com`) — the agent proxy picks one **by default, without prompting**. The registry carries no ranking signals (it stays pure discovery); the selection policy lives here, in the agent.
 
-**Resolution order.** For a given upstream, praca resolves to a single operator using, in order:
+**Resolution order.** For a given upstream, the agent proxy resolves to a single operator using, in order:
 
 1. **User-pinned operator** — if the user has pinned an operator for this upstream, use it.
 2. **Trust set** — the user's (or org's) configured set of trusted operators; the highest-ranked trusted candidate wins.
 3. **Fallback ordering** — a built-in default preference: the agent vendor's first-party operator first, then a curated default list.
 
-**Escalation.** praca surfaces the choice to the user (and the LLM) only when the policy can't decide cleanly:
+**Escalation.** The agent proxy surfaces the choice to the user (and the LLM) only when the policy can't decide cleanly:
 
 - no candidate operator is in the trust set,
 - two or more candidates rank equally, or
 - the user's policy says "always ask" for this upstream or operator.
 
-**Policy storage.** The policy lives in praca's state dir as `~/.aauth/praca/operator-policy.json`:
+**Policy storage.** The policy lives in the agent proxy's state dir as `~/.aauth/praca/operator-policy.json`:
 
 ```json
 {
@@ -182,13 +182,13 @@ When the catalog holds more than one entry sharing a `wraps` value — several o
 }
 ```
 
-Defaults on a fresh install: all four lists empty. With no trust set and no fallback, praca prompts the user (and the LLM) the first time an upstream resolves to more than one operator. Distributions / agent vendors may ship a populated `fallback` and `trust_set` to silently prefer their first-party operator; that's a packaging concern, not a praca-core default. praca needs nothing more from the registry than the `kind`, `operator`, and `wraps` fields it already exposes to run this policy.
+Defaults on a fresh install: all four lists empty. With no trust set and no fallback, the agent proxy prompts the user (and the LLM) the first time an upstream resolves to more than one operator. Distributions / agent vendors may ship a populated `fallback` and `trust_set` to silently prefer their first-party operator; that's a packaging concern, not an agent-proxy-core default. The agent proxy needs nothing more from the registry than the `kind`, `operator`, and `wraps` fields it already exposes to run this policy.
 
 ## Vocabularies
 
-A resource self-describes by advertising one or more **vocabularies** in `r3_vocabularies` — each a `{ urn → vocab_doc_url }` pair. The vocab doc tells praca what operations exist, how to format requests, and what kinds of responses to expect. Multiple vocabularies per resource are first-class: a HubSpot proxy can carry both OpenAPI (CRM operations) and AsyncAPI (webhook events); a Slack proxy can carry OpenAPI (Web API) and AsyncAPI (RTM events).
+A resource self-describes by advertising one or more **vocabularies** in `r3_vocabularies` — each a `{ urn → vocab_doc_url }` pair. The vocab doc tells the agent proxy what operations exist, how to format requests, and what kinds of responses to expect. Multiple vocabularies per resource are first-class: a HubSpot proxy can carry both OpenAPI (CRM operations) and AsyncAPI (webhook events); a Slack proxy can carry OpenAPI (Web API) and AsyncAPI (RTM events).
 
-The vocabulary is **internal to praca**. The LLM never sees the URN, the adapter, or the spec doc; it sees only the operations themselves with a `kind` tag (`sync.request` / `async.send` / `async.receive`) that captures the semantically-load-bearing distinction.
+The vocabulary is **internal to the agent proxy**. The LLM never sees the URN, the adapter, or the spec doc; it sees only the operations themselves with a `kind` tag (`sync.request` / `async.send` / `async.receive`) that captures the semantically-load-bearing distinction.
 
 ### URN registry (v1)
 
@@ -199,7 +199,7 @@ The vocabulary is **internal to praca**. The LLM never sees the URN, the adapter
 | `urn:aauth:vocabulary:mcp-tools` | future | MCP tool-list as a vocab — useful for resources that ARE MCP servers fronted by AAuth. |
 | `urn:aauth:vocabulary:graphql` | future | GraphQL schema as a vocab. |
 
-URN convention is praca-design today; the right long-term home is the AAuth spec itself (alongside `r3_vocabularies`). Lift it when a second adapter ships.
+URN convention is agent-proxy-design today; the right long-term home is the AAuth spec itself (alongside `r3_vocabularies`). Lift it when a second adapter ships.
 
 ### Adapter interface
 
@@ -218,11 +218,11 @@ type InvocationPlan =
   | { kind: 'async.receive'; channel: string; filter?: unknown }     // v.next-only via the runtime
 ```
 
-praca's adapter table is keyed by URN. At `add_resource` time, praca walks `r3_vocabularies`, picks every URN it has an adapter for, and stores the picked list on the L1 entry. `list_operations` runs all picked adapters and flattens results; `get_operations` and `invoke` look up the owning adapter by `(resource, opId)`.
+The agent proxy's adapter table is keyed by URN. At `add_resource` time, the agent proxy walks `r3_vocabularies`, picks every URN it has an adapter for, and stores the picked list on the L1 entry. `list_operations` runs all picked adapters and flattens results; `get_operations` and `invoke` look up the owning adapter by `(resource, opId)`.
 
 ### OpId namespacing
 
-OpIds come from the vocab doc as-is (OpenAPI `operationId`, AsyncAPI operation key, etc.). When two vocabularies at the same resource expose the same opId — rare in practice, since the conventions differ — praca's resource loader detects the collision deterministically and prefixes both (`openapi:contact.created`, `asyncapi:contact.created`) before the ops ever reach the LLM. The prefix scheme is stable, so saved-function code referencing an opId never silently breaks.
+OpIds come from the vocab doc as-is (OpenAPI `operationId`, AsyncAPI operation key, etc.). When two vocabularies at the same resource expose the same opId — rare in practice, since the conventions differ — the agent proxy's resource loader detects the collision deterministically and prefixes both (`openapi:contact.created`, `asyncapi:contact.created`) before the ops ever reach the LLM. The prefix scheme is stable, so saved-function code referencing an opId never silently breaks.
 
 ### Sync vs async lifecycle
 
@@ -232,16 +232,16 @@ OpIds come from the vocab doc as-is (OpenAPI `operationId`, AsyncAPI operation k
 
 ### Vocab-less resources
 
-A resource MAY advertise no `r3_vocabularies`. praca still adds it; `list_operations` returns empty and the LLM falls back to calling `invoke(resource, '/some/path', args)` with `op_id` interpreted as the raw path. This is the escape hatch for resources that haven't (yet) published a spec — the LLM has to know what it's doing, but the door isn't closed.
+A resource MAY advertise no `r3_vocabularies`. The agent proxy still adds it; `list_operations` returns empty and the LLM falls back to calling `invoke(resource, '/some/path', args)` with `op_id` interpreted as the raw path. This is the escape hatch for resources that haven't (yet) published a spec — the LLM has to know what it's doing, but the door isn't closed.
 
 ## Trust & key model
 
 | Key | Location | Used for | Cost per use |
 |---|---|---|---|
 | **AP signing key** | enclave (SE/PIV via `@aauth/local-keys`) | Signing agent tokens (parent's, and v.next sub-agents') | SE ~30–50ms, PIV/YubiKey ~150–300ms |
-| **Parent agent keypair** | software (in praca memory) | Parent's request signatures, HTTP signatures to PS | software Ed25519, ~50µs |
+| **Parent agent keypair** | software (in agent proxy memory) | Parent's request signatures, HTTP signatures to PS | software Ed25519, ~50µs |
 
-**praca *is* the AP in v1.** The MCP server holds both the AP key (enclave-backed) and the parent's software key. The "spawn protocol" question from AAuth issue #23 collapses to an internal function call in this deployment. For multi-tenant praca deployments, AP and parent agent identity would be separated; for personal-install, the collapse is appropriate.
+**The agent proxy *is* the AP in v1.** The MCP server holds both the AP key (enclave-backed) and the parent's software key. The "spawn protocol" question from AAuth issue #23 collapses to an internal function call in this deployment. For multi-tenant agent-proxy deployments, AP and parent agent identity would be separated; for personal-install, the collapse is appropriate.
 
 Enclave signature accounting:
 - One sig at first run (mint parent's agent token; reused until expiry)
@@ -252,25 +252,25 @@ Compromise model: process compromise leaks AP key (forge any future agent for th
 
 ## Interaction relay
 
-When an AAuth resource issues an interaction (escalation needed, fingerprint check, step-up auth), praca is the conduit between resource and PS:
+When an AAuth resource issues an interaction (escalation needed, fingerprint check, step-up auth), the agent proxy is the conduit between resource and PS:
 
 1. Resource responds to a signed request with an interaction payload + resource_token
-2. praca forwards the resource_token to PS along with parent's agent token
+2. the agent proxy forwards the resource_token to PS along with parent's agent token
 3. PS drives the user-approval flow (mobile app preferred, web fallback)
 4. PS returns resolution (auth_token, denied, deferred)
-5. praca returns auth_token to resource (and surfaces deny/defer to the LLM)
+5. the agent proxy returns auth_token to resource (and surfaces deny/defer to the LLM)
 
-Sensitive operations follow the AAuth escalation path: resource mints a resource_token packed with operation context (sender, recipient, body excerpt), praca carries it to PS, PS drives mobile-app approval, only on approval mints auth_token bound to praca's parent key. **praca never sees or constructs the consent URL the user sees.**
+Sensitive operations follow the AAuth escalation path: resource mints a resource_token packed with operation context (sender, recipient, body excerpt), the agent proxy carries it to PS, PS drives mobile-app approval, only on approval mints auth_token bound to the agent proxy's parent key. **The agent proxy never sees or constructs the consent URL the user sees.**
 
 ### Notification fallback
 
-When PS can't reach the user via mobile push (offline, no app installed), PS may fall back to host-provided notification surfaces. praca does not participate in that fallback — it's a PS↔host arrangement, not a praca concern.
+When PS can't reach the user via mobile push (offline, no app installed), PS may fall back to host-provided notification surfaces. The agent proxy does not participate in that fallback — it's a PS↔host arrangement, not an agent-proxy concern.
 
 ## v1 scope (locked)
 
 What ships:
 
-- praca as `@aauth/praca`, stdio MCP server, eight-tool v1 surface (`find_resources`, `add_resource`, `list_resources`, `remove_resource`, `connect`, `list_operations`, `get_operations`, `invoke`)
+- the agent proxy as `@aauth/proxy`, stdio MCP server, eight-tool v1 surface (`find_resources`, `add_resource`, `list_resources`, `remove_resource`, `connect`, `list_operations`, `get_operations`, `invoke`)
 - Three-layer state at `~/.aauth/praca/` (resources / registry cache / vocab cache + connections)
 - Signed `GET registry.aauth.dev/resources` for L2 discovery; direct URL add via `add_resource` works without registry
 - Vocabulary adapter abstraction with one full OpenAPI adapter and one partial AsyncAPI adapter (publish only)
@@ -295,14 +295,14 @@ A coherent additive bundle. Doesn't require rewriting v1 components.
 
 ### Motivation
 
-In v1, the LLM emits one MCP `tool_use` per upstream call. Multi-step workflows ("summarize unread Gmail from family@, post to Slack") are token-expensive. v.next extends Anthropic's "MCP code execution" pattern (late 2025): the model writes a script that imports tools as functions and runs in a sandbox. praca makes each script a verifiable AAuth sub-agent with its own identity and audit trail.
+In v1, the LLM emits one MCP `tool_use` per upstream call. Multi-step workflows ("summarize unread Gmail from family@, post to Slack") are token-expensive. v.next extends Anthropic's "MCP code execution" pattern (late 2025): the model writes a script that imports tools as functions and runs in a sandbox. The agent proxy makes each script a verifiable AAuth sub-agent with its own identity and audit trail.
 
 ### Sub-agents via AAuth issue #23
 
 Each registered function, webhook handler, or one-shot is an AAuth sub-agent of the parent:
 
 ```
-praca-parent (top-level agent)
+agent-proxy parent (top-level agent)
 ├── register_function("send_digest")    → sub-agent parent+send_digest
 ├── register_handler("slack.message")   → sub-agent parent+on_slack_message
 └── run_code(code, scope)               → sub-agent parent+oneshot-{uuid}
@@ -310,9 +310,9 @@ praca-parent (top-level agent)
 
 ### LLM surfacing — Option A
 
-Each saved function appears as a real MCP tool in `tools/list` (added via `notifications/tools/list_changed` after `register_function`). The LLM calls `mySalesDigest(args)` like any other tool; praca routes the call to the saved code in a fresh QuickJS-WASM isolate. The lifecycle meta-tools (`register_function` / `list_functions` / `remove_function` / `run_code`) sit alongside the saved tools; `list_functions` is the canonical fresh snapshot for clients that don't honor `list_changed`. (See "v.next surface" under "Tool surface".)
+Each saved function appears as a real MCP tool in `tools/list` (added via `notifications/tools/list_changed` after `register_function`). The LLM calls `mySalesDigest(args)` like any other tool; the agent proxy routes the call to the saved code in a fresh QuickJS-WASM isolate. The lifecycle meta-tools (`register_function` / `list_functions` / `remove_function` / `run_code`) sit alongside the saved tools; `list_functions` is the canonical fresh snapshot for clients that don't honor `list_changed`. (See "v.next surface" under "Tool surface".)
 
-Sub-agent has its own software keypair and an agent token signed by AP (one enclave sig per spawn) with `act.agent = parent`. When sub-agent code calls upstream, AAuth challenges produce a resource_token bound to sub-agent's key; praca (parent) takes it to PS as `resource_token: sub.rt, actor_token: parent.at`; PS returns auth_token bound to sub-agent. PS audit reads "parent, acting via sub-agent X, did Y." Revoking parent's grant kills all sub-agents at next auth.
+Sub-agent has its own software keypair and an agent token signed by AP (one enclave sig per spawn) with `act.agent = parent`. When sub-agent code calls upstream, AAuth challenges produce a resource_token bound to sub-agent's key; the agent proxy (parent) takes it to PS as `resource_token: sub.rt, actor_token: parent.at`; PS returns auth_token bound to sub-agent. PS audit reads "parent, acting via sub-agent X, did Y." Revoking parent's grant kills all sub-agents at next auth.
 
 ### Runtime
 
@@ -388,11 +388,11 @@ Get these right in v1 and v.next is a runtime bolt-on.
 
 ### Rebuild cadence (v.next)
 
-| Change | Restart praca? | Rebuild WASM? |
+| Change | Restart the agent proxy? | Rebuild WASM? |
 |---|---|---|
 | New service in catalog | no | no |
 | New method on existing service | no | no |
-| Update to praca host code | yes (normal release) | no |
+| Update to agent proxy host code | yes (normal release) | no |
 | Add host primitive (e.g. `register_handler`) | yes | yes (rare) |
 | QuickJS-WASM version bump | yes | yes (rare) |
 
@@ -400,8 +400,8 @@ Get these right in v1 and v.next is a runtime bolt-on.
 
 | Rejected | Why |
 |---|---|
-| Native AAuth client embedded in host (instead of praca-as-MCP) | Per-host implementation effort; praca-as-MCP works for any MCP-aware host |
-| Many MCP servers (one per upstream) | Catalog churn; praca-as-discovery scales better |
+| Native AAuth client embedded in host (instead of agent-proxy-as-MCP) | Per-host implementation effort; agent-proxy-as-MCP works for any MCP-aware host |
+| Many MCP servers (one per upstream) | Catalog churn; agent-proxy-as-discovery scales better |
 | Sibling HTTPS signing proxy | Loses MCP's structured tool descriptions |
 | Embedding `@aauth/local-keys` directly in host process | Reduces cross-host reusability |
 | Routing PS↔user clarifications through chat | Breaks trust model — too many boundaries |
@@ -411,12 +411,12 @@ Get these right in v1 and v.next is a runtime bolt-on.
 | V8 isolates (`isolated-vm`) for v.next runtime | WASM cap-model gives stronger isolation — absence of an import IS the deny |
 | Wasmtime-hosted QuickJS over `quickjs-emscripten` | We don't need WASI HTTP/FS; import surface IS the API |
 | Registry entries carrying full method/scope metadata | That belongs at the resource via `.well-known/aauth-resource.json`; registry stays a thin directory |
-| Vocab string exposed to the LLM in OpSummary/invoke | Vocab is praca-internal routing; `kind` carries the LLM-relevant distinction (sync vs async, publish vs subscribe). Smaller surface, no learned vocabulary in the prompt. |
+| Vocab string exposed to the LLM in OpSummary/invoke | Vocab is agent-proxy-internal routing; `kind` carries the LLM-relevant distinction (sync vs async, publish vs subscribe). Smaller surface, no learned vocabulary in the prompt. |
 | Always-prefixing opIds with vocab | Collisions are rare; prefix-on-collision keeps the common case clean while staying collision-safe |
 | Code-mode (single `execute` tool over typed TS API, Cloudflare style) in v1 | Mechanism B (meta-tools) is portable across MCP clients today; Mechanism A (code-mode) is exactly what v.next's QuickJS-WASM sub-agent runtime delivers, locally |
 | Embedding-ranked tool retrieval (Portkey-style) in v1 | At ~10²–10³ ops per resource, structural path-prefix search is sufficient; revisit when L3 exceeds comfortable scan budget |
 | Resource path-prefixed AAuth resources (`https://api.foo.com/aauth/v2`) | AAuth is origin-rooted today; bare-host canonical form covers everything until/unless that changes |
-| `remove_resource` cascading into PS-side revocation | Tight coupling to a PS revoke API that may not exist; user might still want the grant alive for other agents. Praca-local only; PS revoke is a separate user-driven concern. |
+| `remove_resource` cascading into PS-side revocation | Tight coupling to a PS revoke API that may not exist; user might still want the grant alive for other agents. Agent-proxy-local only; PS revoke is a separate user-driven concern. |
 
 ## Deferred
 
@@ -425,25 +425,26 @@ Get these right in v1 and v.next is a runtime bolt-on.
 - AsyncAPI subscribe invocation — only useful behind a sub-agent, so deferred to v.next
 - MCP-tools and GraphQL vocabulary adapters
 - Operator-selection policy (waiting on registry `kind`/`wraps`/`operator` signals)
-- AAuth issue #22's `class` claim for distinguishing hosts on shared per-machine praca
+- **Multiple accounts per service** — hold more than one connected upstream account at the same resource (e.g. two Gmail accounts behind the same proxy host), with the user/LLM choosing which account an `invoke` runs against. Today the agent proxy keeps a single `connections/{host}.json` per resource; this needs per-account connection state (`connections/{host}/{account}.json`), an `account` selector on `connect`/`invoke` (default when one is connected, disambiguate when several), and `list_resources`/`connect` surfacing the connected-account set. Distinct from operator-selection (which operator fronts an upstream) — this is *which end-user account* at the chosen operator. Falls out of user-held identity: each account is just another grant under the same AAuth identity, not a new operator-scoped token slot. Contrast: Arcade Omni caps at one account per provider per Arcade user — `switch_account` replaces rather than adds (see `ponte/omni-compete.md` §2).
+- AAuth issue #22's `class` claim for distinguishing hosts on shared per-machine agent proxy
 - AAuth-spec home for the vocabulary URN registry — lift from this doc into the AAuth spec once we have a second adapter to validate against
 - Daemon mode with Unix-socket bridge
-- AP separation from praca for multi-tenant deployments
+- AP separation from the agent proxy for multi-tenant deployments
 - Snapshot/resume of WASM linear memory during long blocking interactions
 - Cross-language sub-agents (Rust, Go, Python via Pyodide)
 - SEP-1821 alignment: when MCP `tools/list?query=…` lands with real client support, fold `find_resources` + `list_operations` into thin wrappers over the spec primitive
 
 ## Phased plan
 
-1. ✅ **Phase 0 — Skeleton.** praca stdio MCP server with single-resource `discover`/`invoke`/`connect`. Central `hostCall` dispatcher, catalog-driven, caller identity as parameter. Validated against Claude Code.
+1. ✅ **Phase 0 — Skeleton.** the agent proxy stdio MCP server with single-resource `discover`/`invoke`/`connect`. Central `hostCall` dispatcher, catalog-driven, caller identity as parameter. Validated against Claude Code.
 2. ✅ **Phase 1 — First real resource.** Connected to a real AAuth-fronted upstream and ran the full AAuth dance end-to-end: resource_tokens, escalation, interactions, interaction relay.
 3. ✅ **Phase 2 — Discovery layer (multi-resource).** Refactored `catalog.ts` into a `VocabAdapter` interface (one OpenAPI adapter); added registry client (signed `GET /resources` + ETag); added L1 store at `~/.aauth/praca/resources.json`; rewired `server.ts` to the eight-tool surface; added `PRACA_REGISTRY_URL`.
 4. **Phase 3 — AsyncAPI partial.** AsyncAPI adapter listing `send` + `receive` ops; `invoke` runs `async.send`; `async.receive` returns `async_subscribe_requires_subagent`. Drives the second-vocab validation of the adapter interface.
-5. **Phase 4 — Container host bridge.** praca exposes HTTP listener for container-resident hosts. Register via host's MCP config pointing at `host.docker.internal:<port>`. Validate signing + invoke from inside container.
+5. **Phase 4 — Container host bridge.** the agent proxy exposes HTTP listener for container-resident hosts. Register via host's MCP config pointing at `host.docker.internal:<port>`. Validate signing + invoke from inside container.
 6. **Phase 5 — Approval UX.** Wire up notification fallback path (PS → host notification surface) for cases where mobile push is unavailable.
 7. **Phase 6 — v.next bundle.** Sub-agents per issue #23, MCP-as-AP minting sub-agent tokens, QuickJS-emscripten runtime, catalog-driven named bindings + generic escape hatch, central `hostCall` extended with sub-agent identities. Adds `run_code`/`register_function`/`list_functions`/`remove_function` MCP tools; saved functions surfaced via `tools/list_changed` (Option A). AsyncAPI subscribe becomes invokable via `register_handler`.
 8. **Phase 7+.** Issue #22 `class` claim, daemon mode, multi-tenant AP separation, multi-language sub-agents, AAuth-spec home for the vocabulary URN registry.
 
 ## Single-sentence summary
 
-praca is the user's AAuth agent in MCP form — a stdio-launched Node process that holds the user's parent identity, exposes a fixed eight-tool meta-surface (`find_resources` / `add_resource` / `list_resources` / `remove_resource` / `connect` / `list_operations` / `get_operations` / `invoke`) over three layers of state (added resources / cached registry / per-resource ops), dispatches via vocabulary adapters (OpenAPI today; AsyncAPI partial; MCP-tools and GraphQL later) through a single `hostCall(caller, resource, opId, args)` chokepoint, and relays AAuth interactions between resources and PS — so that v1 ships as a clean, token-flat MCP↔AAuth bridge and v.next bolts on a QuickJS-WASM sub-agent runtime whose saved functions appear as first-class MCP tools without rewriting a line of v1.
+the agent proxy is the user's AAuth agent in MCP form — a stdio-launched Node process that holds the user's parent identity, exposes a fixed eight-tool meta-surface (`find_resources` / `add_resource` / `list_resources` / `remove_resource` / `connect` / `list_operations` / `get_operations` / `invoke`) over three layers of state (added resources / cached registry / per-resource ops), dispatches via vocabulary adapters (OpenAPI today; AsyncAPI partial; MCP-tools and GraphQL later) through a single `hostCall(caller, resource, opId, args)` chokepoint, and relays AAuth interactions between resources and PS — so that v1 ships as a clean, token-flat MCP↔AAuth bridge and v.next bolts on a QuickJS-WASM sub-agent runtime whose saved functions appear as first-class MCP tools without rewriting a line of v1.

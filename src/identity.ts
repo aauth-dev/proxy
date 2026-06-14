@@ -1,17 +1,17 @@
-// praca's runtime identity port.
+// the agent proxy's runtime identity port.
 //
-// An IdentityProvider resolves the PracaConfig (psUrl + agent private JWK +
+// An IdentityProvider resolves the ProxyConfig (psUrl + agent private JWK +
 // agent token) for the current principal. This module is transport- and
 // platform-agnostic and MUST NOT import @aauth/local-keys (or any Node-only
-// enclave dependency) — that keeps a workerd bundle of @aauth/praca's core
-// enclave-free. The stdio server's provider lives in @aauth/praca/local
+// enclave dependency) — that keeps a workerd bundle of @aauth/proxy's core
+// enclave-free. The stdio server's provider lives in @aauth/proxy/local
 // (createLocalKeysIdentityProvider); other hosts (e.g. a multi-tenant server)
 // supply their own.
 
-import type { PracaConfig } from './agent.js'
+import type { ProxyConfig } from './agent.js'
 
 export type BootstrapStatus =
-  | { kind: 'ready'; cfg: PracaConfig }
+  | { kind: 'ready'; cfg: ProxyConfig }
   | { kind: 'needsBootstrap' }
 
 export interface IdentityProvider {

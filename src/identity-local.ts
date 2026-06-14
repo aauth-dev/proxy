@@ -1,4 +1,4 @@
-// @aauth/praca/local — the Node-only identity adapter for the stdio server.
+// @aauth/proxy/local — the Node-only identity adapter for the stdio server.
 //
 // This is the only place @aauth/local-keys is imported, so the package's core
 // entry point stays enclave-free (and bundleable for workerd). Two sources:
@@ -7,20 +7,20 @@
 //  - @aauth/local-keys: the real path — the bootstrapped AP key (Secure Enclave
 //    / YubiKey) mints the agent token, binding a fresh software ephemeral key.
 //    That ephemeral key (returned as `signingKey`) signs HTTP requests, so
-//    praca's request-signing path is unchanged; only token minting differs.
+//    the agent proxy's request-signing path is unchanged; only token minting differs.
 
 import { readFileSync } from 'node:fs'
 import { createAgentToken, getAgentConfig, listAgentProviders } from '@aauth/local-keys'
-import type { AgentSigningKey, PracaConfig } from './agent.js'
+import type { AgentSigningKey, ProxyConfig } from './agent.js'
 import type { IdentityProvider } from './identity.js'
 
 function required(name: string): string {
   const value = process.env[name]
-  if (!value) throw new Error(`praca: missing required env var ${name}`)
+  if (!value) throw new Error(`agent proxy: missing required env var ${name}`)
   return value
 }
 
-export function loadIdentity(): PracaConfig {
+export function loadIdentity(): ProxyConfig {
   const psUrl = required('PRACA_PS_URL')
   const agentToken = required('PRACA_AGENT_TOKEN')
 
@@ -33,14 +33,14 @@ export function loadIdentity(): PracaConfig {
 
 export async function buildConfigFromLocalKeys(
   opts: { agentUrl?: string; psUrl?: string; local?: string } = {},
-): Promise<PracaConfig> {
+): Promise<ProxyConfig> {
   const agentUrl = opts.agentUrl ?? process.env.PRACA_AGENT_URL ?? listAgentProviders()[0]
   if (!agentUrl) {
-    throw new Error('praca: no agent configured (run @aauth/bootstrap) and no PRACA_AGENT_URL set')
+    throw new Error('agent proxy: no agent configured (run @aauth/bootstrap) and no PRACA_AGENT_URL set')
   }
 
   const psUrl = opts.psUrl ?? process.env.PRACA_PS_URL ?? getAgentConfig(agentUrl)?.personServerUrl
-  if (!psUrl) throw new Error(`praca: no Person Server configured for ${agentUrl}; set PRACA_PS_URL`)
+  if (!psUrl) throw new Error(`agent proxy: no Person Server configured for ${agentUrl}; set PRACA_PS_URL`)
 
   // The AP key (enclave/yubikey) signs the agent token, binding a fresh software
   // ephemeral key returned as signingKey.
@@ -63,7 +63,7 @@ export async function buildConfigFromLocalKeys(
 // sourced by the caller from the MCP client's declared name so each host on the
 // user's machine gets a distinct identifier.
 export function createLocalKeysIdentityProvider(): IdentityProvider {
-  let cached: PracaConfig | null = null
+  let cached: ProxyConfig | null = null
   return {
     async resolve({ local }) {
       if (cached) return { kind: 'ready', cfg: cached }
