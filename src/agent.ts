@@ -231,8 +231,22 @@ export async function invokeAtResource(
   }
 
   // agent-token access mode: sign with the agent token + go. No PS exchange.
+  // If the resource returns a 401 auth-token challenge, escalate to the PS.
   if (l1.access_mode === 'agent-token') {
-    const res = await signWith(cfg, cfg.agentToken)(apiUrl, requestInit)
+    const signAgent = signWith(cfg, cfg.agentToken)
+    let res = await signAgent(apiUrl, requestInit)
+    const challenge =
+      res.status === 401 ? parseAuthTokenChallenge(res.headers.get('aauth-requirement')) : undefined
+    if (challenge) {
+      const ps = await psMetadata(cfg.psUrl)
+      const ex = await exchangeAtPS(signAgent, ps.token_endpoint, challenge, cfg)
+      if (ex.kind !== 'token') return ex
+      res = await signWith(cfg, ex.authToken)(apiUrl, requestInit)
+      if (res.status === 202) {
+        const interaction = interactionFrom(res)
+        if (interaction) return { kind: 'interaction', interaction }
+      }
+    }
     return { kind: 'result', status: res.status, body: await safeBody(res) }
   }
 
