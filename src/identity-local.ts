@@ -53,6 +53,16 @@ export async function buildConfigFromLocalKeys(
   }
 }
 
+// Returns true if the JWT's exp claim is within bufferSecs of now (or missing).
+function isJwtExpired(jwt: string, bufferSecs = 60): boolean {
+  try {
+    const payload = JSON.parse(Buffer.from(jwt.split('.')[1], 'base64url').toString('utf8'))
+    return typeof payload.exp === 'number' && payload.exp - bufferSecs < Date.now() / 1000
+  } catch {
+    return false
+  }
+}
+
 // The stdio server's IdentityProvider. Resolves lazily and caches the result
 // so the enclave signs the agent token at most once per session (the env path
 // is likewise resolved once). When no agent provider is configured it returns
@@ -66,7 +76,13 @@ export function createLocalKeysIdentityProvider(): IdentityProvider {
   let cached: ProxyConfig | null = null
   return {
     async resolve({ local }) {
-      if (cached) return { kind: 'ready', cfg: cached }
+      if (cached) {
+        // Static env-var token can't be re-minted — return as-is.
+        if (process.env.PROXY_AGENT_PRIVATE_JWK) return { kind: 'ready', cfg: cached }
+        // AP-key path: re-mint if the token is close to expiry.
+        if (!isJwtExpired(cached.agentToken)) return { kind: 'ready', cfg: cached }
+        cached = null
+      }
       if (process.env.PROXY_AGENT_PRIVATE_JWK) {
         cached = loadIdentity()
         return { kind: 'ready', cfg: cached }

@@ -175,7 +175,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     'add_resource',
     {
       description: describeWithL1(
-        'Add an AAuth resource to your local set. Pass a bare host, host:port, or full URL — the agent proxy canonicalizes. Fetches the resource\'s well-known doc, validates, picks supported vocabularies. After adding: agent-token resources are immediately invokable; aauth-access-token/auth-token resources need `connect` or a first `invoke` that surfaces the auth URL.',
+        'Add an AAuth resource to your local set. Pass a bare host, host:port, or full URL — the agent proxy canonicalizes. Fetches the resource\'s well-known doc, validates, picks supported vocabularies. After adding: agent-token resources are immediately invokable; auth-token resources need `connect` or a first `invoke` that surfaces the auth URL.',
       ),
       inputSchema: { resource: z.string() },
     },
@@ -236,7 +236,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     'connect',
     {
       description: describeWithL1(
-        'Pre-authorize a resource — trigger a Person Server consent step if needed. No-op for agent-token resources. For aauth-access-token/auth-token resources, invokes a probe operation to surface the auth URL; returns "already connected" if the auth succeeds.',
+        'Pre-authorize a resource — trigger a Person Server consent step if needed. No-op for agent-token resources. For auth-token resources, invokes a probe operation to surface the auth URL; returns "already connected" if the auth succeeds.',
       ),
       inputSchema: { resource: z.string() },
     },
@@ -312,7 +312,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     'invoke',
     {
       description: describeWithL1(
-        'Invoke an operation on a resource. Pass `path_params`, `query`, `body` (object) as needed. On first call to an unauthorized aauth-access-token resource, returns an auth URL — open it, then call invoke again. async.receive operations return `subscribe_requires_subagent` (v.next).',
+        'Invoke an operation on a resource. Pass `path_params`, `query`, `body` (object) as needed. On first call to an unauthorized auth-token resource, returns an auth URL — open it, then call invoke again. async.receive operations return `subscribe_requires_subagent` (v.next).',
       ),
       inputSchema: {
         resource: z.string(),

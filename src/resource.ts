@@ -212,12 +212,12 @@ export async function routeOperation(
 // Convert a FetchedResource into the persisted L1 shape.
 //
 // access_mode default: if the resource advertises an authorization_endpoint
-// but no access_mode, infer aauth-access-token (the R3 flow is the only thing
+// but no access_mode, infer auth-token (the R3 flow is the only thing
 // authorization_endpoint exists for). Absent both, default to agent-token
 // (resource accepts agent-signed requests directly — the registry's own mode).
 export function toL1Entry(r: FetchedResource): L1Entry {
   const inferredMode: AccessMode =
-    r.meta.access_mode ?? (r.meta.authorization_endpoint ? 'aauth-access-token' : 'agent-token')
+    r.meta.access_mode ?? (r.meta.authorization_endpoint ? 'auth-token' : 'agent-token')
   return {
     resource: r.host,
     origin: r.origin,
