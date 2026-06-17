@@ -7,7 +7,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js'
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 
 describe('agent proxy MCP server', () => {
-  it('starts over stdio and advertises the v1 eight-tool surface', async () => {
+  it('starts over stdio and advertises the v1 tool surface', async () => {
     const transport = new StdioClientTransport({
       command: 'npx',
       args: ['tsx', 'src/server.ts'],
@@ -26,7 +26,6 @@ describe('agent proxy MCP server', () => {
       const names = tools.map((t) => t.name).sort()
       for (const expected of [
         'add_resource',
-        'connect',
         'find_resources',
         'get_operations',
         'invoke',
