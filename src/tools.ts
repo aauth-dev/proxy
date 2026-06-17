@@ -277,9 +277,9 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
         const qr = renderUnicodeCompact(authUrl)
         return text(
           `Authorization required for ${found.l1.resource}.\n\n` +
-          `Show the user this URL and ask them to open it (use browser tools to open it if available):\n\n` +
-          `  ${authUrl}\n\n` +
-          `Or scan this QR code:\n\n` +
+          `IMPORTANT: Display the following QR code and URL to the user verbatim in your response.\n\n` +
+          `Authorization URL: ${authUrl}\n\n` +
+          `QR code (display this to the user so they can scan it):\n\n` +
           `\`\`\`\n${qr}\n\`\`\`\n\n` +
           `After the user completes authorization, call invoke again.`,
         )
