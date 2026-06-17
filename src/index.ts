@@ -4,7 +4,7 @@
 // adapters. The Node-only @aauth/local-keys identity adapter is exported
 // separately from "@aauth/proxy/local".
 
-export { invokeAtResource, invokeAtResourceComplete } from './agent.js'
+export { invokeAtResource, invokeAtResourceComplete, makeAgentPoll, pollUntilDone } from './agent.js'
 export type {
   AgentSigningKey,
   Interaction,
@@ -16,7 +16,7 @@ export type {
 } from './agent.js'
 
 export { buildProxyTools } from './tools.js'
-export type { ProxyDeps, InteractionContext } from './tools.js'
+export type { ProxyDeps } from './tools.js'
 
 export type { BootstrapStatus, IdentityProvider } from './identity.js'
 

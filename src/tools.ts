@@ -10,8 +10,8 @@
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
-import { invokeAtResource, invokeAtResourceComplete } from './agent.js'
-import type { ProxyConfig } from './agent.js'
+import { invokeAtResource } from './agent.js'
+import type { InvokeResult, ProxyConfig } from './agent.js'
 import { canonicalizeHost } from './host.js'
 import type { IdentityProvider } from './identity.js'
 import { fetchRegistry } from './registry.js'
@@ -32,37 +32,14 @@ export interface ProxyDeps {
   // Optional shared/persistent L3 vocab-doc cache. Defaults (inside resource.ts)
   // to a process-wide in-memory cache when omitted.
   docCache?: DocCache
-  // Side-channel for interaction URLs (e.g. open the OS browser). The URL is
-  // also returned as text for the LLM regardless, so this is best-effort.
-  onInteraction?: (url: string, code: string) => void
+  // Called when invoke encounters an interaction (authorization URL). May throw to
+  // initiate a native protocol-level flow (e.g. MCP URL elicitation for cloud hosts).
+  // For stdio hosts: open the OS browser and return; invoke falls back to returning
+  // the URL as text. Receives pollUrl so hosts can start background polling.
+  onInteraction?: (url: string, code: string, pollUrl: string) => void | Promise<void>
   // Supplies the local-part hint for the agent id. The stdio bin derives it
   // from the MCP client's name; omitted by hosts that allocate their own.
   agentLocal?: () => string | undefined
-  // How `invoke` handles a required interaction.
-  //   'surface' (default): non-blocking — return the interaction URL as text and
-  //     let the caller drive it + re-invoke (stdio / browser behavior).
-  //   'await': block — relay the interaction (onInteraction), poll until terminal
-  //     (heartbeat each round via onPoll), and return the completed result on the
-  //     original call. For HTTP hosts that hold a long-running tool call open.
-  //
-  // The callbacks receive an InteractionContext bound to THIS invoke request, so
-  // the host can push messages to the client over the held connection (e.g. emit
-  // an MCP progress notification carrying the interaction URL, and heartbeats).
-  interaction?: {
-    mode?: 'surface' | 'await'
-    onInteraction?: (url: string, code: string, ctx: InteractionContext) => void | Promise<void>
-    onPoll?: (elapsedMs: number, ctx: InteractionContext) => void | Promise<void>
-    pollTimeoutMs?: number
-  }
-}
-
-// Per-request hooks the host can use to talk to the client during an awaited
-// interaction. `sendNotification` writes a JSON-RPC notification to the active
-// transport; `progressToken` (if the client supplied one) correlates
-// notifications/progress frames to this call.
-export interface InteractionContext {
-  sendNotification: (n: { method: string; params?: Record<string, unknown> }) => Promise<void>
-  progressToken?: string | number
 }
 
 const text = (s: string) => ({ content: [{ type: 'text' as const, text: s }] })
@@ -117,16 +94,6 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     return { ok: true, l1: entry }
   }
 
-  // Surface an interaction: hand it to the side-channel (e.g. open a browser)
-  // and return the URL as text so the LLM can relay it regardless of transport.
-  function surfaceInteraction(url: string, code: string, retryTool: string) {
-    const full = `${url}?code=${code}`
-    deps.onInteraction?.(url, code)
-    return text(
-      `Authorization required. Open this URL to continue (your client may open it automatically), then call ${retryTool} again:\n${full}`,
-    )
-  }
-
   // ── Resource lifecycle ──
 
   server.registerTool(
@@ -175,7 +142,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     'add_resource',
     {
       description: describeWithL1(
-        'Add an AAuth resource to your local set. Pass a bare host, host:port, or full URL — the agent proxy canonicalizes. Fetches the resource\'s well-known doc, validates, picks supported vocabularies. After adding: agent-token resources are immediately invokable; auth-token resources need `connect` or a first `invoke` that surfaces the auth URL.',
+        'Add an AAuth resource to your local set. Pass a bare host, host:port, or full URL — the agent proxy canonicalizes. Fetches the resource\'s well-known doc, validates, picks supported vocabularies. After adding: agent-token resources are immediately invokable; auth-token resources start an authorization flow on the first `invoke`.',
       ),
       inputSchema: { resource: z.string() },
     },
@@ -188,7 +155,6 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
           added: entry.resource,
           access_mode: entry.access_mode,
           vocabularies: entry.picked_vocabs.map((v) => v.vocabUri),
-          connect_required: entry.access_mode !== 'agent-token',
         })
       } catch (err) {
         return text(`add_resource error: ${(err as Error).message}`)
@@ -229,40 +195,6 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       if (!canonical) return text(`invalid host: ${resource}`)
       const removed = await l1.remove(canonical.host)
       return text(removed ? `removed ${canonical.host}` : `not found: ${canonical.host}`)
-    },
-  )
-
-  server.registerTool(
-    'connect',
-    {
-      description: describeWithL1(
-        'Pre-authorize a resource — trigger a Person Server consent step if needed. No-op for agent-token resources. For auth-token resources, invokes a probe operation to surface the auth URL; returns "already connected" if the auth succeeds.',
-      ),
-      inputSchema: { resource: z.string() },
-    },
-    async ({ resource }) => {
-      const c = await getConfig()
-      if (!c.ok) return text(BOOTSTRAP_GUIDANCE)
-      const found = await requireL1(resource)
-      if (!found.ok) return text(found.msg)
-      const { l1: entry } = found
-      if (entry.access_mode === 'agent-token') {
-        return text(`${entry.resource}: already connected (agent-token access mode)`)
-      }
-      const ops = await listOperationsForResource(entry, undefined, docCache)
-      const probe = ops.find((o) => o.kind === 'sync.request' && o.method === 'GET')
-      if (!probe) return text(`${entry.resource}: no probe operation available for connect`)
-      const result = await invokeAtResource(c.cfg, entry, probe.opId, {})
-      if (result.kind === 'interaction') {
-        return surfaceInteraction(result.interaction.url, result.interaction.code, 'connect')
-      }
-      if (result.status >= 200 && result.status < 300) {
-        await l1.touch(entry.resource)
-        return text(`${entry.resource}: connected.`)
-      }
-      return text(
-        `${entry.resource}: connect probe returned ${result.status} — ${JSON.stringify(result.body)}`,
-      )
     },
   )
 
@@ -312,7 +244,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     'invoke',
     {
       description: describeWithL1(
-        'Invoke an operation on a resource. Pass `path_params`, `query`, `body` (object) as needed. On first call to an unauthorized auth-token resource, returns an auth URL — open it, then call invoke again. async.receive operations return `subscribe_requires_subagent` (v.next).',
+        'Invoke an operation on a resource. Pass `path_params`, `query`, `body` (object) as needed. If authorization is required, the client opens the auth URL automatically — call invoke again after authorization completes. async.receive operations return `subscribe_requires_subagent` (v.next).',
       ),
       inputSchema: {
         resource: z.string(),
@@ -322,47 +254,31 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
         body: z.record(z.string(), z.unknown()).optional(),
       },
     },
-    async ({ resource, op_id, path_params, query, body }, extra) => {
+    async ({ resource, op_id, path_params, query, body }) => {
       const c = await getConfig()
       if (!c.ok) return text(BOOTSTRAP_GUIDANCE)
       const found = await requireL1(resource)
       if (!found.ok) return text(found.msg)
       const invokeArgs = { pathParams: path_params, query, body }
-      try {
-        // 'await' mode: block — relay + poll the interaction to completion, return
-        // the result on this original call. (HTTP hosts holding a long call open.)
-        if (deps.interaction?.mode === 'await') {
-          const inter = deps.interaction
-          // Per-request context so host callbacks can push to the client (e.g.
-          // emit notifications/progress carrying the interaction URL + heartbeats).
-          const ctx: InteractionContext = {
-            sendNotification: (n) => extra.sendNotification(n as never),
-            progressToken: extra._meta?.progressToken,
-          }
-          const completed = await invokeAtResourceComplete(
-            c.cfg,
-            found.l1,
-            op_id,
-            (url, code) => inter.onInteraction?.(url, code, ctx),
-            invokeArgs,
-            5,
-            inter.pollTimeoutMs ?? 180_000,
-            (elapsedMs) => inter.onPoll?.(elapsedMs, ctx),
-          )
-          if (completed.status >= 200 && completed.status < 300) await l1.touch(found.l1.resource)
-          return json(completed)
-        }
 
-        // 'surface' mode (default): non-blocking — return the URL as text.
-        const result = await invokeAtResource(c.cfg, found.l1, op_id, invokeArgs)
-        if (result.kind === 'interaction') {
-          return surfaceInteraction(result.interaction.url, result.interaction.code, 'invoke')
-        }
-        if (result.status >= 200 && result.status < 300) await l1.touch(found.l1.resource)
-        return json({ status: result.status, body: result.body })
+      let result: InvokeResult
+      try {
+        result = await invokeAtResource(c.cfg, found.l1, op_id, invokeArgs)
       } catch (err) {
         return text(`invoke error: ${(err as Error).message}`)
       }
+
+      if (result.kind === 'interaction') {
+        // onInteraction may throw (cloud: MCP URL elicitation) or return (stdio: open browser).
+        await deps.onInteraction?.(result.interaction.url, result.interaction.code, result.interaction.pollUrl)
+        // stdio fallback: onInteraction returned without throwing
+        return text(
+          `Authorization required. Open this URL to continue, then call invoke again:\n${result.interaction.url}?code=${result.interaction.code}`,
+        )
+      }
+
+      if (result.status >= 200 && result.status < 300) await l1.touch(found.l1.resource)
+      return json({ status: result.status, body: result.body })
     },
   )
 }

@@ -72,6 +72,11 @@ function signWith(cfg: ProxyConfig, token: string) {
     signedFetch(url, { ...init, signingKey: cfg.agentPrivateJwk, signatureKey: { type: 'jwt', jwt: token } })
 }
 
+export function makeAgentPoll(cfg: ProxyConfig): (url: string) => Promise<Response> {
+  return (url: string) =>
+    signWith(cfg, cfg.agentToken)(url, { method: 'GET', headers: { Prefer: 'wait=20' } })
+}
+
 function parseInteraction(requirement: string | null): { url: string; code: string } | undefined {
   if (!requirement || !requirement.includes('requirement=interaction')) return undefined
   const url = /url="([^"]+)"/.exec(requirement)?.[1]
