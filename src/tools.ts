@@ -9,6 +9,7 @@
 // their transport allows.
 
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
+import { renderUnicodeCompact } from 'uqr'
 import { z } from 'zod'
 import { invokeAtResource } from './agent.js'
 import type { InvokeResult, ProxyConfig } from './agent.js'
@@ -273,10 +274,13 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
         await deps.onInteraction?.(result.interaction.url, result.interaction.code, result.interaction.pollUrl)
         // stdio fallback: onInteraction returned without throwing
         const authUrl = `${result.interaction.url}?code=${result.interaction.code}`
+        const qr = renderUnicodeCompact(authUrl)
         return text(
           `Authorization required for ${found.l1.resource}.\n\n` +
           `Show the user this URL and ask them to open it (use browser tools to open it if available):\n\n` +
           `  ${authUrl}\n\n` +
+          `Or scan this QR code:\n\n` +
+          `\`\`\`\n${qr}\n\`\`\`\n\n` +
           `After the user completes authorization, call invoke again.`,
         )
       }
