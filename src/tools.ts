@@ -272,8 +272,12 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
         // onInteraction may throw (cloud: MCP URL elicitation) or return (stdio: open browser).
         await deps.onInteraction?.(result.interaction.url, result.interaction.code, result.interaction.pollUrl)
         // stdio fallback: onInteraction returned without throwing
+        const authUrl = `${result.interaction.url}?code=${result.interaction.code}`
         return text(
-          `Authorization required. Open this URL to continue, then call invoke again:\n${result.interaction.url}?code=${result.interaction.code}`,
+          `Authorization required for ${found.l1.resource}.\n\n` +
+          `Show the user this URL and ask them to open it (use browser tools to open it if available):\n\n` +
+          `  ${authUrl}\n\n` +
+          `After the user completes authorization, call invoke again.`,
         )
       }
 
