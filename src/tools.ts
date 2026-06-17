@@ -36,8 +36,17 @@ export interface ProxyDeps {
   // Called when invoke encounters an interaction (authorization URL). May throw to
   // initiate a native protocol-level flow (e.g. MCP URL elicitation for cloud hosts).
   // For stdio hosts: open the OS browser and return; invoke falls back to returning
-  // the URL as text. Receives pollUrl so hosts can start background polling.
-  onInteraction?: (url: string, code: string, pollUrl: string) => void | Promise<void>
+  // the URL as text. onComplete is called by the host when authorization finishes,
+  // resolving any waiters registered via authPending.
+  onInteraction?: (url: string, code: string, pollUrl: string, onComplete?: () => void) => void | Promise<void>
+  // Tracks in-flight authorization Promises keyed by resource. When invoke gets a
+  // 202 and onInteraction returns (fallback path), the authDone promise is stored
+  // here. Subsequent invokes for the same resource wait on it (up to 30s) instead
+  // of re-hitting the resource and PS and creating new temporal state.
+  authPending?: {
+    get(resource: string): Promise<void> | undefined
+    set(resource: string, done: Promise<void>): void
+  }
   // Supplies the local-part hint for the agent id. The stdio bin derives it
   // from the MCP client's name; omitted by hosts that allocate their own.
   agentLocal?: () => string | undefined
@@ -262,6 +271,25 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       if (!found.ok) return text(found.msg)
       const invokeArgs = { pathParams: path_params, query, body }
 
+      // If there's an in-flight authorization for this resource, wait up to 30s
+      // for it to complete before hitting the resource/PS again. This avoids
+      // creating new temporal state (codes, pending interactions) on every retry.
+      const inFlight = deps.authPending?.get(found.l1.resource)
+      if (inFlight) {
+        let resolved = false
+        await Promise.race([
+          inFlight.then(() => { resolved = true }),
+          new Promise<void>((r) => setTimeout(r, 30_000)),
+        ])
+        if (!resolved) {
+          return text(
+            `Authorization for ${found.l1.resource} is still in progress.\n\n` +
+            `The user has not yet completed authorization. Try again in a moment.`,
+          )
+        }
+        // Auth completed — fall through to invokeAtResource; PS now has the grant.
+      }
+
       let result: InvokeResult
       try {
         result = await invokeAtResource(c.cfg, found.l1, op_id, invokeArgs)
@@ -270,9 +298,18 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       }
 
       if (result.kind === 'interaction') {
-        // onInteraction may throw (cloud: MCP URL elicitation) or return (stdio: open browser).
-        await deps.onInteraction?.(result.interaction.url, result.interaction.code, result.interaction.pollUrl)
-        // stdio fallback: onInteraction returned without throwing
+        // Wire up a Promise that resolves when onInteraction's poll completes.
+        // This is stored in authPending so future invokes can wait on it.
+        let markComplete: (() => void) | undefined
+        const authDone = new Promise<void>((r) => { markComplete = r })
+
+        // onInteraction may throw (cloud: MCP URL elicitation) or return (stdio/fallback).
+        await deps.onInteraction?.(result.interaction.url, result.interaction.code, result.interaction.pollUrl, markComplete)
+
+        // Only reached if onInteraction returned (fallback path, not elicitation).
+        // Register the promise so concurrent/subsequent invokes wait on it.
+        deps.authPending?.set(found.l1.resource, authDone)
+
         const authUrl = `${result.interaction.url}?code=${result.interaction.code}`
         const qr = renderUnicodeCompact(authUrl)
         return text(
@@ -281,11 +318,11 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
           `1. Display the QR code below verbatim so the user can scan it.\n` +
           `2. Show the authorization URL so the user can open it.\n` +
           `3. Offer to open the URL using browser tools if available.\n` +
-          `4. After showing the URL and QR code, automatically retry invoke every 15 seconds until it succeeds — do not wait for the user to tell you authorization is complete.\n\n` +
+          `4. After showing the URL and QR code, automatically retry invoke — the server will wait up to 30 seconds for authorization to complete before responding.\n\n` +
           `Authorization URL: ${authUrl}\n\n` +
           `QR code:\n\n` +
           `\`\`\`\n${qr}\n\`\`\`\n\n` +
-          `Begin retrying invoke now.`,
+          `Retry invoke now.`,
         )
       }
 
