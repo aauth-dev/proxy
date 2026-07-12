@@ -64,8 +64,14 @@ export interface InvokeArgs {
 
 export interface VocabAdapter<Doc = unknown> {
   readonly vocabUri: string
-  load(url: string): Promise<Doc>
+  // The r3_vocabularies discovery value: a single doc URL for most
+  // vocabularies; openapi-gateway advertises an object of service label → URL.
+  load(source: string | Record<string, string>): Promise<Doc>
   listOperations(doc: Doc, query?: string): OpSummary[]
   getOperations(doc: Doc, opIds: string[]): OpDetail[]
   buildInvocation(doc: Doc, opId: string, args: InvokeArgs): InvocationPlan
+  // Shape of one entry in r3_operations / r3_granted for this vocabulary.
+  // Default (absent): { operationId: opId }. openapi-gateway splits the
+  // composite id into { service, operationId }.
+  formatOperationEntry?(opId: string): Record<string, unknown>
 }

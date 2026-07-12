@@ -21,7 +21,9 @@ export interface L1Entry {
   access_mode: AccessMode
   logo_uri?: string
   authorization_endpoint?: string
-  picked_vocabs: Array<{ vocabUri: string; docUrl: string }>
+  // docUrl is a plain URL for most vocabularies; openapi-gateway persists the
+  // label→URL object (entries persisted before gateway support are strings).
+  picked_vocabs: Array<{ vocabUri: string; docUrl: string | Record<string, string> }>
   added: string // ISO timestamp
   last_used?: string // ISO timestamp
 }

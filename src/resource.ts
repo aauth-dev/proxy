@@ -26,13 +26,16 @@ export interface AAuthResourceMeta {
   access_mode?: AccessMode
   logo_uri?: string
   authorization_endpoint?: string
-  r3_vocabularies?: Record<string, string>
+  // Value is a doc URL for most vocabularies; openapi-gateway advertises an
+  // object of service label → per-service OpenAPI URL (R3 §Resource Metadata
+  // Extensions).
+  r3_vocabularies?: Record<string, string | Record<string, string>>
   jwks_uri?: string
 }
 
 export interface PickedVocab {
   vocabUri: string
-  docUrl: string
+  docUrl: string | Record<string, string>
   adapter: VocabAdapter
 }
 
@@ -84,7 +87,7 @@ function validate(meta: AAuthResourceMeta, host: string, origin: string): void {
   // so direct-URL adds of resources without a description still work.
 }
 
-function pickVocabs(advertised: Record<string, string>): PickedVocab[] {
+function pickVocabs(advertised: Record<string, string | Record<string, string>>): PickedVocab[] {
   const out: PickedVocab[] = []
   for (const uri of supportedVocabUris()) {
     const docUrl = advertised[uri]

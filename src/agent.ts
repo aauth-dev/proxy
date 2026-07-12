@@ -271,7 +271,9 @@ export async function invokeAtResource(
     body: JSON.stringify({
       r3_operations: {
         vocabulary: route.adapter.vocabUri,
-        operations: [{ operationId }],
+        // Entry shape is vocabulary-specific: {operationId} for plain openapi,
+        // {service, operationId} for openapi-gateway.
+        operations: [route.adapter.formatOperationEntry?.(operationId) ?? { operationId }],
       },
     }),
   })
