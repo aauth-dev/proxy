@@ -44,7 +44,7 @@ const l1: L1Entry = {
 
 const cfg: ProxyConfig = {
   psUrl: 'https://ps.example',
-  agentPrivateJwk: { kty: 'OKP', crv: 'Ed25519', x: 'AAAA', d: 'BBBB' } as never,
+  agentPrivateJwk: { kty: 'OKP', crv: 'Ed25519', alg: 'Ed25519', x: 'AAAA', d: 'BBBB' } as never,
   agentToken: 'agent.jwt.here',
 }
 

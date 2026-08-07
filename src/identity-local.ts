@@ -14,6 +14,29 @@ import { createAgentToken, getAgentConfig, listAgentProviders } from '@aauth/loc
 import type { AgentSigningKey, ProxyConfig } from './agent.js'
 import type { IdentityProvider } from './identity.js'
 
+// httpsig 2.0 (signature-key -08) takes the signing algorithm from the JWK's
+// `alg` member, which must be fully specified (RFC 9864) — the polymorphic
+// `EdDSA` is rejected. Neither WebCrypto/jose exportJWK (used by
+// @aauth/local-keys for the ephemeral key) nor hand-written env JWKs reliably
+// carry one, so derive it from the key material where that is unambiguous.
+function withFullySpecifiedAlg<T extends { kty?: string; crv?: string; alg?: string }>(jwk: T): T {
+  if (jwk.alg && jwk.alg !== 'EdDSA') return jwk
+  const derived =
+    jwk.kty === 'OKP' && jwk.crv === 'Ed25519' ? 'Ed25519'
+    : jwk.kty === 'OKP' && jwk.crv === 'Ed448' ? 'Ed448'
+    : jwk.kty === 'EC' && jwk.crv === 'P-256' ? 'ES256'
+    : jwk.kty === 'EC' && jwk.crv === 'P-384' ? 'ES384'
+    : jwk.kty === 'EC' && jwk.crv === 'P-521' ? 'ES512'
+    : undefined
+  if (!derived) {
+    // e.g. RSA: kty leaves padding and hash undetermined — refuse to guess.
+    throw new Error(
+      `agent proxy: signing JWK needs a fully-specified alg (RFC 9864); cannot derive one from kty=${jwk.kty} crv=${jwk.crv}`,
+    )
+  }
+  return { ...jwk, alg: derived }
+}
+
 function required(name: string): string {
   const value = process.env[name]
   if (!value) throw new Error(`agent proxy: missing required env var ${name}`)
@@ -28,7 +51,7 @@ export function loadIdentity(): ProxyConfig {
     process.env.PROXY_AGENT_PRIVATE_JWK ??
     readFileSync(process.env.PROXY_AGENT_KEY_FILE ?? '.secrets/proxy-agent-key.json', 'utf8')
 
-  return { psUrl, agentToken, agentPrivateJwk: JSON.parse(jwkJson) }
+  return { psUrl, agentToken, agentPrivateJwk: withFullySpecifiedAlg(JSON.parse(jwkJson)) }
 }
 
 export async function buildConfigFromLocalKeys(
@@ -48,7 +71,7 @@ export async function buildConfigFromLocalKeys(
 
   return {
     psUrl,
-    agentPrivateJwk: signingKey as unknown as AgentSigningKey,
+    agentPrivateJwk: withFullySpecifiedAlg(signingKey) as unknown as AgentSigningKey,
     agentToken: signatureKey.jwt,
   }
 }
