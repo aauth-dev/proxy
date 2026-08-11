@@ -19,4 +19,9 @@ export interface IdentityProvider {
   // The stdio provider sources it from the MCP client's name; a provider is
   // free to ignore it and derive identity from its own context.
   resolve(ctx: { local?: string }): Promise<BootstrapStatus>
+  // Already-resolved config, or undefined when nothing is cached. MUST do no
+  // work — no enclave signature, no network. Tools that want to annotate their
+  // output with what the agent's setup can complete (see access-mode.ts) use
+  // this so a cheap listing call never provokes a YubiKey touch.
+  peek?(): ProxyConfig | undefined
 }

@@ -98,6 +98,9 @@ function isJwtExpired(jwt: string, bufferSecs = 60): boolean {
 export function createLocalKeysIdentityProvider(): IdentityProvider {
   let cached: ProxyConfig | null = null
   return {
+    peek() {
+      return cached ?? undefined
+    },
     async resolve({ local }) {
       if (cached) {
         // Static env-var token can't be re-minted — return as-is.

@@ -1,6 +1,6 @@
 # agent proxy — the user's AAuth agent in MCP form
 
-**Status: v1 invoke spine ✅ proven live (2026-05-25); discovery layer redesigned 2026-06-09.** The agent proxy drives the authorize-first R3 flow end-to-end against a real Person Server + AAuth resource, signing with the bootstrapped `@aauth/local-keys` identity. Discovery generalizes to multi-resource: signed-call registry client, three-layer state (added / discoverable / per-resource ops), vocabulary-adapter abstraction (OpenAPI today, AsyncAPI partial, MCP-tools/GraphQL later). v.next (sub-agents, WASM runtime) is still ahead.
+**Status: v1 invoke spine ✅ proven live (2026-05-25); discovery layer redesigned 2026-06-09; AAuth -11 / R3 -02 landed 2026-08-11 (v0.6.0).** The agent proxy drives the authorize-first R3 flow end-to-end against a real Person Server + AAuth resource, signing with the bootstrapped `@aauth/local-keys` identity. -11 adds person-token acquisition and caching in front of the authorize-first path, the `auth_token_endpoint` / `person_token_endpoint` split in PS metadata, and three-way `access_mode` planning; R3 -02 adds operation access annotations and the per-call proposal flow, and removes the openapi-gateway vocabulary. Discovery generalizes to multi-resource: signed-call registry client, three-layer state (added / discoverable / per-resource ops), vocabulary-adapter abstraction (OpenAPI today, AsyncAPI partial, MCP-tools/GraphQL later). v.next (sub-agents, WASM runtime) is still ahead.
 
 Reference implementation of an AAuth agent for MCP-aware agent hosts. The agent proxy represents the user as an AAuth agent, exposes that agent's capabilities to an LLM via MCP, and relays AAuth interactions to the user's Person Server. Published as `@aauth/proxy` from `aauth-dev/praca`.
 
@@ -67,7 +67,7 @@ Each tool's description embeds a short literal snapshot of L1 ("currently added 
 **Operations within a resource (L3):**
 - `list_operations(resource, query?)` — return ops across all vocabularies the resource advertises, as `{ opId, kind, summary, method?, path?, channel?, tags }[]`. `query` is **either** free-text (matched against `summary`/`tags`/`opId`) **or** a path/channel prefix (`/crm/v3/objects/contacts/*`). Bounded result size with explicit "N more — refine query" marker.
 - `get_operations(resource, op_ids[])` — batch fetch full schemas for one or more operations. Schemas dominate token cost, so this is intentionally separate from `list_operations` (per Speakeasy / OpenMCP).
-- `invoke(resource, op_id, args)` — execute. Routes internally on the op's `kind`: `sync.request` → R3 HTTP call; `async.send` → publish via the resource's send channel; `async.receive` → returns `async_subscribe_requires_subagent` (v.next). On first call to an aauth-access-token or auth-token resource that hasn't been authorized, returns the interaction URL — the LLM hands it to the user, then retries.
+- `invoke(resource, op_id, args)` — execute. Routes internally on the op's `kind`: `sync.request` → R3 HTTP call; `async.send` → publish via the resource's send channel; `async.receive` → returns `async_subscribe_requires_subagent` (v.next). On first call to a session-token or auth-token resource that hasn't been authorized, returns the interaction URL — the LLM hands it to the user, then retries. An operation whose access mode this agent cannot complete is refused without a request being made (see "Access modes").
 
 `kind` values: `sync.request` | `async.send` | `async.receive`. The LLM never sees `vocab`; that's an agent-proxy-internal routing detail (see "Vocabularies"). OpIds are the natural value from the vocab doc; the agent proxy deterministically prefixes (`openapi:`/`asyncapi:`) only when two vocabularies at the same resource happen to expose colliding ids.
 
@@ -103,6 +103,7 @@ Three layers, all file-backed, all per-machine.
 | `catalog/registry.json` | **L2** — cached `GET registry.aauth.dev/resources` result | refreshed on startup + 24h background; ETag-conditional |
 | `catalog/{host}/{vocab}.json` | **L3** — cached vocabulary docs (OpenAPI / AsyncAPI / …) per resource | fetched on first `list_operations`/`get_operations`; cached with TTL |
 | `connections/{host}.json` | per-resource session state — stored auth-tokens, refresh state, last interaction | written by R3 flow |
+| `person-tokens.json` | PS-issued person tokens, keyed `(resource, mission_s256)`, plus the thumbprint of the agent key they all bind | written on person-token acquisition; flushed whole on key rotation |
 | `pending-interactions.json` | open interactions awaiting user resolution | written/cleared by interaction relay |
 
 JSON files for v1; promote to SQLite if concurrent writes get painful. File-lock for concurrent writes (multiple host clients OK).
@@ -143,7 +144,9 @@ The agent calls `add_resource(host_or_url)`. The agent proxy:
 
 After `add_resource`:
 - `access_mode: agent-token` resources are immediately invokable.
-- `access_mode: aauth-access-token` / `auth-token` resources are *added* but `invoke` will return an interaction URL on first call; `connect(resource)` is the explicit pre-auth path.
+- `access_mode: person-token` / `auth-token` resources need a person token from the PS first; the agent proxy obtains one lazily on the first `invoke` (see "Person tokens").
+- `access_mode: session-token` resources are *added* but `invoke` will return an interaction URL on first call so the user can complete the resource's own consent flow; `connect(resource)` is the explicit pre-auth path.
+- A resource declaring a mode this agent cannot complete is listed with a `skip_reason` and never called.
 
 `add_resource` is the canonical entry point for both registry-found and direct-URL resources. No registry inclusion is required — direct URL is first-class. The agent proxy never gatekeeps on registry membership.
 
@@ -152,6 +155,53 @@ After `add_resource`:
 Per-resource ops are fetched on first `list_operations`/`get_operations` call against that resource, cached at `~/.aauth/proxy/catalog/{host}/{vocab}.json`. The agent proxy reads the resource's `r3_vocabularies` and loads each one through the matching adapter; vocab docs are cached with a TTL and refreshed lazily.
 
 `list_operations` returns a bounded summary list (no schemas); `get_operations` is the explicit "give me the full schemas for these op_ids" call. This separation matters because schemas dominate token cost — Speakeasy's published numbers show schema-bearing tool listings 5-10× larger than summary-only listings. (See "Tool surface".)
+
+## Person tokens
+
+AAuth -11 makes the person token load-bearing: a resource MUST have verified one before it issues a resource token, and the agent MUST present one via `Signature-Key` on every authorization endpoint request. The agent proxy therefore obtains a person token before the authorize-first path, not only for `access_mode: person-token` resources.
+
+Acquisition is a signed POST to the PS's `person_token_endpoint` (published in `/.well-known/aauth-person.json` alongside `auth_token_endpoint`, renamed from `token_endpoint` in -11), presenting the agent token via `Signature-Key`, with `{ resource, mission_s256? }` as the body. Requests carrying a body to a PS or AS additionally cover `content-digest` and `content-type` in the signature. `200` returns `{ person_token, expires_in }`; `202` with `requirement=interaction` is the deferred path — the PS wants the user to approve this agent acting at this resource, and the agent proxy surfaces it like any other interaction rather than blocking.
+
+**Caching.** A person token is scoped to one resource and, when it carries `mission_s256`, to one mission, so the cache key is the pair. Every person token binds the same key through `cnf`, so a signing-key rotation invalidates the whole set at once — the store records the RFC 7638 thumbprint it was populated under and flushes everything the moment a different one is presented. There is no partial invalidation and no migration.
+
+**Missions.** `mission_s256` is forwarded to the person token endpoint, stamped into the person token, copied by the resource into the resource token, and copied by the PS into the auth token. It appears in no auth-token request body — the claim travels inside the tokens. No PS implements `mission_endpoint` yet; the claim path is built regardless.
+
+## Access modes
+
+`access_mode` is an IANA registry, not a closed list, and the declaration is advisory: a resource MAY return any `AAuth-Requirement` at runtime whatever it published. The agent proxy plans three ways and only three:
+
+| Plan | When | What the agent proxy does |
+|---|---|---|
+| **undeclared** | absent, or a value this build does not recognize | call the resource and read the `AAuth-Requirement`. Never an error. |
+| **satisfiable** | recognized, and this agent's setup can complete it | plan against it and skip the speculative call |
+| **unsatisfiable** | recognized, and this agent cannot complete it | skip the resource / operation, with the reason stated |
+
+The third case is the one that pays. An agent whose agent token carries no `ps` claim has no person server, so it cannot obtain a person token and cannot complete `person-token`, `auth-token` or `per-call` — and it should learn that while planning, not at a 401. `find_resources` and `list_resources` carry a `skip_reason` on such resources; `invoke` refuses them without sending a request.
+
+Whatever the plan, the runtime loop is the same: make the request, read any `AAuth-Requirement`, satisfy it, retry. The plan only chooses the opening credential.
+
+### Operation access annotations
+
+An agent cannot read R3 documents, so R3 alone tells it nothing about what any one operation needs. The vocabulary is what it *can* read — it has to parse that to make the call at all — so R3 -02 puts the annotations there:
+
+| Vocabulary | Location | Access mode | Budget |
+|---|---|---|---|
+| OpenAPI / AsyncAPI | Operation Object | `x-aauth-access-mode` | `x-aauth-budget` |
+| MCP | Tool `_meta` | `aauth.dev/access-mode` | `aauth.dev/budget` |
+
+The agent proxy reads them off the vocab doc it already fetches for L3 and flattens them onto every `list_operations` / `get_operations` result as `access_mode` (always present — the mode that actually applies to that operation) and `budget: true` (only when set). Three rules:
+
+- **Sparse.** An unannotated operation takes the resource-wide `access_mode`.
+- **Replacing, not intersecting.** A `person-token` annotation on an `auth-token` resource *lowers* the requirement for that operation — which is what lets a metered resource serve balance and history calls without an authorization round trip.
+- **Advisory.** Never enforced, in either direction. The runtime requirement is authoritative.
+
+`session-token` MUST NOT appear in an annotation; a value seen anyway is dropped. `budget: true` implies at least `auth-token`, since a budget rides in the auth token's `budget` claim.
+
+The LLM sees this before it plans: which operations need only the agent token, which cost an authorization round trip, and which are `per-call` and will block on a person every time.
+
+### Per-call
+
+A `per-call` operation is authorized in principle but not for any specific call. The resource challenges the invocation, builds a **proposal document** carrying that call's concrete `parameters`, persists it under its content hash, and returns a resource token whose `r3_uri`/`r3_s256` reference it — the token never carries the parameters. The agent proxy exchanges that resource token at the PS for a per-call auth token (the grant lands in `r3_per_call`, renamed from `r3_conditional` in R3 -02) and retries **the identical call**: the resource recovers the proposal by hash and rejects any parameter that differs. The request init is fixed for the whole invoke flow so the retry is byte-identical by construction.
 
 ## Operator selection
 
@@ -196,10 +246,12 @@ The vocabulary is **internal to the agent proxy**. The LLM never sees the URN, t
 |---|---|---|
 | `urn:aauth:vocabulary:openapi` | v1 adapter, full | OpenAPI 3.x. All ops have `kind: sync.request`. |
 | `urn:aauth:vocabulary:asyncapi` | v1 adapter, partial | AsyncAPI 3.x. `send` operations → `kind: async.send` (invokable). `receive` operations → `kind: async.receive` (listed; `invoke` returns `async_subscribe_requires_subagent`). |
-| `urn:aauth:vocabulary:mcp-tools` | future | MCP tool-list as a vocab — useful for resources that ARE MCP servers fronted by AAuth. |
+| `urn:aauth:vocabulary:mcp` | future | MCP tool-list as a vocab — useful for resources that ARE MCP servers fronted by AAuth. |
 | `urn:aauth:vocabulary:graphql` | future | GraphQL schema as a vocab. |
 
-URN convention is agent-proxy-design today; the right long-term home is the AAuth spec itself (alongside `r3_vocabularies`). Lift it when a second adapter ships.
+The URN registry now lives in the R3 spec (`urn:aauth:vocabulary:`), which defines seven standard vocabularies.
+
+`urn:aauth:vocabulary:openapi-gateway` was **removed in R3 -02** (AAuth issue #72), and its adapter with it. Operation identifiers are scoped to the one discovery endpoint a resource advertises per vocabulary, so there is no composite `service:operationId` identity and no `{service, operationId}` entry shape in `r3_operations` / `r3_granted` / `r3_per_call`. A resource fronting several backend services either presents them as one valid definition at its discovery endpoint (renaming collisions) or exposes them under separate resource identifiers, where `aud` distinguishes them.
 
 ### Adapter interface
 
@@ -210,6 +262,7 @@ interface VocabAdapter {
   listOperations(doc: VocabDoc, query?: string): OpSummary[]
   getOperations(doc: VocabDoc, opIds: string[]): OpDetail[]
   buildInvocation(doc: VocabDoc, opId: string, args: unknown): InvocationPlan
+  annotationsFor(doc: VocabDoc, opId: string): OperationAnnotations   // access mode + budget
 }
 
 type InvocationPlan =

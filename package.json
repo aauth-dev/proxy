@@ -1,6 +1,6 @@
 {
   "name": "@aauth/proxy",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "The user's AAuth agent in MCP form — discovery, identity, interaction relay",
   "type": "module",
   "exports": {
@@ -45,7 +45,7 @@
     "url": "https://github.com/aauth-dev/proxy"
   },
   "dependencies": {
-    "@aauth/local-keys": "^1.1.0",
+    "@aauth/local-keys": "^2.0.0",
     "@hellocoop/httpsig": "^2.0.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "uqr": "^0.1.3",

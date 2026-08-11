@@ -5,6 +5,8 @@
 //   - path prefix: query starts with '/'; optional trailing /* — matches path prefix
 // Both are bounded; the caller decides on a result cap.
 
+import { readOpenApiAnnotations } from './annotations.js'
+import type { OperationAnnotations } from './annotations.js'
 import type {
   InvocationPlan,
   InvokeArgs,
@@ -16,6 +18,9 @@ import type {
 const HTTP_METHODS = ['get', 'post', 'put', 'delete', 'patch', 'head', 'options'] as const
 type HttpMethod = (typeof HTTP_METHODS)[number]
 
+// Specification extensions (x-*) are permitted on the Operation Object, which is
+// where R3 -02 puts the access annotations; the index signature keeps them
+// reachable without naming each one.
 interface OpenAPIOperation {
   operationId?: string
   summary?: string
@@ -24,6 +29,7 @@ interface OpenAPIOperation {
   parameters?: unknown[]
   requestBody?: unknown
   responses?: Record<string, unknown>
+  [ext: string]: unknown
 }
 
 type OpenAPIPathItem = Partial<Record<HttpMethod, OpenAPIOperation>> & {
@@ -45,6 +51,7 @@ interface ResolvedOp {
   parameters?: unknown[]
   requestBody?: unknown
   responses?: Record<string, unknown>
+  annotations: OperationAnnotations
 }
 
 export interface OpenAPIVocabDoc {
@@ -68,6 +75,7 @@ function indexOperations(doc: OpenAPIDoc): Map<string, ResolvedOp> {
         parameters: [...(item.parameters ?? []), ...(op.parameters ?? [])],
         requestBody: op.requestBody,
         responses: op.responses,
+        annotations: readOpenApiAnnotations(op),
       })
     }
   }
@@ -104,6 +112,13 @@ function getOps(doc: OpenAPIVocabDoc): Map<string, ResolvedOp> {
   return ops
 }
 
+// Annotations are sparse: emit the field only when the operation carries one, so
+// unannotated documents cost nothing extra in the listing the LLM reads.
+function annotationsField(op: ResolvedOp): { annotations?: OperationAnnotations } {
+  const a = op.annotations ?? {}
+  return Object.keys(a).length > 0 ? { annotations: a } : {}
+}
+
 export class OpenAPIAdapter implements VocabAdapter<OpenAPIVocabDoc> {
   readonly vocabUri = 'urn:aauth:vocabulary:openapi'
 
@@ -126,6 +141,7 @@ export class OpenAPIAdapter implements VocabAdapter<OpenAPIVocabDoc> {
         method: op.method,
         path: op.path,
         tags: op.tags,
+        ...annotationsField(op),
       })
     }
     return out
@@ -144,12 +160,17 @@ export class OpenAPIAdapter implements VocabAdapter<OpenAPIVocabDoc> {
         method: op.method,
         path: op.path,
         tags: op.tags,
+        ...annotationsField(op),
         paramsSchema: op.parameters,
         bodySchema: op.requestBody,
         responseSchema: op.responses,
       })
     }
     return out
+  }
+
+  annotationsFor(doc: OpenAPIVocabDoc, opId: string): OperationAnnotations {
+    return getOps(doc).get(opId)?.annotations ?? {}
   }
 
   buildInvocation(doc: OpenAPIVocabDoc, opId: string, args: InvokeArgs): InvocationPlan {
