@@ -4,9 +4,14 @@
 //   - enumerate operations as bounded summaries (for list_operations)
 //   - return full schemas for chosen op_ids (for get_operations)
 //   - turn (opId, args) into an InvocationPlan the agent proxy's `invoke` can execute
+//   - read each operation's access annotations (R3 -02 §Operation Access
+//     Annotations) off the vocabulary document
 //
 // See design.md §"Vocabularies". The LLM never sees `vocab` — it sees
-// `kind` (sync.request | async.send | async.receive) on each OpSummary.
+// `kind` (sync.request | async.send | async.receive) on each OpSummary, plus
+// the operation's effective `access_mode` / `budget`.
+
+import type { OperationAnnotations } from './annotations.js'
 
 export type OpKind = 'sync.request' | 'async.send' | 'async.receive'
 
@@ -18,6 +23,20 @@ export interface OpSummary {
   path?: string    // sync.request
   channel?: string // async.*
   tags?: string[]
+  /**
+   * The operation's own access annotations, when the vocabulary document carries
+   * them. Sparse by design — absent means "takes the resource-wide access_mode".
+   * resource.ts resolves these against the L1 entry before the LLM sees them.
+   */
+  annotations?: OperationAnnotations
+  /**
+   * The access mode that actually applies to this operation: the annotation when
+   * present, the resource-wide `access_mode` otherwise. Filled in by resource.ts,
+   * not by adapters. Advisory — the runtime AAuth-Requirement is authoritative.
+   */
+  access_mode?: string
+  /** true when invoking this operation draws down a budget. Omitted when false. */
+  budget?: boolean
 }
 
 export interface OpDetail extends OpSummary {
@@ -64,14 +83,14 @@ export interface InvokeArgs {
 
 export interface VocabAdapter<Doc = unknown> {
   readonly vocabUri: string
-  // The r3_vocabularies discovery value: a single doc URL for most
-  // vocabularies; openapi-gateway advertises an object of service label → URL.
-  load(source: string | Record<string, string>): Promise<Doc>
+  // The r3_vocabularies discovery value: one doc URL per vocabulary. Operation
+  // identifiers are scoped to that one endpoint (R3 -02 §Operation Identifier
+  // Scope), so a resource fronting several backends either presents them as one
+  // definition or exposes them under separate resource identifiers.
+  load(source: string): Promise<Doc>
   listOperations(doc: Doc, query?: string): OpSummary[]
   getOperations(doc: Doc, opIds: string[]): OpDetail[]
   buildInvocation(doc: Doc, opId: string, args: InvokeArgs): InvocationPlan
-  // Shape of one entry in r3_operations / r3_granted for this vocabulary.
-  // Default (absent): { operationId: opId }. openapi-gateway splits the
-  // composite id into { service, operationId }.
-  formatOperationEntry?(opId: string): Record<string, unknown>
+  /** This operation's access annotations, or {} when it carries none. */
+  annotationsFor(doc: Doc, opId: string): OperationAnnotations
 }

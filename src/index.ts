@@ -4,16 +4,30 @@
 // adapters. The Node-only @aauth/local-keys identity adapter is exported
 // separately from "@aauth/proxy/local".
 
-export { invokeAtResource, invokeAtResourceComplete, makeAgentPoll, pollUntilDone } from './agent.js'
+export {
+  flushPersonTokens,
+  invokeAtResource,
+  invokeAtResourceComplete,
+  makeAgentPoll,
+  obtainPersonToken,
+  pollUntilDone,
+} from './agent.js'
 export type {
   AgentSigningKey,
   Interaction,
   InteractionHandler,
   InvokeArgs,
+  InvokeOptions,
   InvokeResult,
   ProxyConfig,
   PSTokenHints,
+  SessionTokenStore,
 } from './agent.js'
+
+export { isKnownAccessMode, KNOWN_ACCESS_MODES, planAccessMode, planReason } from './access-mode.js'
+export type { AccessModePlan, AgentSetup, KnownAccessMode } from './access-mode.js'
+
+export { agentTokenPs, decodeJwtHeader, decodeJwtPayload, jwkThumbprint, jwtExp } from './jwt.js'
 
 export { buildProxyTools } from './tools.js'
 export type { ProxyDeps } from './tools.js'
@@ -42,7 +56,17 @@ export type {
 export { createFsRegistryCache, fetchRegistry, registryUrl } from './registry.js'
 export type { CachedIndex, RegistryCache, RegistryEntry, RegistryIndex } from './registry.js'
 
-export { createFsL1Store } from './store.js'
-export type { AccessMode, L1Entry, L1Store } from './store.js'
+export {
+  createFsL1Store,
+  createFsPersonTokenStore,
+  createMemoryPersonTokenStore,
+} from './store.js'
+export type {
+  AccessMode,
+  L1Entry,
+  L1Store,
+  PersonTokenKey,
+  PersonTokenStore,
+} from './store.js'
 
 export * from './vocab/index.js'

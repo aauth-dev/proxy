@@ -9,12 +9,13 @@
 // user explicitly typed the host they want to add.
 
 import { canonicalizeHost } from './host.js'
-import { getAdapter, supportedVocabUris } from './vocab/index.js'
+import { effectiveAccessMode, getAdapter, supportedVocabUris } from './vocab/index.js'
 import type { AccessMode, L1Entry } from './store.js'
 import type {
   InvocationPlan,
   InvokeArgs,
   OpDetail,
+  OperationAnnotations,
   OpSummary,
   VocabAdapter,
 } from './vocab/index.js'
@@ -22,20 +23,20 @@ import type {
 export interface AAuthResourceMeta {
   issuer: string
   client_name?: string
+  name?: string
   description?: string
   access_mode?: AccessMode
   logo_uri?: string
   authorization_endpoint?: string
-  // Value is a doc URL for most vocabularies; openapi-gateway advertises an
-  // object of service label → per-service OpenAPI URL (R3 §Resource Metadata
-  // Extensions).
-  r3_vocabularies?: Record<string, string | Record<string, string>>
+  // One discovery endpoint per vocabulary (R3 -02 §Resource Metadata Extensions,
+  // §Operation Identifier Scope).
+  r3_vocabularies?: Record<string, string>
   jwks_uri?: string
 }
 
 export interface PickedVocab {
   vocabUri: string
-  docUrl: string | Record<string, string>
+  docUrl: string
   adapter: VocabAdapter
 }
 
@@ -77,21 +78,21 @@ function validate(meta: AAuthResourceMeta, host: string, origin: string): void {
   if (meta.issuer.replace(/\/+$/, '') !== origin) {
     throw new Error(`resource ${host}: issuer mismatch (got ${meta.issuer}, expected ${origin})`)
   }
-  if (
-    meta.access_mode !== undefined &&
-    !['agent-token', 'aauth-access-token', 'auth-token'].includes(meta.access_mode)
-  ) {
-    throw new Error(`resource ${host}: invalid access_mode ${meta.access_mode}`)
-  }
+  // access_mode is NOT validated against a closed list. The value set is an IANA
+  // registry (protocol §AAuth Access Mode Value Registry) and the declaration is
+  // advisory, so an unrecognized value is not an error — the agent adds the
+  // resource, treats the mode as undeclared, and reads the runtime
+  // AAuth-Requirement instead (see access-mode.ts).
+  //
   // description is enforced at the registry on submit; agent-proxy-side is lenient
   // so direct-URL adds of resources without a description still work.
 }
 
-function pickVocabs(advertised: Record<string, string | Record<string, string>>): PickedVocab[] {
+function pickVocabs(advertised: Record<string, string>): PickedVocab[] {
   const out: PickedVocab[] = []
   for (const uri of supportedVocabUris()) {
     const docUrl = advertised[uri]
-    if (!docUrl) continue
+    if (typeof docUrl !== 'string' || !docUrl) continue
     const adapter = getAdapter(uri)
     if (!adapter) continue
     out.push({ vocabUri: uri, docUrl, adapter })
@@ -155,6 +156,18 @@ function rehydrate(picked: L1Entry['picked_vocabs']): PickedVocab[] {
   return out
 }
 
+// Resolve an operation's access annotations against the resource-wide
+// access_mode and flatten the result onto the summary the LLM reads: `access_mode`
+// is always the mode that actually applies to THIS operation, and `budget` appears
+// only when the operation draws one down. Advisory throughout — the agent never
+// enforces either, and a resource may return any AAuth-Requirement at runtime.
+function withEffectiveAccess<T extends OpSummary>(op: T, resourceWide: string | undefined): T {
+  const resolved: T = { ...op, access_mode: effectiveAccessMode(op.annotations, resourceWide) }
+  if (op.annotations?.budget === true) resolved.budget = true
+  delete resolved.annotations
+  return resolved
+}
+
 export async function listOperationsForResource(
   l1: L1Entry,
   query?: string,
@@ -164,7 +177,7 @@ export async function listOperationsForResource(
   for (const v of rehydrate(l1.picked_vocabs)) {
     const doc = await loadDoc(l1.resource, v, docCache)
     for (const summary of v.adapter.listOperations(doc, query)) {
-      out.push(summary)
+      out.push(withEffectiveAccess(summary, l1.access_mode))
     }
   }
   return out
@@ -179,7 +192,7 @@ export async function getOperationsForResource(
   for (const v of rehydrate(l1.picked_vocabs)) {
     const doc = await loadDoc(l1.resource, v, docCache)
     for (const detail of v.adapter.getOperations(doc, opIds)) {
-      out.push(detail)
+      out.push(withEffectiveAccess(detail, l1.access_mode))
     }
   }
   return out
@@ -188,6 +201,10 @@ export async function getOperationsForResource(
 export interface RoutedOperation {
   adapter: VocabAdapter
   plan: InvocationPlan
+  /** This operation's own access annotations, {} when it carries none. */
+  annotations: OperationAnnotations
+  /** The mode that applies to this call: annotation if present, else the resource's. */
+  accessMode: string
 }
 
 // Resolve an opId on a resource by trying each picked vocab in order. First
@@ -204,7 +221,13 @@ export async function routeOperation(
     const doc = await loadDoc(l1.resource, v, docCache)
     try {
       const plan = v.adapter.buildInvocation(doc, opId, args)
-      return { adapter: v.adapter, plan }
+      const annotations = v.adapter.annotationsFor(doc, opId)
+      return {
+        adapter: v.adapter,
+        plan,
+        annotations,
+        accessMode: effectiveAccessMode(annotations, l1.access_mode),
+      }
     } catch {
       // try the next adapter
     }
@@ -225,7 +248,7 @@ export function toL1Entry(r: FetchedResource): L1Entry {
     resource: r.host,
     origin: r.origin,
     issuer: r.meta.issuer.replace(/\/+$/, ''),
-    name: r.meta.client_name?.trim() || r.host,
+    name: r.meta.name?.trim() || r.meta.client_name?.trim() || r.host,
     description: r.meta.description ?? '',
     access_mode: inferredMode,
     ...(r.meta.logo_uri ? { logo_uri: r.meta.logo_uri } : {}),

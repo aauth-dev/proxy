@@ -11,9 +11,12 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { renderUnicodeCompact } from 'uqr'
 import { z } from 'zod'
+import { planAccessMode } from './access-mode.js'
+import type { AgentSetup } from './access-mode.js'
 import { deleteAtAdmin, invokeAtResource } from './agent.js'
 import type { InvokeResult, ProxyConfig } from './agent.js'
 import { canonicalizeHost } from './host.js'
+import { agentTokenPs } from './jwt.js'
 import type { IdentityProvider } from './identity.js'
 import { fetchRegistry } from './registry.js'
 import type { RegistryCache } from './registry.js'
@@ -90,6 +93,28 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
   const describeWithL1 = (base: string): string =>
     `${base}\n\nCurrently added resources: ${l1Snapshot}`
 
+  // What this agent's setup can complete. An agent token with no `ps` claim has
+  // no person server, so nothing beyond `agent-token` and `session-token` is
+  // reachable — the listing tools say so up front instead of letting the LLM
+  // plan against a resource that will 401.
+  //
+  // Peek only: a listing tool must not provoke an enclave signature to mint an
+  // agent token. When nothing is resolved yet the annotation is simply omitted —
+  // it is advisory, and `invoke` still refuses an unsatisfiable mode outright.
+  function peekSetup(): AgentSetup | undefined {
+    const cfg = identity.peek?.()
+    return cfg ? { hasPersonServer: agentTokenPs(cfg.agentToken) !== undefined } : undefined
+  }
+
+  // The `skip_reason` field on a listed resource: present only when this agent
+  // cannot complete the mode the resource declares. Advisory — an unrecognized
+  // or absent access_mode never produces one.
+  function skipReason(accessMode: string | undefined, setup: AgentSetup | undefined): string | undefined {
+    if (!setup) return undefined
+    const plan = planAccessMode(accessMode, setup)
+    return plan.kind === 'unsatisfiable' ? plan.reason : undefined
+  }
+
   async function requireL1(
     resource: string,
   ): Promise<{ ok: true; l1: L1Entry } | { ok: false; msg: string }> {
@@ -110,13 +135,14 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     'find_resources',
     {
       description: describeWithL1(
-        'Search the AAuth registry for discoverable resources by free-text query against name/description. Returns each result tagged `added: true` if already in your local resource set.',
+        'Search the AAuth registry for discoverable resources by free-text query against name/description. Returns each result tagged `added: true` if already in your local resource set. A result carrying `skip_reason` declares an access_mode this agent cannot complete — do not add or plan against it.',
       ),
       inputSchema: { query: z.string().optional() },
     },
     async ({ query }) => {
       const c = await getConfig()
       if (!c.ok) return text(BOOTSTRAP_GUIDANCE)
+      const setup: AgentSetup = { hasPersonServer: agentTokenPs(c.cfg.agentToken) !== undefined }
       try {
         const index = await fetchRegistry(c.cfg, registryCache)
         const q = (query ?? '').trim().toLowerCase()
@@ -132,12 +158,14 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
           })
           .map((r) => {
             const host = canonicalizeHost(r.issuer)?.host ?? r.issuer
+            const reason = skipReason(r.access_mode, setup)
             return {
               resource: host,
               name: r.name,
               description: r.description,
               access_mode: r.access_mode,
               added: added.has(host),
+              ...(reason ? { skip_reason: reason } : {}),
               ...(r.logo_uri ? { logo_uri: r.logo_uri } : {}),
             }
           })
@@ -176,18 +204,23 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     'list_resources',
     {
       description:
-        'Return your locally added resources with name, description, access_mode, last_used, and how many vocabularies the agent proxy picked. Cheap; safe to call anytime.',
+        'Return your locally added resources with name, description, access_mode, last_used, and how many vocabularies the agent proxy picked. A resource carrying `skip_reason` declares an access_mode this agent cannot complete — invoke will refuse it without calling out. Cheap; safe to call anytime.',
     },
     async () => {
-      const entries = (await l1.list()).map((e) => ({
-        resource: e.resource,
-        name: e.name,
-        description: e.description,
-        access_mode: e.access_mode,
-        vocabularies: e.picked_vocabs.map((v) => v.vocabUri),
-        added: e.added,
-        last_used: e.last_used,
-      }))
+      const setup = peekSetup()
+      const entries = (await l1.list()).map((e) => {
+        const reason = skipReason(e.access_mode, setup)
+        return {
+          resource: e.resource,
+          name: e.name,
+          description: e.description,
+          access_mode: e.access_mode,
+          vocabularies: e.picked_vocabs.map((v) => v.vocabUri),
+          added: e.added,
+          last_used: e.last_used,
+          ...(reason ? { skip_reason: reason } : {}),
+        }
+      })
       return json(entries)
     },
   )
@@ -214,7 +247,14 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     'list_operations',
     {
       description: describeWithL1(
-        'List operations a resource exposes. Optional `query` is either free-text (matched against opId/summary/tags) or an OpenAPI path prefix (e.g. "/crm/v3/objects/contacts/*"). Returns summaries only — schemas are fetched via get_operations to keep token cost flat. Each op carries `kind` (sync.request/async.send/async.receive).',
+        'List operations a resource exposes. Optional `query` is either free-text (matched against opId/summary/tags) or an OpenAPI path prefix (e.g. "/crm/v3/objects/contacts/*"). Returns summaries only — schemas are fetched via get_operations to keep token cost flat.\n\n' +
+          'Each op carries `kind` (sync.request/async.send/async.receive) and `access_mode`, the credential that operation needs — read it before you plan:\n' +
+          '- `agent-token` — no authorization step; the agent already holds what it needs.\n' +
+          '- `person-token` — one call to the person server first; no user prompt in the common case.\n' +
+          '- `session-token` — the resource runs its own login/consent flow once.\n' +
+          '- `auth-token` — an authorization round trip through the person server; may prompt the user.\n' +
+          '- `per-call` — the resource authorizes each invocation against that call\'s parameters. It WILL block on a person every time. Do not plan unattended work around these.\n\n' +
+          '`budget: true` means invoking the operation draws down a spending budget. All of this is advisory — the resource may still challenge at runtime.',
       ),
       inputSchema: { resource: z.string(), query: z.string().optional() },
     },
@@ -234,7 +274,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     'get_operations',
     {
       description: describeWithL1(
-        'Batch fetch full schemas (params, request body, response) for one or more operations on a resource. Separate from list_operations because schemas dominate token cost.',
+        'Batch fetch full schemas (params, request body, response) for one or more operations on a resource. Separate from list_operations because schemas dominate token cost. Each detail also carries the operation\'s `access_mode` and `budget`, as list_operations returns them.',
       ),
       inputSchema: { resource: z.string(), op_ids: z.array(z.string()) },
     },
@@ -254,7 +294,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     'invoke',
     {
       description: describeWithL1(
-        'Invoke an operation on a resource. Pass `path_params`, `query`, `body` (object) as needed. If authorization is required, the client opens the auth URL automatically — call invoke again after authorization completes. async.receive operations return `subscribe_requires_subagent` (v.next).',
+        'Invoke an operation on a resource. Pass `path_params`, `query`, `body` (object) as needed. If authorization is required, the client opens the auth URL automatically — call invoke again after authorization completes. async.receive operations return `subscribe_requires_subagent` (v.next). An operation whose access_mode this agent cannot complete is refused without any request being made, with the reason stated.',
       ),
       inputSchema: {
         resource: z.string(),
@@ -286,6 +326,17 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
         result = await invokeAtResource(c.cfg, found.l1, op_id, invokeArgs)
       } catch (err) {
         return text(`invoke error: ${(err as Error).message}`)
+      }
+
+      // Case (c) of the access_mode plan: recognized, and this agent cannot
+      // complete it. No request was made and none will be — say why and let the
+      // LLM route around the resource rather than retry into a 401.
+      if (result.kind === 'skipped') {
+        return text(
+          `Skipped ${result.resource} / ${result.opId}: ${result.reason}.\n\n` +
+            `This operation's access_mode is "${result.mode}". Retrying will not help. ` +
+            `Use a different resource or operation, or bootstrap an agent identity bound to a person server.`,
+        )
       }
 
       if (result.kind === 'interaction') {
