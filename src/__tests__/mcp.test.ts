@@ -27,7 +27,7 @@ describe('agent proxy MCP server', () => {
       for (const expected of [
         'add_resource',
         'find_resources',
-        'get_operations',
+        'get_operation_schemas',
         'invoke',
         'list_operations',
         'list_resources',

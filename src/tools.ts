@@ -247,7 +247,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     'list_operations',
     {
       description: describeWithL1(
-        'List operations a resource exposes. Optional `query` is either free-text (matched against opId/summary/tags) or an OpenAPI path prefix (e.g. "/crm/v3/objects/contacts/*"). Returns summaries only — schemas are fetched via get_operations to keep token cost flat.\n\n' +
+        'List operations a resource exposes. Optional `query` is either free-text (matched against opId/summary/tags) or an OpenAPI path prefix (e.g. "/crm/v3/objects/contacts/*"). Returns summaries only — schemas are fetched via get_operation_schemas to keep token cost flat.\n\n' +
           'Each op carries `kind` (sync.request/async.send/async.receive) and `access_mode`, the credential that operation needs — read it before you plan:\n' +
           '- `agent-token` — no authorization step; the agent already holds what it needs.\n' +
           '- `person-token` — one call to the person server first; no user prompt in the common case.\n' +
@@ -271,7 +271,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
   )
 
   server.registerTool(
-    'get_operations',
+    'get_operation_schemas',
     {
       description: describeWithL1(
         'Batch fetch full schemas (params, request body, response) for one or more operations on a resource. Separate from list_operations because schemas dominate token cost. Each detail also carries the operation\'s `access_mode` and `budget`, as list_operations returns them.',
@@ -285,7 +285,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
         const details = await getOperationsForResource(found.l1, op_ids, docCache)
         return json(details)
       } catch (err) {
-        return text(`get_operations error: ${(err as Error).message}`)
+        return text(`get_operation_schemas error: ${(err as Error).message}`)
       }
     },
   )

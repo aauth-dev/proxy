@@ -20,7 +20,6 @@ import type { IdentityProvider } from './identity.js'
 // @aauth/local-keys for the ephemeral key) nor hand-written env JWKs reliably
 // carry one, so derive it from the key material where that is unambiguous.
 function withFullySpecifiedAlg<T extends { kty?: string; crv?: string; alg?: string }>(jwk: T): T {
-  if (jwk.alg && jwk.alg !== 'EdDSA') return jwk
   const derived =
     jwk.kty === 'OKP' && jwk.crv === 'Ed25519' ? 'Ed25519'
     : jwk.kty === 'OKP' && jwk.crv === 'Ed448' ? 'Ed448'
@@ -28,6 +27,17 @@ function withFullySpecifiedAlg<T extends { kty?: string; crv?: string; alg?: str
     : jwk.kty === 'EC' && jwk.crv === 'P-384' ? 'ES384'
     : jwk.kty === 'EC' && jwk.crv === 'P-521' ? 'ES512'
     : undefined
+  if (jwk.alg && jwk.alg !== 'EdDSA') {
+    // A fully-specified alg is present. Where the key material determines the
+    // algorithm, the two MUST agree (-11 verifier rule) — a JWK claiming
+    // alg=Ed25519 over EC/P-256 material must not pass through unchecked.
+    if (derived && jwk.alg !== derived) {
+      throw new Error(
+        `agent proxy: signing JWK alg=${jwk.alg} contradicts its key material (kty=${jwk.kty} crv=${jwk.crv} implies ${derived})`,
+      )
+    }
+    return jwk
+  }
   if (!derived) {
     // e.g. RSA: kty leaves padding and hash undetermined — refuse to guess.
     throw new Error(

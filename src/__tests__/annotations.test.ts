@@ -151,7 +151,7 @@ describe('what the LLM sees', () => {
     expect(byId.listDatasets.budget).toBeUndefined()
   })
 
-  it('carries the same fields on get_operations details', async () => {
+  it('carries the same fields on get_operation_schemas details', async () => {
     const details = await getOperationsForResource(
       l1('agent-token'),
       ['purchaseDataset'],

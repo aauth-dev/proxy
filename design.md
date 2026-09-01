@@ -66,7 +66,7 @@ Each tool's description embeds a short literal snapshot of L1 ("currently added 
 
 **Operations within a resource (L3):**
 - `list_operations(resource, query?)` — return ops across all vocabularies the resource advertises, as `{ opId, kind, summary, method?, path?, channel?, tags }[]`. `query` is **either** free-text (matched against `summary`/`tags`/`opId`) **or** a path/channel prefix (`/crm/v3/objects/contacts/*`). Bounded result size with explicit "N more — refine query" marker.
-- `get_operations(resource, op_ids[])` — batch fetch full schemas for one or more operations. Schemas dominate token cost, so this is intentionally separate from `list_operations` (per Speakeasy / OpenMCP).
+- `get_operation_schemas(resource, op_ids[])` — batch fetch full schemas for one or more operations. Schemas dominate token cost, so this is intentionally separate from `list_operations` (per Speakeasy / OpenMCP).
 - `invoke(resource, op_id, args)` — execute. Routes internally on the op's `kind`: `sync.request` → R3 HTTP call; `async.send` → publish via the resource's send channel; `async.receive` → returns `async_subscribe_requires_subagent` (v.next). On first call to a session-token or auth-token resource that hasn't been authorized, returns the interaction URL — the LLM hands it to the user, then retries. An operation whose access mode this agent cannot complete is refused without a request being made (see "Access modes").
 
 `kind` values: `sync.request` | `async.send` | `async.receive`. The LLM never sees `vocab`; that's an agent-proxy-internal routing detail (see "Vocabularies"). OpIds are the natural value from the vocab doc; the agent proxy deterministically prefixes (`openapi:`/`asyncapi:`) only when two vocabularies at the same resource happen to expose colliding ids.
@@ -101,7 +101,7 @@ Three layers, all file-backed, all per-machine.
 |---|---|---|
 | `resources.json` | **L1** — added resources: `{ resource, name, description, access_mode, picked_vocabs[], last_used }[]` | written on `add_resource` / `remove_resource` / first successful auth |
 | `catalog/registry.json` | **L2** — cached `GET registry.aauth.dev/resources` result | refreshed on startup + 24h background; ETag-conditional |
-| `catalog/{host}/{vocab}.json` | **L3** — cached vocabulary docs (OpenAPI / AsyncAPI / …) per resource | fetched on first `list_operations`/`get_operations`; cached with TTL |
+| `catalog/{host}/{vocab}.json` | **L3** — cached vocabulary docs (OpenAPI / AsyncAPI / …) per resource | fetched on first `list_operations`/`get_operation_schemas`; cached with TTL |
 | `connections/{host}.json` | per-resource session state — stored auth-tokens, refresh state, last interaction | written by R3 flow |
 | `person-tokens.json` | PS-issued person tokens, keyed `(resource, mission_s256)`, plus the thumbprint of the agent key they all bind | written on person-token acquisition; flushed whole on key rotation |
 | `pending-interactions.json` | open interactions awaiting user resolution | written/cleared by interaction relay |
@@ -152,9 +152,9 @@ After `add_resource`:
 
 ### L3 — operations within a resource
 
-Per-resource ops are fetched on first `list_operations`/`get_operations` call against that resource, cached at `~/.aauth/proxy/catalog/{host}/{vocab}.json`. The agent proxy reads the resource's `r3_vocabularies` and loads each one through the matching adapter; vocab docs are cached with a TTL and refreshed lazily.
+Per-resource ops are fetched on first `list_operations`/`get_operation_schemas` call against that resource, cached at `~/.aauth/proxy/catalog/{host}/{vocab}.json`. The agent proxy reads the resource's `r3_vocabularies` and loads each one through the matching adapter; vocab docs are cached with a TTL and refreshed lazily.
 
-`list_operations` returns a bounded summary list (no schemas); `get_operations` is the explicit "give me the full schemas for these op_ids" call. This separation matters because schemas dominate token cost — Speakeasy's published numbers show schema-bearing tool listings 5-10× larger than summary-only listings. (See "Tool surface".)
+`list_operations` returns a bounded summary list (no schemas); `get_operation_schemas` is the explicit "give me the full schemas for these op_ids" call. This separation matters because schemas dominate token cost — Speakeasy's published numbers show schema-bearing tool listings 5-10× larger than summary-only listings. (See "Tool surface".)
 
 ## Person tokens
 
@@ -189,7 +189,7 @@ An agent cannot read R3 documents, so R3 alone tells it nothing about what any o
 | OpenAPI / AsyncAPI | Operation Object | `x-aauth-access-mode` | `x-aauth-budget` |
 | MCP | Tool `_meta` | `aauth.dev/access-mode` | `aauth.dev/budget` |
 
-The agent proxy reads them off the vocab doc it already fetches for L3 and flattens them onto every `list_operations` / `get_operations` result as `access_mode` (always present — the mode that actually applies to that operation) and `budget: true` (only when set). Three rules:
+The agent proxy reads them off the vocab doc it already fetches for L3 and flattens them onto every `list_operations` / `get_operation_schemas` result as `access_mode` (always present — the mode that actually applies to that operation) and `budget: true` (only when set). Three rules:
 
 - **Sparse.** An unannotated operation takes the resource-wide `access_mode`.
 - **Replacing, not intersecting.** A `person-token` annotation on an `auth-token` resource *lowers* the requirement for that operation — which is what lets a metered resource serve balance and history calls without an authorization round trip.
@@ -271,7 +271,7 @@ type InvocationPlan =
   | { kind: 'async.receive'; channel: string; filter?: unknown }     // v.next-only via the runtime
 ```
 
-The agent proxy's adapter table is keyed by URN. At `add_resource` time, the agent proxy walks `r3_vocabularies`, picks every URN it has an adapter for, and stores the picked list on the L1 entry. `list_operations` runs all picked adapters and flattens results; `get_operations` and `invoke` look up the owning adapter by `(resource, opId)`.
+The agent proxy's adapter table is keyed by URN. At `add_resource` time, the agent proxy walks `r3_vocabularies`, picks every URN it has an adapter for, and stores the picked list on the L1 entry. `list_operations` runs all picked adapters and flattens results; `get_operation_schemas` and `invoke` look up the owning adapter by `(resource, opId)`.
 
 ### OpId namespacing
 
@@ -323,7 +323,7 @@ When PS can't reach the user via mobile push (offline, no app installed), PS may
 
 What ships:
 
-- the agent proxy as `@aauth/proxy`, stdio MCP server, eight-tool v1 surface (`find_resources`, `add_resource`, `list_resources`, `remove_resource`, `connect`, `list_operations`, `get_operations`, `invoke`)
+- the agent proxy as `@aauth/proxy`, stdio MCP server, eight-tool v1 surface (`find_resources`, `add_resource`, `list_resources`, `remove_resource`, `connect`, `list_operations`, `get_operation_schemas`, `invoke`)
 - Three-layer state at `~/.aauth/proxy/` (resources / registry cache / vocab cache + connections)
 - Signed `GET registry.aauth.dev/resources` for L2 discovery; direct URL add via `add_resource` works without registry
 - Vocabulary adapter abstraction with one full OpenAPI adapter and one partial AsyncAPI adapter (publish only)
@@ -500,4 +500,4 @@ Get these right in v1 and v.next is a runtime bolt-on.
 
 ## Single-sentence summary
 
-the agent proxy is the user's AAuth agent in MCP form — a stdio-launched Node process that holds the user's parent identity, exposes a fixed eight-tool meta-surface (`find_resources` / `add_resource` / `list_resources` / `remove_resource` / `connect` / `list_operations` / `get_operations` / `invoke`) over three layers of state (added resources / cached registry / per-resource ops), dispatches via vocabulary adapters (OpenAPI today; AsyncAPI partial; MCP-tools and GraphQL later) through a single `hostCall(caller, resource, opId, args)` chokepoint, and relays AAuth interactions between resources and PS — so that v1 ships as a clean, token-flat MCP↔AAuth bridge and v.next bolts on a QuickJS-WASM sub-agent runtime whose saved functions appear as first-class MCP tools without rewriting a line of v1.
+the agent proxy is the user's AAuth agent in MCP form — a stdio-launched Node process that holds the user's parent identity, exposes a fixed eight-tool meta-surface (`find_resources` / `add_resource` / `list_resources` / `remove_resource` / `connect` / `list_operations` / `get_operation_schemas` / `invoke`) over three layers of state (added resources / cached registry / per-resource ops), dispatches via vocabulary adapters (OpenAPI today; AsyncAPI partial; MCP-tools and GraphQL later) through a single `hostCall(caller, resource, opId, args)` chokepoint, and relays AAuth interactions between resources and PS — so that v1 ships as a clean, token-flat MCP↔AAuth bridge and v.next bolts on a QuickJS-WASM sub-agent runtime whose saved functions appear as first-class MCP tools without rewriting a line of v1.

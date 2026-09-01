@@ -2,7 +2,7 @@
 // in `r3_vocabularies` ({ urn → vocab_doc_url }). Each adapter knows how to:
 //   - fetch + parse the doc
 //   - enumerate operations as bounded summaries (for list_operations)
-//   - return full schemas for chosen op_ids (for get_operations)
+//   - return full schemas for chosen op_ids (for get_operation_schemas)
 //   - turn (opId, args) into an InvocationPlan the agent proxy's `invoke` can execute
 //   - read each operation's access annotations (R3 -02 §Operation Access
 //     Annotations) off the vocabulary document

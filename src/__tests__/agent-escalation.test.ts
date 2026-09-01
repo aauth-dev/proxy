@@ -139,6 +139,36 @@ describe('agent-token per-call escalation', () => {
     expect(psInit.components).toContain('content-type')
   })
 
+  it('re-authorizes on a budget-exhausted challenge, then surfaces the reason when it repeats', async () => {
+    mockPSWellKnown()
+
+    // draft-hardt-aauth-budgets §exhaustion: exhaustion is a plain auth-token
+    // challenge with a fresh resource token and reason=budget-exhausted. The
+    // loop re-authorizes (always correct), and when the re-acquired auth token
+    // exhausts again it stops and surfaces the reason instead of spinning.
+    const challenge = (rt: string) =>
+      makeResponse(402, { error: 'payment_required' }, {
+        'aauth-requirement': `requirement=auth-token; resource-token="${rt}"; reason=budget-exhausted`,
+      })
+    mockSignedFetch
+      .mockResolvedValueOnce(challenge('rt_1'))                          // resource, agent cred
+      .mockResolvedValueOnce(makeResponse(200, { auth_token: 'auth_A' })) // PS exchange
+      .mockResolvedValueOnce(challenge('rt_2'))                          // resource, auth cred
+      .mockResolvedValueOnce(makeResponse(200, { auth_token: 'auth_B' })) // PS exchange
+      .mockResolvedValueOnce(challenge('rt_3'))                          // resource, auth cred again → terminal
+
+    const result = await invokeAtResource(config(), l1(), 'whoami', { query: 'scope=profile' })
+
+    expect(result).toEqual({
+      kind: 'result',
+      status: 402,
+      body: { error: 'budget-exhausted', detail: { error: 'payment_required' } },
+    })
+    // Both fresh resource tokens were taken back to the PS before giving up.
+    expect(JSON.parse(mockSignedFetch.mock.calls[1][1].body).resource_token).toBe('rt_1')
+    expect(JSON.parse(mockSignedFetch.mock.calls[3][1].body).resource_token).toBe('rt_2')
+  })
+
   it('retries the per-call operation with byte-identical parameters', async () => {
     mockPSWellKnown()
     mockRouteOperation.mockResolvedValue({

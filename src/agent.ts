@@ -190,6 +190,11 @@ interface ParsedRequirement {
   resourceToken?: string
   url?: string
   code?: string
+  // draft-hardt-aauth-budgets §reason-parameter: `budget-exhausted` (grant fully
+  // spent) or `insufficient-budget` (this request alone does not fit). Advisory —
+  // re-authorizing without reading it is always correct; we surface it so the
+  // LLM can request a larger budget with justification, or shrink the call.
+  reason?: string
 }
 
 // Parses the AAuth-Requirement header. Unrecognized `requirement=` values are
@@ -204,6 +209,19 @@ function parseRequirement(headerValue: string | null): ParsedRequirement | undef
     resourceToken: /resource-token="([^"]+)"/.exec(headerValue)?.[1],
     url: /url="([^"]+)"/.exec(headerValue)?.[1],
     code: /code="([^"]+)"/.exec(headerValue)?.[1],
+    reason: /reason=([A-Za-z0-9_-]+)/.exec(headerValue)?.[1],
+  }
+}
+
+// A terminal challenge response, annotated with the challenge's `reason` when
+// one was sent so the caller (ultimately the LLM) sees `budget-exhausted` /
+// `insufficient-budget` instead of a bare status.
+async function terminalChallenge(res: Response, req: ParsedRequirement): Promise<InvokeResult> {
+  const body = await safeBody(res)
+  return {
+    kind: 'result',
+    status: res.status,
+    body: req.reason ? { error: req.reason, detail: body } : body,
   }
 }
 
@@ -624,7 +642,10 @@ export async function invokeAtResource(
 
     const marker = `${req.requirement}:${cred.kind}`
     if (satisfied.has(marker)) {
-      return { kind: 'result', status: res.status, body: await safeBody(res) }
+      // Same requirement, same credential kind, second time — e.g. the budget of
+      // the auth token we just re-acquired is exhausted again. Stop and surface
+      // the challenge (with its reason) rather than spin.
+      return terminalChallenge(res, req)
     }
     satisfied.add(marker)
 
@@ -652,7 +673,7 @@ export async function invokeAtResource(
         // `r3_uri`/`r3_s256` reference. The agent exchanges it and retries the
         // identical call (R3 -02 §Per-Call Proposals).
         if (!req.resourceToken) {
-          return { kind: 'result', status: res.status, body: await safeBody(res) }
+          return terminalChallenge(res, req)
         }
         const ex = await exchangeAtPS(cfg, (await needPS()).auth_token_endpoint, req.resourceToken)
         if (ex.kind !== 'token') return ex
