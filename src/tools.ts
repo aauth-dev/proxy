@@ -8,7 +8,7 @@
 // other hosts supply their own backends and surface interaction URLs however
 // their transport allows.
 
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
+import type { McpServer, ServerContext } from '@modelcontextprotocol/server'
 import { renderUnicodeCompact } from 'uqr'
 import { z } from 'zod'
 import { planAccessMode } from './access-mode.js'
@@ -51,8 +51,9 @@ export interface ProxyDeps {
     resolve(resource: string): Promise<void>
   }
   // Supplies the local-part hint for the agent id. The stdio bin derives it
-  // from the MCP client's name; omitted by hosts that allocate their own.
-  agentLocal?: () => string | undefined
+  // from the MCP client's name (passed in `hint.clientName` when the client
+  // identified itself); omitted by hosts that allocate their own.
+  agentLocal?: (hint: { clientName?: string }) => string | undefined
 }
 
 const text = (s: string) => ({ content: [{ type: 'text' as const, text: s }] })
@@ -80,10 +81,19 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
   // Identity is resolved lazily per call; the provider owns any caching (which
   // must be per-principal — a shared process-global cache would leak identities
   // across tenants in a multi-user host).
-  async function getConfig(): Promise<{ ok: true; cfg: ProxyConfig } | { ok: false }> {
-    const status = await identity.resolve({ local: deps.agentLocal?.() })
+  async function getConfig(ctx: ServerContext): Promise<{ ok: true; cfg: ProxyConfig } | { ok: false }> {
+    const status = await identity.resolve({ local: deps.agentLocal?.({ clientName: clientName(ctx) }) })
     if (status.kind === 'needsBootstrap') return { ok: false }
     return { ok: true, cfg: status.cfg }
+  }
+
+  // The MCP client's self-reported name. 2026-07-28 requests carry it in the
+  // per-request _meta envelope; 2025-era connections learned it at initialize.
+  // Display/hint use only — never a security decision.
+  function clientName(ctx: ServerContext): string | undefined {
+    const envelope = ctx.mcpReq.envelope as { clientInfo?: { name?: string } } | undefined
+    // eslint-disable-next-line @typescript-eslint/no-deprecated
+    return envelope?.clientInfo?.name ?? server.server.getClientVersion()?.name
   }
 
   // Snapshot of L1 for tool descriptions, taken once at registration. Keeps the
@@ -137,10 +147,10 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       description: describeWithL1(
         'Search the AAuth registry for discoverable resources by free-text query against name/description. Returns each result tagged `added: true` if already in your local resource set. A result carrying `skip_reason` declares an access_mode this agent cannot complete — do not add or plan against it.',
       ),
-      inputSchema: { query: z.string().optional() },
+      inputSchema: z.object({ query: z.string().optional() }),
     },
-    async ({ query }) => {
-      const c = await getConfig()
+    async ({ query }, ctx) => {
+      const c = await getConfig(ctx)
       if (!c.ok) return text(BOOTSTRAP_GUIDANCE)
       const setup: AgentSetup = { hasPersonServer: agentTokenPs(c.cfg.agentToken) !== undefined }
       try {
@@ -182,7 +192,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       description: describeWithL1(
         'Add an AAuth resource to your local set. Pass a bare host, host:port, or full URL — the agent proxy canonicalizes. Fetches the resource\'s well-known doc, validates, picks supported vocabularies. After adding: agent-token resources are immediately invokable; auth-token resources start an authorization flow on the first `invoke`.',
       ),
-      inputSchema: { resource: z.string() },
+      inputSchema: z.object({ resource: z.string() }),
     },
     async ({ resource }) => {
       try {
@@ -231,7 +241,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       description: describeWithL1(
         'Remove a resource from your local set. Agent-proxy-local only — does NOT revoke any user grants at the Person Server; re-adding picks up existing grants transparently.',
       ),
-      inputSchema: { resource: z.string() },
+      inputSchema: z.object({ resource: z.string() }),
     },
     async ({ resource }) => {
       const canonical = canonicalizeHost(resource)
@@ -256,7 +266,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
           '- `per-call` — the resource authorizes each invocation against that call\'s parameters. It WILL block on a person every time. Do not plan unattended work around these.\n\n' +
           '`budget: true` means invoking the operation draws down a spending budget. All of this is advisory — the resource may still challenge at runtime.',
       ),
-      inputSchema: { resource: z.string(), query: z.string().optional() },
+      inputSchema: z.object({ resource: z.string(), query: z.string().optional() }),
     },
     async ({ resource, query }) => {
       const found = await requireL1(resource)
@@ -276,7 +286,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       description: describeWithL1(
         'Batch fetch full schemas (params, request body, response) for one or more operations on a resource. Separate from list_operations because schemas dominate token cost. Each detail also carries the operation\'s `access_mode` and `budget`, as list_operations returns them.',
       ),
-      inputSchema: { resource: z.string(), op_ids: z.array(z.string()) },
+      inputSchema: z.object({ resource: z.string(), op_ids: z.array(z.string()) }),
     },
     async ({ resource, op_ids }) => {
       const found = await requireL1(resource)
@@ -296,16 +306,16 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       description: describeWithL1(
         'Invoke an operation on a resource. Pass `path_params`, `query`, `body` (object) as needed. If authorization is required, the client opens the auth URL automatically — call invoke again after authorization completes. async.receive operations return `subscribe_requires_subagent` (v.next). An operation whose access_mode this agent cannot complete is refused without any request being made, with the reason stated.',
       ),
-      inputSchema: {
+      inputSchema: z.object({
         resource: z.string(),
         op_id: z.string(),
         path_params: z.record(z.string(), z.string()).optional(),
         query: z.string().optional(),
         body: z.record(z.string(), z.unknown()).optional(),
-      },
+      }),
     },
-    async ({ resource, op_id, path_params, query, body }) => {
-      const c = await getConfig()
+    async ({ resource, op_id, path_params, query, body }, ctx) => {
+      const c = await getConfig(ctx)
       if (!c.ok) return text(BOOTSTRAP_GUIDANCE)
       const found = await requireL1(resource)
       if (!found.ok) return text(found.msg)
@@ -376,10 +386,10 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       description: describeWithL1(
         'Clear all stored upstream OAuth tokens for a resource. Use during testing to force a fresh upstream OAuth flow without touching PS consent state.',
       ),
-      inputSchema: { resource: z.string() },
+      inputSchema: z.object({ resource: z.string() }),
     },
-    async ({ resource }) => {
-      const c = await getConfig()
+    async ({ resource }, ctx) => {
+      const c = await getConfig(ctx)
       if (!c.ok) return text(BOOTSTRAP_GUIDANCE)
       const found = await requireL1(resource)
       if (!found.ok) return text(found.msg)

@@ -9,8 +9,8 @@ import { createWriteStream, mkdirSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
+import { McpServer } from '@modelcontextprotocol/server'
+import { serveStdio } from '@modelcontextprotocol/server/stdio'
 import { createLocalKeysIdentityProvider } from './identity-local.js'
 import { createFsRegistryCache } from './registry.js'
 import { createFsL1Store } from './store.js'
@@ -50,7 +50,6 @@ function slugifyClientName(name: string | undefined): string {
 }
 
 const { version: PKG_VERSION } = createRequire(import.meta.url)('../package.json') as { version: string }
-const server = new McpServer({ name: 'aauth-proxy', version: PKG_VERSION })
 
 // `--log` tees stdio JSON-RPC frames to ~/.aauth/proxy/logs/<ISO>.jsonl as
 // `{ts, dir, frame}` lines (same shape reloaderoo writes). Opt-in; best-effort —
@@ -112,11 +111,17 @@ function setupFrameLog(): void {
 }
 
 setupFrameLog()
-await buildProxyTools(server, {
-  l1: createFsL1Store(),
-  registryCache: createFsRegistryCache(),
-  identity: createLocalKeysIdentityProvider(),
-  onInteraction: (url, code) => tryOpenBrowser(`${url}?code=${code}`),
-  agentLocal: () => slugifyClientName(server.server.getClientVersion()?.name),
+// serveStdio owns the transport and the protocol-era decision: the opening
+// exchange pins one server instance from this factory to the connection and
+// serves both the 2026-07-28 revision and the 2025-era initialize handshake.
+serveStdio(async () => {
+  const server = new McpServer({ name: 'aauth-proxy', version: PKG_VERSION })
+  await buildProxyTools(server, {
+    l1: createFsL1Store(),
+    registryCache: createFsRegistryCache(),
+    identity: createLocalKeysIdentityProvider(),
+    onInteraction: (url, code) => tryOpenBrowser(`${url}?code=${code}`),
+    agentLocal: ({ clientName }) => slugifyClientName(clientName),
+  })
+  return server
 })
-await server.connect(new StdioServerTransport())
