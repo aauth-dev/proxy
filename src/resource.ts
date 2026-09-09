@@ -80,16 +80,18 @@ function validate(meta: AAuthResourceMeta, host: string, origin: string): void {
   if (meta.issuer.replace(/\/+$/, '') !== origin) {
     throw new Error(`resource ${host}: issuer mismatch (got ${meta.issuer}, expected ${origin})`)
   }
-  // §3.8: the interaction endpoint is a stable, published property of the
-  // resource — same origin as the issuer, or it is not this resource's page.
+  // The interaction endpoint is a published property of the resource: where
+  // the person is sent with `?code=`. It must be https; it need not share the
+  // issuer's origin (ONBOARDING-PLAN-2.md Q2 — an operator hosts the OAuth
+  // start for a fleet of resources; the registry may add an origin rule).
   if (meta.interaction_endpoint !== undefined) {
-    let sameOrigin = false
+    let https = false
     try {
-      sameOrigin = new URL(meta.interaction_endpoint).origin === origin
+      https = new URL(meta.interaction_endpoint).protocol === 'https:'
     } catch {
       /* not a URL */
     }
-    if (!sameOrigin) throw new Error(`resource ${host}: interaction_endpoint must be same-origin with issuer`)
+    if (!https) throw new Error(`resource ${host}: interaction_endpoint must be an https URL`)
   }
   // access_mode is NOT validated against a closed list. The value set is an IANA
   // registry (protocol §AAuth Access Mode Value Registry) and the declaration is

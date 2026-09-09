@@ -233,11 +233,12 @@ async function terminalChallenge(res: Response, req: ParsedRequirement): Promise
   }
 }
 
-// N7 (§3.8): an interaction needs `code` and the poll URL. The page the
-// person is sent to is a published property of whoever issued the 202 — the
-// resource's `interaction_endpoint` (L1) or the PS's — so a `url=` parameter
-// on the header is honoured when present and composed from metadata when
-// not. Neither → not an interaction this agent can drive.
+// An interaction needs `code` and the poll URL. The page the person is sent
+// to is a published property of whoever issued the 202 — the resource's
+// `interaction_endpoint` (L1) or the PS's (ONBOARDING-PLAN-2.md §2): the
+// header carries the code only and the agent composes
+// `{interaction_endpoint}?code=`. A `url=` parameter is still honoured when a
+// 2.x-era issuer sends one. Neither → not an interaction this agent can drive.
 function interactionFrom(res: Response, publishedUrl?: string): Interaction | undefined {
   const parsed = parseRequirement(res.headers.get('aauth-requirement'))
   const pollUrl = res.headers.get('location') ?? ''
@@ -388,32 +389,6 @@ export async function obtainPersonToken(
  */
 export async function flushPersonTokens(cfg: ProxyConfig): Promise<void> {
   await personTokenStore(cfg).flush()
-}
-
-// POST the interaction to the PS so it can try to reach the user (live web
-// session, registered mobile push). On 2xx the PS owns user-reach; the agent
-// blocks on the pollUrl until the user completes there. On any non-2xx
-// (including the spec-pending interaction_unavailable error — see AAuth#34) the
-// agent falls back to driving the URL itself.
-async function relayInteractionToPS(
-  signAgent: SignedFetch,
-  endpoint: string,
-  interaction: Interaction,
-): Promise<boolean> {
-  try {
-    const res = await signAgent(endpoint, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        type: 'interaction',
-        url: interaction.url,
-        code: interaction.code,
-      }),
-    })
-    return res.ok
-  } catch {
-    return false
-  }
 }
 
 type Poller = (url: string) => Promise<Response>
@@ -699,33 +674,16 @@ export async function invokeAtResource(
       }
 
       case 'interaction': {
+        // A resource-owned 202 (resource-managed session consent). The agent
+        // opens `{interaction_endpoint}?code=` itself — the caller surfaces it
+        // (local OS open, native elicitation, or text + QR) and polls. There
+        // is no relay to the PS (ONBOARDING-PLAN-2.md Q5): the PS drives only
+        // the interactions it is told about inside a resource token.
         const interaction = interactionFrom(res, l1.interaction_endpoint)
         if (!interaction) {
           return { kind: 'result', status: res.status, body: await safeBody(res) }
         }
-        // Try the PS's interaction endpoint first so it can use its own
-        // user-reach channels (live web session, mobile push). On any non-2xx —
-        // including the spec-pending interaction_unavailable error (AAuth#34)
-        // and any PS that hasn't implemented the endpoint yet — surface the
-        // interaction so the caller can drive it (layer 2: local OS open;
-        // layer 3: text + QR).
-        const meta = await needPS().catch(() => undefined)
-        const engaged = meta?.interaction_endpoint
-          ? await relayInteractionToPS(
-              signWith(cfg, { kind: 'agent' }),
-              meta.interaction_endpoint,
-              interaction,
-            )
-          : false
-        if (!engaged) return { kind: 'interaction', interaction }
-        const completed = await pollUntilDone(makeAgentPoll(cfg), interaction.pollUrl, 180_000)
-        if (completed.status === 202) return { kind: 'interaction', interaction }
-        const settled = completed.headers.get('aauth-access')
-        if (settled) {
-          await sessions.set(l1.resource, settled)
-          cred = { kind: 'session', token: settled }
-        }
-        continue
+        return { kind: 'interaction', interaction }
       }
 
       default:
@@ -773,7 +731,11 @@ export async function invokeAtResourceComplete(
       return { status: 0, body: { error: 'access_mode_unsatisfiable', ...result } }
     }
     await onInteraction(result.interaction.url, result.interaction.code)
-    await pollUntilDone(poll, result.interaction.pollUrl, pollTimeoutMs, onPoll)
+    const completed = await pollUntilDone(poll, result.interaction.pollUrl, pollTimeoutMs, onPoll)
+    // A resource-managed consent settles with the session token on the poll
+    // (AAuth-Access); keep it so the retry presents it.
+    const settled = completed.headers.get('aauth-access')
+    if (settled) await sessionTokenStore(cfg).set(l1.resource, settled)
   }
   throw new Error('invoke did not complete after interactions')
 }
@@ -790,8 +752,10 @@ export async function deleteAtAdmin(cfg: ProxyConfig, l1: L1Entry, path: string)
 // `connectAtResource` links the PERSON's upstream account: POST on the
 // resource's connection collection with a person token, take back a
 // connection-only resource token (an interaction and no `scope`), exchange it
-// at the PS, and drive the interaction the PS answers with. The PS issues no
-// auth token for this shape; it terminates with `connection_established`.
+// at the PS, and surface the interaction the PS answers with — the person
+// goes to `{ps.interaction_endpoint}?code=`, where the PS explains and sends
+// them on to the resource's own flow. The PS issues no auth token for this
+// shape; it terminates with `connection_established`.
 
 export interface ConnectArgs {
   /** Present iff the resource declares `connection.account_description`. */
@@ -805,17 +769,16 @@ export type ConnectOutcome =
   | { kind: 'ready'; reason: 'no_connection_needed' | 'already_connected'; account?: string; scopes?: string[] }
   /** The flow completed at the PS. */
   | { kind: 'connected'; account?: string }
-  /** The PS could not reach the person itself; the caller must surface this URL, then poll `pollUrl`. */
+  /** The person must act: the caller surfaces `{url}?code=`, then polls `pollUrl` (`pollConnection`). */
   | { kind: 'interaction'; interaction: Interaction }
-  /** The PS is driving the interaction; the bounded wait elapsed. Poll `pollUrl` or call again. */
+  /** The interaction was surfaced and the bounded wait elapsed. Poll `pollUrl` or call again. */
   | { kind: 'still_pending'; interaction: Interaction }
   | { kind: 'error'; status: number; body: unknown }
 
 /**
  * POST the connection collection and exchange the resulting token at the PS.
- * Non-blocking beyond the PS relay: when the PS engages the person itself the
- * caller decides how long to wait (`pollConnection`); when it cannot, the
- * interaction is returned for the caller to surface.
+ * Non-blocking: the PS's 202 comes back as `interaction` for the caller to
+ * surface; the caller decides how long to wait (`pollConnection`).
  */
 export async function connectAtResource(cfg: ProxyConfig, l1: L1Entry, args: ConnectArgs = {}): Promise<ConnectOutcome> {
   if (!l1.connection) return { kind: 'ready', reason: 'no_connection_needed' }
@@ -847,12 +810,10 @@ export async function connectAtResource(cfg: ProxyConfig, l1: L1Entry, args: Con
     if (ex.status >= 200 && ex.status < 300) return { kind: 'connected', ...(args.account ? { account: args.account } : {}) }
     return { kind: 'error', status: ex.status, body: ex.body }
   }
-  // The PS wants the person. Try its own reach first (live web session, push);
-  // only if it cannot does the caller surface the URL.
-  const engaged = ps.interaction_endpoint
-    ? await relayInteractionToPS(signWith(cfg, { kind: 'agent' }), ps.interaction_endpoint, ex.interaction)
-    : false
-  return engaged ? { kind: 'still_pending', interaction: ex.interaction } : { kind: 'interaction', interaction: ex.interaction }
+  // The PS wants the person: hand the caller the URL (composed from the PS
+  // metadata when the header carried only the code). The PS reaches an open
+  // wallet tab on its own when it can; either way the caller polls.
+  return { kind: 'interaction', interaction: ex.interaction }
 }
 
 /**

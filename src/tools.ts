@@ -84,11 +84,6 @@ export interface ProxyDeps {
     set(host: string, flight: ConnectFlight): Promise<void>
     clear(host: string): Promise<void>
   }
-  // The queue-depth guard (H4): called when a connect is about to start a new
-  // flow. Returns a warning to attach to the result when the person is about
-  // to be sent through more consent screens than they will sit through; the
-  // host owns the count and the threshold (§7 C3 is still open).
-  connectGuard?: (host: string) => Promise<string | undefined>
 }
 
 export interface ConnectFlight {
@@ -323,7 +318,6 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       const cfg = c.cfg
       const host = entry.resource
       const inflight = deps.connectState ?? memoryFlights(cfg)
-      let warning: string | undefined
 
       const finish = async (outcome: ConnectOutcome, flight?: InFlight) => {
         switch (outcome.kind) {
@@ -331,7 +325,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
             await inflight.clear(host)
             await deps.authPending?.resolve(host)
             const refreshed = await refreshConnections(cfg, entry as L1Entry)
-            return json({ ...base, outcome: 'connected', ...(flight?.account ?? outcome.account ? { account: flight?.account ?? outcome.account } : {}), connections: refreshed.connections ?? [], ...(warning ? { warning } : {}) })
+            return json({ ...base, outcome: 'connected', ...(flight?.account ?? outcome.account ? { account: flight?.account ?? outcome.account } : {}), connections: refreshed.connections ?? [] })
           }
           case 'ready': {
             const refreshed = await refreshConnections(cfg, entry as L1Entry)
@@ -348,7 +342,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
             await inflight.clear(host)
             return json({ ...base, outcome: 'error', status: outcome.status, body: outcome.body })
           case 'interaction':
-            // Reached only through the fallback path below.
+            // Reached only through the surfacing path below.
             return text(interactionText(outcome.interaction))
         }
       }
@@ -365,9 +359,6 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
         return finish(await pollConnection(cfg, existing.interaction, budgetMs), existing)
       }
 
-      // H4: about to send the person through another consent screen — the
-      // host says whether that is one too many for this sitting.
-      warning = await deps.connectGuard?.(host)
       let outcome: ConnectOutcome
       try {
         outcome = await connectAtResource(cfg, entry, { ...(account ? { account } : {}), ...(scopes ? { scopes } : {}) })
@@ -376,9 +367,10 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       }
       if (outcome.kind !== 'interaction') return finish(outcome)
 
-      // The PS could not reach the person itself. Hand the URL to the host
-      // (B3: may throw a native elicitation; stdio: opens a browser), then
-      // wait the bounded slice (B2) before answering.
+      // The PS wants the person. Hand the URL to the host (B3: may throw a
+      // native elicitation; stdio: opens a browser), then wait the bounded
+      // slice (B2) before answering. The PS also reaches an open wallet tab
+      // on its own; the poll sees the result either way.
       const { interaction } = outcome
       const flight: InFlight = { interaction, ...(account ? { account } : {}), startedAt: Date.now() }
       await inflight.set(host, flight)
@@ -387,7 +379,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       const waited = await pollConnection(cfg, interaction, budgetMs)
       if (waited.kind === 'still_pending') {
         return text(
-          `${warning ? `${warning}\n\n` : ''}Connecting ${host} needs the person to act.\n\n` +
+          `Connecting ${host} needs the person to act.\n\n` +
             `IMPORTANT: You MUST do all of the following in your response:\n` +
             `1. Display the QR code below verbatim so the user can scan it.\n` +
             `2. Show the authorization URL so the user can open it.\n` +

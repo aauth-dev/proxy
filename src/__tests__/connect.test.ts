@@ -91,8 +91,12 @@ describe('N1 — toL1Entry carries interaction_endpoint and the connection objec
     expect(entry.interaction_endpoint).toBe('https://res.example/connect')
     expect(entry.connection).toEqual(CONNECTION)
 
-    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => makeResponse(200, { ...meta, interaction_endpoint: 'https://evil.example/connect' }))
-    await expect(fetchResource('res.example')).rejects.toThrow(/same-origin/)
+    // Q2: another origin is fine (an operator hosts the fleet's OAuth start);
+    // a non-https endpoint is not.
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => makeResponse(200, { ...meta, interaction_endpoint: 'https://proxy.example/oauth/start/x' }))
+    expect((await fetchResource('res.example')).meta.interaction_endpoint).toBe('https://proxy.example/oauth/start/x')
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => makeResponse(200, { ...meta, interaction_endpoint: 'http://res.example/connect' }))
+    await expect(fetchResource('res.example')).rejects.toThrow(/https/)
   })
 })
 
@@ -137,31 +141,20 @@ describe('connectAtResource', () => {
     expect(out).toEqual({ kind: 'error', status: 400, body: { error: 'account_required', account_description: 'Google account email address' } })
   })
 
-  it('relays the PS 202 to the PS first; when engaged it is still_pending, else the interaction is returned (N7: URL composed from PS metadata)', async () => {
+  it('surfaces the PS 202 as an interaction with the URL composed from PS metadata — no relay POST (Q5)', async () => {
     mockPSWellKnown()
-    // Engaged: the PS accepts the relay → still_pending with the interaction.
     mockSignedFetch
       .mockResolvedValueOnce(personTokenResponse())
       .mockResolvedValueOnce(makeResponse(200, { resource_token: 'rt_conn' }))
       .mockResolvedValueOnce(makeResponse(202, {}, { 'aauth-requirement': 'requirement=interaction; code="ABCD-EFGH"', location: 'https://ps.example/pending/ABCD-EFGH' }))
-      .mockResolvedValueOnce(makeResponse(200, { ok: true })) // relay accepted
-    const engaged = await connectAtResource(config(), l1(), { account: 'a@b.co' })
-    expect(engaged).toEqual({
-      kind: 'still_pending',
+    const out = await connectAtResource(config(), l1(), { account: 'a@b.co' })
+    expect(out).toEqual({
+      kind: 'interaction',
       interaction: { url: 'https://ps.example/auth', code: 'ABCD-EFGH', pollUrl: 'https://ps.example/pending/ABCD-EFGH' },
     })
-    expect(urlOf(3)).toBe('https://ps.example/auth') // the relay POST
-    expect(bodyOf(3)).toMatchObject({ type: 'interaction', code: 'ABCD-EFGH' })
-
-    // Not engaged: interaction_unavailable → the caller drives it.
-    mockSignedFetch
-      .mockResolvedValueOnce(personTokenResponse())
-      .mockResolvedValueOnce(makeResponse(200, { resource_token: 'rt_conn' }))
-      .mockResolvedValueOnce(makeResponse(202, {}, { 'aauth-requirement': 'requirement=interaction; code="ABCD-EFGH"', location: 'https://ps.example/pending/ABCD-EFGH' }))
-      .mockResolvedValueOnce(makeResponse(409, { error: 'interaction_unavailable' }))
-    const cfg2 = config() // fresh person-token cache
-    const surfaced = await connectAtResource(cfg2, l1(), { account: 'a@b.co' })
-    expect(surfaced.kind).toBe('interaction')
+    // person token, POST /connections, exchange — and nothing after.
+    expect(mockSignedFetch).toHaveBeenCalledTimes(3)
+    expect(urlOf(2)).toBe('https://ps.example/token')
   })
 })
 
@@ -225,8 +218,8 @@ describe('N2 — account on the authorize request', () => {
   })
 })
 
-describe('N7 — a resource 202 with only a code composes the URL from L1', () => {
-  it('uses interaction_endpoint when the header carries no url=', async () => {
+describe('D2 — a 401 auth-token whose resource token carries interaction_code is the ordinary exchange', () => {
+  it('exchanges at the PS and surfaces its 202 with the URL composed from PS metadata', async () => {
     mockPSWellKnown()
     mockRouteOperation.mockResolvedValue({
       adapter: { vocabUri: 'urn:aauth:vocabulary:openapi' },
@@ -234,13 +227,37 @@ describe('N7 — a resource 202 with only a code composes the URL from L1', () =
       annotations: {},
       accessMode: 'agent-token',
     })
+    // The fleet's B3 shape: the vend needed a connect, so the resource
+    // challenges with a resource token carrying the pending code. Nothing on
+    // the agent side inspects the token; it goes to the PS like any other.
     mockSignedFetch
-      .mockResolvedValueOnce(makeResponse(202, {}, { 'aauth-requirement': 'requirement=interaction; code="ABCD-EFGH"', location: 'https://res.example/pending/1' }))
-      .mockResolvedValueOnce(makeResponse(409, { error: 'interaction_unavailable' })) // PS relay declines
+      .mockResolvedValueOnce(makeResponse(401, { error: 'no_tokens' }, { 'aauth-requirement': 'requirement=auth-token; resource-token="rt.with.interaction_code"' }))
+      .mockResolvedValueOnce(makeResponse(202, { status: 'pending' }, { 'aauth-requirement': 'requirement=interaction; code="WXYZ-1234"', location: 'https://ps.example/pending/WXYZ-1234' }))
+    const out = await invokeAtResource(config(), l1(), 'x')
+    expect(out).toEqual({
+      kind: 'interaction',
+      interaction: { url: 'https://ps.example/auth', code: 'WXYZ-1234', pollUrl: 'https://ps.example/pending/WXYZ-1234' },
+    })
+    expect(mockSignedFetch).toHaveBeenCalledTimes(2)
+    expect(bodyOf(1)).toMatchObject({ resource_token: 'rt.with.interaction_code' })
+  })
+})
+
+describe('N7 — a resource 202 with only a code composes the URL from L1', () => {
+  it('uses interaction_endpoint when the header carries no url=, and nothing is relayed', async () => {
+    mockPSWellKnown()
+    mockRouteOperation.mockResolvedValue({
+      adapter: { vocabUri: 'urn:aauth:vocabulary:openapi' },
+      plan: { kind: 'sync.request', method: 'GET', path: '/x', query: '' },
+      annotations: {},
+      accessMode: 'agent-token',
+    })
+    mockSignedFetch.mockResolvedValueOnce(makeResponse(202, {}, { 'aauth-requirement': 'requirement=interaction; code="ABCD-EFGH"', location: 'https://res.example/pending/1' }))
     const out = await invokeAtResource(config(), l1(), 'x')
     expect(out).toEqual({
       kind: 'interaction',
       interaction: { url: 'https://res.example/connect', code: 'ABCD-EFGH', pollUrl: 'https://res.example/pending/1' },
     })
+    expect(mockSignedFetch).toHaveBeenCalledTimes(1)
   })
 })
