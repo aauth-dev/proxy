@@ -437,6 +437,12 @@ type ExchangeOutcome =
 // `mission_s256`, which the resource copies into the resource token and the PS
 // into the auth token.
 //
+// `presentedToken` is the token the agent presented to the resource on the
+// request that produced this resource token — the person token, or on a
+// step-up the auth token. AAuth -11 (§PS Token Endpoint, step 6) has the PS
+// verify it against the `presented_jti` / `ps` / `sub` the resource copied;
+// a PS refuses the exchange without it when the resource token names one.
+//
 // cfg.psHints (if set) are spread into the body — all §Agent Token Request
 // optional params. cfg.onAuthToken (if set) is called with the auth_token before
 // it is returned.
@@ -444,6 +450,7 @@ async function exchangeAtPS(
   cfg: ProxyConfig,
   ps: PSMetadata,
   resourceToken: string,
+  presentedToken?: string,
 ): Promise<ExchangeOutcome> {
   const { capabilities, ...otherHints } = cfg.psHints ?? {}
   const res = await signWith(cfg, { kind: 'agent' }, { psOrAs: true })(ps.auth_token_endpoint, {
@@ -451,6 +458,7 @@ async function exchangeAtPS(
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       resource_token: resourceToken,
+      ...(presentedToken ? { presented_token: presentedToken } : {}),
       capabilities: capabilities ?? ['interaction'],
       ...otherHints,
     }),
@@ -607,7 +615,7 @@ export async function invokeAtResource(
             opts.account,
           )
           if (authz.kind !== 'resourceToken') return authz
-          const ex = await exchangeAtPS(cfg, await needPS(), authz.resourceToken)
+          const ex = await exchangeAtPS(cfg, await needPS(), authz.resourceToken, pt.personToken)
           if (ex.kind !== 'token') return ex
           cred = { kind: 'auth', jwt: ex.authToken }
         }
@@ -672,7 +680,10 @@ export async function invokeAtResource(
         if (!req.resourceToken) {
           return terminalChallenge(res, req)
         }
-        const ex = await exchangeAtPS(cfg, await needPS(), req.resourceToken)
+        // The credential that drew the challenge is what the resource copied
+        // out of; the PS checks the exchange against it.
+        const presented = cred.kind === 'person' || cred.kind === 'auth' ? cred.jwt : undefined
+        const ex = await exchangeAtPS(cfg, await needPS(), req.resourceToken, presented)
         if (ex.kind !== 'token') return ex
         cred = { kind: 'auth', jwt: ex.authToken }
         continue
@@ -807,7 +818,7 @@ export async function connectAtResource(cfg: ProxyConfig, l1: L1Entry, args: Con
   }
   if (!body.resource_token) return { kind: 'error', status: res.status, body }
 
-  const ex = await exchangeAtPS(cfg, ps, body.resource_token)
+  const ex = await exchangeAtPS(cfg, ps, body.resource_token, pt.personToken)
   if (ex.kind === 'token') return { kind: 'connected', ...(args.account ? { account: args.account } : {}) }
   if (ex.kind === 'result') {
     // N6: a terminal answer that carries no token is the connection-only

@@ -381,6 +381,8 @@ describe('authorize-first', () => {
     expect(authzUrl).toBe('https://res.example/authorize')
     // A resource MUST have verified a person token before it issues a resource token.
     expect(authzInit.signatureKey).toEqual({ type: 'jwt', jwt: 'pt_authz' })
+    // … and the exchange names that same token as presented_token (-11 step 6).
+    expect(JSON.parse(mockSignedFetch.mock.calls[2][1].body)).toMatchObject({ resource_token: 'rt_authz', presented_token: 'pt_authz' })
     // No gateway {service, operationId} entry shape — R3 -02 removed it.
     expect(JSON.parse(authzInit.body)).toEqual({
       r3_operations: {

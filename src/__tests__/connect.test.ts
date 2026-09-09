@@ -119,7 +119,7 @@ describe('connectAtResource', () => {
     expect(bodyOf(1)).toEqual({ scopes: ['calendar.readonly'], account: 'dick@hello.coop' })
     expect((mockSignedFetch.mock.calls[1]![1] as { signatureKey: { jwt: string } }).signatureKey.jwt).toBe('pt_abc')
     expect(urlOf(2)).toBe('https://ps.example/token')
-    expect(bodyOf(2)).toMatchObject({ resource_token: 'rt_conn', capabilities: ['interaction'] })
+    expect(bodyOf(2)).toMatchObject({ resource_token: 'rt_conn', presented_token: 'pt_abc', capabilities: ['interaction'] })
   })
 
   it('already_connected is a status, not an error → ready', async () => {
