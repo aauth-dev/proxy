@@ -1,5 +1,5 @@
 // Fetch + validate a resource's well-known doc; pick vocabulary adapters
-// the agent proxy supports. The caller (add_resource) decides what to do with the
+// the agent proxy supports. The caller (connect_resource) decides what to do with the
 // FetchedResource — typically convert to an L1Entry and store.
 //
 // Mirrors registry/validate.ts:fetchResourceMetadata in spirit: manual
@@ -10,7 +10,7 @@
 
 import { canonicalizeHost } from './host.js'
 import { effectiveAccessMode, getAdapter, supportedVocabUris } from './vocab/index.js'
-import type { AccessMode, L1Entry } from './store.js'
+import type { AccessMode, ConnectionMetadata, L1Entry } from './store.js'
 import type {
   InvocationPlan,
   InvokeArgs,
@@ -32,6 +32,8 @@ export interface AAuthResourceMeta {
   // §Operation Identifier Scope).
   r3_vocabularies?: Record<string, string>
   jwks_uri?: string
+  interaction_endpoint?: string
+  connection?: ConnectionMetadata
 }
 
 export interface PickedVocab {
@@ -77,6 +79,19 @@ function validate(meta: AAuthResourceMeta, host: string, origin: string): void {
   if (!meta.issuer) throw new Error(`resource ${host}: missing issuer`)
   if (meta.issuer.replace(/\/+$/, '') !== origin) {
     throw new Error(`resource ${host}: issuer mismatch (got ${meta.issuer}, expected ${origin})`)
+  }
+  // The interaction endpoint is a published property of the resource: where
+  // the person is sent with `?code=`. It must be https; it need not share the
+  // issuer's origin (ONBOARDING-PLAN-2.md Q2 — an operator hosts the OAuth
+  // start for a fleet of resources; the registry may add an origin rule).
+  if (meta.interaction_endpoint !== undefined) {
+    let https = false
+    try {
+      https = new URL(meta.interaction_endpoint).protocol === 'https:'
+    } catch {
+      /* not a URL */
+    }
+    if (!https) throw new Error(`resource ${host}: interaction_endpoint must be an https URL`)
   }
   // access_mode is NOT validated against a closed list. The value set is an IANA
   // registry (protocol §AAuth Access Mode Value Registry) and the declaration is
@@ -255,6 +270,11 @@ export function toL1Entry(r: FetchedResource): L1Entry {
     ...(r.meta.authorization_endpoint
       ? { authorization_endpoint: r.meta.authorization_endpoint }
       : {}),
+    // N1: carry the interaction endpoint and the whole connection object.
+    // The whitelist used to drop both, which is why nothing connection-
+    // related could work until this line.
+    ...(typeof r.meta.interaction_endpoint === 'string' ? { interaction_endpoint: r.meta.interaction_endpoint } : {}),
+    ...(r.meta.connection && typeof r.meta.connection.endpoint === 'string' ? { connection: r.meta.connection } : {}),
     picked_vocabs: r.pickedVocabs.map((v) => ({ vocabUri: v.vocabUri, docUrl: v.docUrl })),
     added: new Date().toISOString(),
   }

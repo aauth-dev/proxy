@@ -11,13 +11,13 @@ import { Client } from '@modelcontextprotocol/client'
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio'
 
 const EXPECTED_TOOLS = [
-  'add_resource',
+  'connect_resource',
+  'delete_resource',
   'find_resources',
   'get_operation_schemas',
   'invoke',
   'list_operations',
   'list_resources',
-  'remove_resource',
   'reset_tokens',
 ]
 

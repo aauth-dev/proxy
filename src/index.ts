@@ -5,15 +5,22 @@
 // separately from "@aauth/proxy/local".
 
 export {
+  connectAtResource,
+  disconnectAll,
   flushPersonTokens,
   invokeAtResource,
   invokeAtResourceComplete,
+  listConnections,
   makeAgentPoll,
   obtainPersonToken,
+  pollConnection,
   pollUntilDone,
 } from './agent.js'
 export type {
   AgentSigningKey,
+  ConnectArgs,
+  ConnectOutcome,
+  DisconnectRow,
   Interaction,
   InteractionHandler,
   InvokeArgs,
@@ -30,7 +37,7 @@ export type { AccessModePlan, AgentSetup, KnownAccessMode } from './access-mode.
 export { agentTokenPs, decodeJwtHeader, decodeJwtPayload, jwkThumbprint, jwtExp } from './jwt.js'
 
 export { buildProxyTools } from './tools.js'
-export type { ProxyDeps } from './tools.js'
+export type { ConnectFlight, ProxyDeps } from './tools.js'
 
 export type { BootstrapStatus, IdentityProvider } from './identity.js'
 
@@ -63,6 +70,9 @@ export {
 } from './store.js'
 export type {
   AccessMode,
+  ConnectionMetadata,
+  ConnectionRow,
+  ConnectionScope,
   L1Entry,
   L1Store,
   PersonTokenKey,
