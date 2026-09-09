@@ -247,6 +247,33 @@ function interactionFrom(res: Response, publishedUrl?: string): Interaction | un
   return url ? { url, code: parsed.code, pollUrl } : undefined
 }
 
+// A 202 that carries no interaction code: the PS is reaching the person by
+// its own channels (an open wallet tab, a registered device) and the agent
+// has only the poll URL — `requirement=approval`. Poll it; a later poll may
+// re-advertise `requirement=interaction; code=` if the person is not reached.
+function pendingFrom(res: Response): string | undefined {
+  if (res.status !== 202) return undefined
+  return res.headers.get('location') ?? undefined
+}
+
+// Poll a PS pending URL to completion on the agent's behalf. Terminal 2xx →
+// the body; a 202 that (now) advertises an interaction → the interaction to
+// surface; a 202 at the deadline → still pending; anything else → the result.
+async function drivePending(
+  cfg: ProxyConfig,
+  pollUrl: string,
+  publishedUrl: string | undefined,
+  timeoutMs: number,
+): Promise<{ kind: 'done'; body: unknown; res: Response } | { kind: 'interaction'; interaction: Interaction } | { kind: 'pending' } | { kind: 'result'; status: number; body: unknown }> {
+  const res = await pollUntilDone(makeAgentPoll(cfg), pollUrl, timeoutMs)
+  if (res.status === 202) {
+    const interaction = interactionFrom(res, publishedUrl)
+    return interaction ? { kind: 'interaction', interaction } : { kind: 'pending' }
+  }
+  if (!res.ok) return { kind: 'result', status: res.status, body: await safeBody(res) }
+  return { kind: 'done', body: await safeBody(res), res }
+}
+
 async function safeBody(res: Response): Promise<unknown> {
   const text = await res.text()
   try {
@@ -368,16 +395,24 @@ export async function obtainPersonToken(
     }),
   })
 
+  let body: { person_token?: string; expires_in?: number }
   if (res.status === 202) {
     const interaction = interactionFrom(res, ps.interaction_endpoint)
     if (interaction) return { kind: 'interaction', interaction }
+    const pollUrl = pendingFrom(res)
+    if (!pollUrl) return { kind: 'result', status: res.status, body: await safeBody(res) }
+    // The PS is reaching the person itself; wait here.
+    const driven = await drivePending(cfg, pollUrl, ps.interaction_endpoint, PS_REACH_TIMEOUT_MS)
+    if (driven.kind === 'interaction') return driven
+    if (driven.kind === 'pending') return { kind: 'result', status: 202, body: { error: 'ps_reach_timeout', poll_url: pollUrl } }
+    if (driven.kind === 'result') return driven
+    body = driven.body as typeof body
+  } else {
+    if (!res.ok) return { kind: 'result', status: res.status, body: await safeBody(res) }
+    body = (await res.json()) as typeof body
   }
-  if (!res.ok) return { kind: 'result', status: res.status, body: await safeBody(res) }
 
-  const { person_token, expires_in } = (await res.json()) as {
-    person_token: string
-    expires_in?: number
-  }
+  const { person_token, expires_in } = body
   if (!person_token) {
     return { kind: 'result', status: res.status, body: { error: 'ps_returned_no_person_token' } }
   }
@@ -425,7 +460,13 @@ export async function pollUntilDone(
 type ExchangeOutcome =
   | { kind: 'token'; authToken: string }
   | { kind: 'interaction'; interaction: Interaction }
+  /** The PS is reaching the person by its own channels; poll `pollUrl`. */
+  | { kind: 'pending'; pollUrl: string }
   | { kind: 'result'; status: number; body: unknown }
+
+// How long the agent waits on a PS that is reaching the person itself before
+// handing the wait back to the caller (a person at a wallet tab, not a machine).
+const PS_REACH_TIMEOUT_MS = 180_000
 
 // Exchange a resource token at the PS for an auth token. `capabilities` tells the
 // PS the agent can relay interactions to the user, so it returns a 202 consent
@@ -466,11 +507,31 @@ async function exchangeAtPS(
   if (res.status === 202) {
     const interaction = interactionFrom(res, ps.interaction_endpoint)
     if (interaction) return { kind: 'interaction', interaction }
+    const pollUrl = pendingFrom(res)
+    return pollUrl ? { kind: 'pending', pollUrl } : { kind: 'result', status: res.status, body: await safeBody(res) }
   }
   if (!res.ok) return { kind: 'result', status: res.status, body: await safeBody(res) }
-  const { auth_token } = (await res.json()) as { auth_token: string }
-  if (cfg.onAuthToken) await cfg.onAuthToken(auth_token)
-  return { kind: 'token', authToken: auth_token }
+  return tokenFrom(cfg, (await res.json()) as { auth_token?: string })
+}
+
+async function tokenFrom(cfg: ProxyConfig, body: { auth_token?: string }): Promise<Exclude<ExchangeOutcome, { kind: 'pending' }>> {
+  if (typeof body.auth_token !== 'string' || !body.auth_token) {
+    return { kind: 'result', status: 200, body: { error: 'ps_returned_no_auth_token', detail: body } }
+  }
+  if (cfg.onAuthToken) await cfg.onAuthToken(body.auth_token)
+  return { kind: 'token', authToken: body.auth_token }
+}
+
+// Exchange, and when the PS is reaching the person itself, wait for it —
+// the invoke path has nothing else to do until the token exists.
+async function exchangeAtPSAndWait(cfg: ProxyConfig, ps: PSMetadata, resourceToken: string, presentedToken?: string): Promise<Exclude<ExchangeOutcome, { kind: 'pending' }>> {
+  const ex = await exchangeAtPS(cfg, ps, resourceToken, presentedToken)
+  if (ex.kind !== 'pending') return ex
+  const driven = await drivePending(cfg, ex.pollUrl, ps.interaction_endpoint, PS_REACH_TIMEOUT_MS)
+  if (driven.kind === 'interaction') return driven
+  if (driven.kind === 'pending') return { kind: 'result', status: 202, body: { error: 'ps_reach_timeout', poll_url: ex.pollUrl } }
+  if (driven.kind === 'result') return driven
+  return tokenFrom(cfg, driven.body as { auth_token?: string })
 }
 
 // ── Authorize-first ──
@@ -615,7 +676,7 @@ export async function invokeAtResource(
             opts.account,
           )
           if (authz.kind !== 'resourceToken') return authz
-          const ex = await exchangeAtPS(cfg, await needPS(), authz.resourceToken, pt.personToken)
+          const ex = await exchangeAtPSAndWait(cfg, await needPS(), authz.resourceToken, pt.personToken)
           if (ex.kind !== 'token') return ex
           cred = { kind: 'auth', jwt: ex.authToken }
         }
@@ -683,7 +744,7 @@ export async function invokeAtResource(
         // The credential that drew the challenge is what the resource copied
         // out of; the PS checks the exchange against it.
         const presented = cred.kind === 'person' || cred.kind === 'auth' ? cred.jwt : undefined
-        const ex = await exchangeAtPS(cfg, await needPS(), req.resourceToken, presented)
+        const ex = await exchangeAtPSAndWait(cfg, await needPS(), req.resourceToken, presented)
         if (ex.kind !== 'token') return ex
         cred = { kind: 'auth', jwt: ex.authToken }
         continue
@@ -787,8 +848,13 @@ export type ConnectOutcome =
   | { kind: 'connected'; account?: string }
   /** The person must act: the caller surfaces `{url}?code=`, then polls `pollUrl` (`pollConnection`). */
   | { kind: 'interaction'; interaction: Interaction }
-  /** The interaction was surfaced and the bounded wait elapsed. Poll `pollUrl` or call again. */
-  | { kind: 'still_pending'; interaction: Interaction }
+  /**
+   * Not finished yet: poll `pollUrl` or call again. `interaction` is present
+   * when the person has a URL to open; absent while the PS is reaching them by
+   * its own channels (an open wallet tab, a device) — a later poll may
+   * advertise one.
+   */
+  | { kind: 'still_pending'; pollUrl: string; interaction?: Interaction }
   | { kind: 'error'; status: number; body: unknown }
 
 /**
@@ -820,6 +886,9 @@ export async function connectAtResource(cfg: ProxyConfig, l1: L1Entry, args: Con
 
   const ex = await exchangeAtPS(cfg, ps, body.resource_token, pt.personToken)
   if (ex.kind === 'token') return { kind: 'connected', ...(args.account ? { account: args.account } : {}) }
+  // The PS is reaching the person itself (open wallet tab, device): nothing
+  // to surface yet; the caller polls.
+  if (ex.kind === 'pending') return { kind: 'still_pending', pollUrl: ex.pollUrl }
   if (ex.kind === 'result') {
     // N6: a terminal answer that carries no token is the connection-only
     // ceremony completing on the spot.
@@ -835,11 +904,19 @@ export async function connectAtResource(cfg: ProxyConfig, l1: L1Entry, args: Con
 /**
  * The bounded wait (D14 B2): poll the PS pending URL for up to `budgetMs`.
  * Resolves `connected` on any terminal 2xx — with or without a token (N6) —
- * `still_pending` when the slice elapses, and `error` on a terminal failure.
+ * `still_pending` when the slice elapses (adopting an interaction the poll
+ * advertises, if the PS gave up reaching the person itself), and `error` on a
+ * terminal failure. `pollUrl` may be the URL or a prior `Interaction`.
  */
-export async function pollConnection(cfg: ProxyConfig, interaction: Interaction, budgetMs: number, onPoll?: (elapsedMs: number) => void | Promise<void>): Promise<ConnectOutcome> {
-  const res = await pollUntilDone(makeAgentPoll(cfg), interaction.pollUrl, budgetMs, onPoll)
-  if (res.status === 202) return { kind: 'still_pending', interaction }
+export async function pollConnection(cfg: ProxyConfig, pending: string | Interaction, budgetMs: number, onPoll?: (elapsedMs: number) => void | Promise<void>): Promise<ConnectOutcome> {
+  const pollUrl = typeof pending === 'string' ? pending : pending.pollUrl
+  const prior = typeof pending === 'string' ? undefined : pending
+  const res = await pollUntilDone(makeAgentPoll(cfg), pollUrl, budgetMs, onPoll)
+  if (res.status === 202) {
+    const advertised = interactionFrom(res, prior?.url ?? (await psMetadata(cfg.psUrl).catch(() => undefined))?.interaction_endpoint)
+    const interaction = advertised ?? prior
+    return { kind: 'still_pending', pollUrl, ...(interaction ? { interaction } : {}) }
+  }
   if (res.status >= 200 && res.status < 300) return { kind: 'connected' }
   return { kind: 'error', status: res.status, body: await safeBody(res) }
 }
