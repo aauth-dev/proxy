@@ -2,7 +2,7 @@
 
 **Status: v1 invoke spine ✅ proven live (2026-05-25); discovery layer redesigned 2026-06-09; AAuth -11 / R3 -02 landed 2026-08-11 (v0.6.0).** The agent proxy drives the authorize-first R3 flow end-to-end against a real Person Server + AAuth resource, signing with the bootstrapped `@aauth/local-keys` identity. -11 adds person-token acquisition and caching in front of the authorize-first path, the `auth_token_endpoint` / `person_token_endpoint` split in PS metadata, and three-way `access_mode` planning; R3 -02 adds operation access annotations and the per-call proposal flow, and removes the openapi-gateway vocabulary. Discovery generalizes to multi-resource: signed-call registry client, three-layer state (added / discoverable / per-resource ops), vocabulary-adapter abstraction (OpenAPI today, AsyncAPI partial, MCP-tools/GraphQL later). v.next (sub-agents, WASM runtime) is still ahead.
 
-Reference implementation of an AAuth agent for MCP-aware agent hosts. The agent proxy represents the user as an AAuth agent, exposes that agent's capabilities to an LLM via MCP, and relays AAuth interactions to the user's Person Server. Published as `@aauth/proxy` from `aauth-dev/praca`.
+Reference implementation of an AAuth agent for MCP-aware agent hosts. The agent proxy represents the user as an AAuth agent, exposes that agent's capabilities to an LLM via MCP, and opens the AAuth interactions that need the person. Published as `@aauth/proxy` from `aauth-dev/praca`.
 
 ## Objectives
 
@@ -29,7 +29,7 @@ Reference implementation of an AAuth agent for MCP-aware agent hosts. The agent 
             │  - software parent keypair      │
             │  - AP signing key in enclave    │
             │  - service catalog              │
-            │  - interaction relay to PS      │
+            │  - interactions (open + poll)   │
             │  - state in ~/.aauth/proxy/     │
             └────────────────┬────────────────┘
                              │ AAuth-signed HTTPS
@@ -104,7 +104,7 @@ Three layers, all file-backed, all per-machine.
 | `catalog/{host}/{vocab}.json` | **L3** — cached vocabulary docs (OpenAPI / AsyncAPI / …) per resource | fetched on first `list_operations`/`get_operation_schemas`; cached with TTL |
 | `connections/{host}.json` | per-resource session state — stored auth-tokens, refresh state, last interaction | written by R3 flow |
 | `person-tokens.json` | PS-issued person tokens, keyed `(resource, mission_s256)`, plus the thumbprint of the agent key they all bind | written on person-token acquisition; flushed whole on key rotation |
-| `pending-interactions.json` | open interactions awaiting user resolution | written/cleared by interaction relay |
+| `pending-interactions.json` | open interactions awaiting user resolution | written/cleared as interactions open and resolve |
 
 JSON files for v1; promote to SQLite if concurrent writes get painful. File-lock for concurrent writes (multiple host clients OK).
 
@@ -303,7 +303,42 @@ Enclave signature accounting:
 
 Compromise model: process compromise leaks AP key (forge any future agent for this user/machine), parent's software key (impersonate parent until agent token expires), in-memory sub-agent keys. Does **not** leak the user's PS grant — that's at PS, keyed on parent identity. Revoke at PS → all forged agents become useless within auth_token TTL.
 
-## Interaction relay
+## Interactions
+
+> Superseded in 4.0.0. There is no relay: the agent does not POST an
+> interaction to the PS, and it *does* construct the URL the person opens.
+> The v1 flow this section described is kept below the line as design history.
+
+When a party cannot proceed without the person, it answers `202` with
+`AAuth-Requirement: requirement=interaction; code="XXXX-XXXX"` — the code
+alone. The recipient composes `{interaction_endpoint}?code=…` from the
+issuer's published metadata: the resource's own `interaction_endpoint` when
+the resource answered, the PS's when the PS did. The agent opens that URL and
+polls; it never forwards the interaction anywhere.
+
+Two shapes reach the agent:
+
+1. **The PS needs the person** — consent for a grant, or approval of a per-call
+   proposal. The agent composes the URL from PS metadata and polls the
+   `Location` until the PS answers with an auth token, or terminally denies.
+2. **The resource needs the person** — an upstream account has to be linked.
+   The resource mints a connection-only resource token (no `scope`, an
+   `interaction_code`); the PS holds a pending record, sends the person to the
+   *resource's* `interaction_endpoint`, and terminates on the resource's
+   bounce with `{ "status": "connection_established" }` and no token.
+
+A `202` carrying no code at all is the third case: the PS is reaching the
+person by its own channel (an open wallet tab, a device push). There is
+nothing for the agent to open — it polls, and a later poll may hand it an
+interaction after all.
+
+Sensitive operations still follow the AAuth escalation path: the resource
+mints a resource_token packed with operation context, the agent presents it at
+the PS, and the PS mints an auth token bound to the agent's key only on
+approval.
+
+<details>
+<summary>v1 design history — the interaction relay (removed in 4.0.0)</summary>
 
 When an AAuth resource issues an interaction (escalation needed, fingerprint check, step-up auth), the agent proxy is the conduit between resource and PS:
 
@@ -314,6 +349,8 @@ When an AAuth resource issues an interaction (escalation needed, fingerprint che
 5. the agent proxy returns auth_token to resource (and surfaces deny/defer to the LLM)
 
 Sensitive operations follow the AAuth escalation path: resource mints a resource_token packed with operation context (sender, recipient, body excerpt), the agent proxy carries it to PS, PS drives mobile-app approval, only on approval mints auth_token bound to the agent proxy's parent key. **The agent proxy never sees or constructs the consent URL the user sees.**
+
+</details>
 
 ### Notification fallback
 
@@ -327,7 +364,7 @@ What ships:
 - Three-layer state at `~/.aauth/proxy/` (resources / registry cache / vocab cache + connections)
 - Signed `GET registry.aauth.dev/resources` for L2 discovery; direct URL add via `add_resource` works without registry
 - Vocabulary adapter abstraction with one full OpenAPI adapter and one partial AsyncAPI adapter (publish only)
-- Interaction relay to PS
+- Interactions: compose the URL from the issuer's metadata, open it, poll
 - MCP-as-AP key model
 - Integration tested against at least one real AAuth resource
 
@@ -421,7 +458,7 @@ const result = aauth.call(svc, method, args);
 hostCall(callerIdentity, service, method, args)
 ```
 
-Owns AAuth signing, scope validation, resource_token bubbling, interaction relay, audit attribution. **v1's MCP `invoke` tool handler calls into the same dispatcher** with `callerIdentity = parent`. v.next bindings call it with `callerIdentity = sub_agent`. One code path; v.next is purely additive.
+Owns AAuth signing, scope validation, resource_token bubbling, interaction handling, audit attribution. **v1's MCP `invoke` tool handler calls into the same dispatcher** with `callerIdentity = parent`. v.next bindings call it with `callerIdentity = sub_agent`. One code path; v.next is purely additive.
 
 ### Interactions block import calls
 
@@ -490,7 +527,7 @@ Get these right in v1 and v.next is a runtime bolt-on.
 ## Phased plan
 
 1. ✅ **Phase 0 — Skeleton.** the agent proxy stdio MCP server with single-resource `discover`/`invoke`/`connect`. Central `hostCall` dispatcher, catalog-driven, caller identity as parameter. Validated against Claude Code.
-2. ✅ **Phase 1 — First real resource.** Connected to a real AAuth-fronted upstream and ran the full AAuth dance end-to-end: resource_tokens, escalation, interactions, interaction relay.
+2. ✅ **Phase 1 — First real resource.** Connected to a real AAuth-fronted upstream and ran the full AAuth dance end-to-end: resource_tokens, escalation, interactions.
 3. ✅ **Phase 2 — Discovery layer (multi-resource).** Refactored `catalog.ts` into a `VocabAdapter` interface (one OpenAPI adapter); added registry client (signed `GET /resources` + ETag); added L1 store at `~/.aauth/proxy/resources.json`; rewired `server.ts` to the eight-tool surface; added `PROXY_REGISTRY_URL`.
 4. **Phase 3 — AsyncAPI partial.** AsyncAPI adapter listing `send` + `receive` ops; `invoke` runs `async.send`; `async.receive` returns `async_subscribe_requires_subagent`. Drives the second-vocab validation of the adapter interface.
 5. **Phase 4 — Container host bridge.** the agent proxy exposes HTTP listener for container-resident hosts. Register via host's MCP config pointing at `host.docker.internal:<port>`. Validate signing + invoke from inside container.
@@ -500,4 +537,4 @@ Get these right in v1 and v.next is a runtime bolt-on.
 
 ## Single-sentence summary
 
-the agent proxy is the user's AAuth agent in MCP form — a stdio-launched Node process that holds the user's parent identity, exposes a fixed eight-tool meta-surface (`find_resources` / `add_resource` / `list_resources` / `remove_resource` / `connect` / `list_operations` / `get_operation_schemas` / `invoke`) over three layers of state (added resources / cached registry / per-resource ops), dispatches via vocabulary adapters (OpenAPI today; AsyncAPI partial; MCP-tools and GraphQL later) through a single `hostCall(caller, resource, opId, args)` chokepoint, and relays AAuth interactions between resources and PS — so that v1 ships as a clean, token-flat MCP↔AAuth bridge and v.next bolts on a QuickJS-WASM sub-agent runtime whose saved functions appear as first-class MCP tools without rewriting a line of v1.
+the agent proxy is the user's AAuth agent in MCP form — a stdio-launched Node process that holds the user's parent identity, exposes a fixed eight-tool meta-surface (`find_resources` / `add_resource` / `list_resources` / `remove_resource` / `connect` / `list_operations` / `get_operation_schemas` / `invoke`) over three layers of state (added resources / cached registry / per-resource ops), dispatches via vocabulary adapters (OpenAPI today; AsyncAPI partial; MCP-tools and GraphQL later) through a single `hostCall(caller, resource, opId, args)` chokepoint, and opens the AAuth interactions that need the person — so that v1 ships as a clean, token-flat MCP↔AAuth bridge and v.next bolts on a QuickJS-WASM sub-agent runtime whose saved functions appear as first-class MCP tools without rewriting a line of v1.
