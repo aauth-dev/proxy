@@ -74,6 +74,27 @@ export interface ProxyDeps {
   // the PS before answering `still_pending`. MCP clients commonly time a tool
   // call out around 60 s, so the default stays well inside that.
   connectBudgetMs?: number
+  // In-flight connects, per resource host, so a repeat connect_resource call
+  // resumes the same PS pending record instead of starting a new flow. A host
+  // that builds a fresh server per request (the hosted MCP) MUST back this
+  // with per-user storage that outlives the request; the default is an
+  // in-memory map per ProxyConfig (one process, one principal).
+  connectState?: {
+    get(host: string): Promise<ConnectFlight | undefined>
+    set(host: string, flight: ConnectFlight): Promise<void>
+    clear(host: string): Promise<void>
+  }
+  // The queue-depth guard (H4): called when a connect is about to start a new
+  // flow. Returns a warning to attach to the result when the person is about
+  // to be sent through more consent screens than they will sit through; the
+  // host owns the count and the threshold (§7 C3 is still open).
+  connectGuard?: (host: string) => Promise<string | undefined>
+}
+
+export interface ConnectFlight {
+  interaction: Interaction
+  account?: string
+  startedAt: number
 }
 
 const text = (s: string) => ({ content: [{ type: 'text' as const, text: s }] })
@@ -98,20 +119,29 @@ That guide walks through generating a keypair (Secure Enclave / YubiKey / softwa
 binding a Person Server, and publishing the JWKS. When it's done, call this tool again.`
 
 // In-flight connects, per ProxyConfig (i.e. per principal — a process-global
-// map would let one tenant resume another's flow in a multi-user host).
-interface InFlight {
-  interaction: Interaction
-  account?: string
-  startedAt: number
-}
+// map would let one tenant resume another's flow in a multi-user host). The
+// default when the host injects no connectState.
+type InFlight = ConnectFlight
+type FlightStore = NonNullable<ProxyDeps['connectState']>
 const inflightByConfig = new WeakMap<ProxyConfig, Map<string, InFlight>>()
-function inflightFor(cfg: ProxyConfig): Map<string, InFlight> {
+function memoryFlights(cfg: ProxyConfig): FlightStore {
   let m = inflightByConfig.get(cfg)
   if (!m) {
     m = new Map()
     inflightByConfig.set(cfg, m)
   }
-  return m
+  const map = m
+  return {
+    async get(host) {
+      return map.get(host)
+    },
+    async set(host, flight) {
+      map.set(host, flight)
+    },
+    async clear(host) {
+      map.delete(host)
+    },
+  }
 }
 
 function interactionText(interaction: Interaction): string {
@@ -292,29 +322,30 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       if (!c.ok) return text(BOOTSTRAP_GUIDANCE)
       const cfg = c.cfg
       const host = entry.resource
-      const inflight = inflightFor(cfg)
+      const inflight = deps.connectState ?? memoryFlights(cfg)
+      let warning: string | undefined
 
       const finish = async (outcome: ConnectOutcome, flight?: InFlight) => {
         switch (outcome.kind) {
           case 'connected': {
-            inflight.delete(host)
+            await inflight.clear(host)
             await deps.authPending?.resolve(host)
             const refreshed = await refreshConnections(cfg, entry as L1Entry)
-            return json({ ...base, outcome: 'connected', ...(flight?.account ?? outcome.account ? { account: flight?.account ?? outcome.account } : {}), connections: refreshed.connections ?? [] })
+            return json({ ...base, outcome: 'connected', ...(flight?.account ?? outcome.account ? { account: flight?.account ?? outcome.account } : {}), connections: refreshed.connections ?? [], ...(warning ? { warning } : {}) })
           }
           case 'ready': {
             const refreshed = await refreshConnections(cfg, entry as L1Entry)
             return json({ ...base, outcome: 'ready', reason: outcome.reason, ...(outcome.account ? { account: outcome.account } : {}), ...(outcome.scopes ? { scopes: outcome.scopes } : {}), connections: refreshed.connections ?? [] })
           }
           case 'still_pending':
-            inflight.set(host, flight ?? { interaction: outcome.interaction, ...(account ? { account } : {}), startedAt: Date.now() })
+            await inflight.set(host, flight ?? { interaction: outcome.interaction, ...(account ? { account } : {}), startedAt: Date.now() })
             return text(
               `Connection to ${host} is still pending — the person has not finished at ${entry!.connection!.upstream_name ?? 'the upstream'} yet.\n\n` +
                 `Call connect_resource("${host}"${account ? `, account: "${account}"` : ''}) again to keep waiting. If they need the link:\n\n` +
                 interactionText(outcome.interaction),
             )
           case 'error':
-            inflight.delete(host)
+            await inflight.clear(host)
             return json({ ...base, outcome: 'error', status: outcome.status, body: outcome.body })
           case 'interaction':
             // Reached only through the fallback path below.
@@ -324,16 +355,19 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
 
       // Resume an in-flight connect (D8: blocking governs what the agent sees;
       // the flow itself lives at the PS). The next slice of waiting, or give up.
-      const existing = inflight.get(host)
+      const existing = await inflight.get(host)
       if (existing) {
         if (Date.now() - existing.startedAt > CONNECT_MAX_MS) {
-          inflight.delete(host)
+          await inflight.clear(host)
           await deps.authPending?.resolve(host)
           return json({ ...base, outcome: 'timed_out', detail: 'the person did not finish; call connect_resource again to start over' })
         }
         return finish(await pollConnection(cfg, existing.interaction, budgetMs), existing)
       }
 
+      // H4: about to send the person through another consent screen — the
+      // host says whether that is one too many for this sitting.
+      warning = await deps.connectGuard?.(host)
       let outcome: ConnectOutcome
       try {
         outcome = await connectAtResource(cfg, entry, { ...(account ? { account } : {}), ...(scopes ? { scopes } : {}) })
@@ -347,13 +381,13 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       // wait the bounded slice (B2) before answering.
       const { interaction } = outcome
       const flight: InFlight = { interaction, ...(account ? { account } : {}), startedAt: Date.now() }
-      inflight.set(host, flight)
+      await inflight.set(host, flight)
       await deps.onInteraction?.(interaction.url, interaction.code, interaction.pollUrl, () => deps.authPending?.resolve(host))
       await deps.authPending?.register(host)
       const waited = await pollConnection(cfg, interaction, budgetMs)
       if (waited.kind === 'still_pending') {
         return text(
-          `Connecting ${host} needs the person to act.\n\n` +
+          `${warning ? `${warning}\n\n` : ''}Connecting ${host} needs the person to act.\n\n` +
             `IMPORTANT: You MUST do all of the following in your response:\n` +
             `1. Display the QR code below verbatim so the user can scan it.\n` +
             `2. Show the authorization URL so the user can open it.\n` +
@@ -422,7 +456,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       if (entry.connection) {
         const c = await getConfig(ctx)
         if (!c.ok) return text(BOOTSTRAP_GUIDANCE)
-        inflightFor(c.cfg).delete(canonical.host)
+        await (deps.connectState ?? memoryFlights(c.cfg)).clear(canonical.host)
         try {
           disconnected = await disconnectAll(c.cfg, entry)
         } catch (err) {
