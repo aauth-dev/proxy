@@ -391,6 +391,25 @@ describe('authorize-first', () => {
       },
     })
   })
+
+  it('a named account takes the auth-token path even on a person-token read (the account travels in the auth token)', async () => {
+    mockPSWellKnown()
+    mockSignedFetch
+      .mockResolvedValueOnce(makeResponse(200, { person_token: 'pt_acct', expires_in: 3600 }))
+      .mockResolvedValueOnce(makeResponse(200, { resource_token: 'rt_acct' }))
+      .mockResolvedValueOnce(makeResponse(200, { auth_token: 'at_acct' }))
+      .mockResolvedValueOnce(makeResponse(200, { ok: true }))
+    const entry = l1({ access_mode: 'person-token', authorization_endpoint: 'https://res.example/authorize' })
+    routeTo('person-token')
+
+    const result = await invokeAtResource(config(), entry, 'whoami', {}, { account: 'dick@example.com' })
+    expect(result).toEqual({ kind: 'result', status: 200, body: { ok: true } })
+    const [authzUrl, authzInit] = mockSignedFetch.mock.calls[1]
+    expect(authzUrl).toBe('https://res.example/authorize')
+    expect(JSON.parse(authzInit.body)).toMatchObject({ account: 'dick@example.com' })
+    // The call itself presents the auth token, not the person token.
+    expect(mockSignedFetch.mock.calls[3][1].signatureKey).toEqual({ type: 'jwt', jwt: 'at_acct' })
+  })
 })
 
 describe('three-way access_mode plan', () => {

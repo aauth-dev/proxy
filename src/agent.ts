@@ -634,8 +634,15 @@ export async function invokeAtResource(
   // requirement loop, which is identical in every mode.
   let cred: Credential = { kind: 'agent' }
 
+  // A named account (the AAuth `account` extension) only travels in an auth
+  // token: it is bound at the authorization endpoint and the resource routes
+  // on it. A person-token read carries no account, so with more than one
+  // account connected the resource can only answer account_required — take
+  // the auth-token path whenever the caller named one.
+  const mode = accessPlan.kind === 'satisfiable' && accessPlan.mode === 'person-token' && opts.account ? 'auth-token' : accessPlan.kind === 'satisfiable' ? accessPlan.mode : undefined
+
   if (accessPlan.kind === 'satisfiable') {
-    switch (accessPlan.mode) {
+    switch (mode) {
       case 'agent-token':
         break
 
