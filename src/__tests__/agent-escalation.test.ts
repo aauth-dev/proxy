@@ -270,6 +270,7 @@ describe('person tokens', () => {
     expect(ptUrl).toBe('https://ps.example/person')
     expect(JSON.parse(ptInit.body)).toEqual({
       resource: 'https://res.example',
+      capabilities: ['interaction'],
       mission_s256: MISSION,
     })
     // The agent token is presented while requesting the person token …
@@ -380,6 +381,8 @@ describe('authorize-first', () => {
     expect(authzUrl).toBe('https://res.example/authorize')
     // A resource MUST have verified a person token before it issues a resource token.
     expect(authzInit.signatureKey).toEqual({ type: 'jwt', jwt: 'pt_authz' })
+    // … and the exchange names that same token as presented_token (-11 step 6).
+    expect(JSON.parse(mockSignedFetch.mock.calls[2][1].body)).toMatchObject({ resource_token: 'rt_authz', presented_token: 'pt_authz' })
     // No gateway {service, operationId} entry shape — R3 -02 removed it.
     expect(JSON.parse(authzInit.body)).toEqual({
       r3_operations: {
@@ -387,6 +390,25 @@ describe('authorize-first', () => {
         operations: [{ operationId: 'whoami' }],
       },
     })
+  })
+
+  it('a named account takes the auth-token path even on a person-token read (the account travels in the auth token)', async () => {
+    mockPSWellKnown()
+    mockSignedFetch
+      .mockResolvedValueOnce(makeResponse(200, { person_token: 'pt_acct', expires_in: 3600 }))
+      .mockResolvedValueOnce(makeResponse(200, { resource_token: 'rt_acct' }))
+      .mockResolvedValueOnce(makeResponse(200, { auth_token: 'at_acct' }))
+      .mockResolvedValueOnce(makeResponse(200, { ok: true }))
+    const entry = l1({ access_mode: 'person-token', authorization_endpoint: 'https://res.example/authorize' })
+    routeTo('person-token')
+
+    const result = await invokeAtResource(config(), entry, 'whoami', {}, { account: 'dick@example.com' })
+    expect(result).toEqual({ kind: 'result', status: 200, body: { ok: true } })
+    const [authzUrl, authzInit] = mockSignedFetch.mock.calls[1]
+    expect(authzUrl).toBe('https://res.example/authorize')
+    expect(JSON.parse(authzInit.body)).toMatchObject({ account: 'dick@example.com' })
+    // The call itself presents the auth token, not the person token.
+    expect(mockSignedFetch.mock.calls[3][1].signatureKey).toEqual({ type: 'jwt', jwt: 'at_acct' })
   })
 })
 

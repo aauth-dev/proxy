@@ -119,7 +119,7 @@ describe('connectAtResource', () => {
     expect(bodyOf(1)).toEqual({ scopes: ['calendar.readonly'], account: 'dick@hello.coop' })
     expect((mockSignedFetch.mock.calls[1]![1] as { signatureKey: { jwt: string } }).signatureKey.jwt).toBe('pt_abc')
     expect(urlOf(2)).toBe('https://ps.example/token')
-    expect(bodyOf(2)).toMatchObject({ resource_token: 'rt_conn', capabilities: ['interaction'] })
+    expect(bodyOf(2)).toMatchObject({ resource_token: 'rt_conn', presented_token: 'pt_abc', capabilities: ['interaction'] })
   })
 
   it('already_connected is a status, not an error → ready', async () => {
@@ -164,9 +164,46 @@ describe('pollConnection (B2 slice)', () => {
     mockSignedFetch.mockResolvedValueOnce(makeResponse(200, { status: 'connection_established' }))
     expect(await pollConnection(config(), interaction, 10)).toEqual({ kind: 'connected' })
     mockSignedFetch.mockResolvedValue(makeResponse(202, {}))
-    expect(await pollConnection(config(), interaction, 10)).toEqual({ kind: 'still_pending', interaction })
+    expect(await pollConnection(config(), interaction, 10)).toEqual({ kind: 'still_pending', pollUrl: interaction.pollUrl, interaction })
     mockSignedFetch.mockResolvedValueOnce(makeResponse(410, { error: 'expired' }))
     expect(await pollConnection(config(), interaction, 10)).toEqual({ kind: 'error', status: 410, body: { error: 'expired' } })
+  })
+
+  it('a PS reaching the person itself (202 requirement=approval, no code) is still_pending with only the poll URL; a later poll may advertise the interaction', async () => {
+    mockPSWellKnown()
+    mockSignedFetch
+      .mockResolvedValueOnce(personTokenResponse())
+      .mockResolvedValueOnce(makeResponse(200, { resource_token: 'rt_conn' }))
+      .mockResolvedValueOnce(makeResponse(202, { status: 'pending' }, { 'aauth-requirement': 'requirement=approval', location: 'https://ps.example/pending/QQQQ-1111' }))
+    const out = await connectAtResource(config(), l1(), { account: 'a@b.co' })
+    expect(out).toEqual({ kind: 'still_pending', pollUrl: 'https://ps.example/pending/QQQQ-1111' })
+
+    // The wallet tab went away: the poll re-advertises the code; the URL is the PS's.
+    mockSignedFetch.mockResolvedValue(makeResponse(202, { status: 'pending' }, { 'aauth-requirement': 'requirement=interaction; code="QQQQ-1111"', location: 'https://ps.example/pending/QQQQ-1111' }))
+    expect(await pollConnection(config(), 'https://ps.example/pending/QQQQ-1111', 10)).toEqual({
+      kind: 'still_pending',
+      pollUrl: 'https://ps.example/pending/QQQQ-1111',
+      interaction: { url: 'https://ps.example/auth', code: 'QQQQ-1111', pollUrl: 'https://ps.example/pending/QQQQ-1111' },
+    })
+  })
+
+  it('invoke waits out a PS that is reaching the person itself and continues with the token', async () => {
+    mockPSWellKnown()
+    mockRouteOperation.mockResolvedValue({
+      adapter: { vocabUri: 'urn:aauth:vocabulary:openapi' },
+      plan: { kind: 'sync.request', method: 'GET', path: '/x', query: '' },
+      annotations: {},
+      accessMode: 'agent-token',
+    })
+    mockSignedFetch
+      .mockResolvedValueOnce(makeResponse(401, {}, { 'aauth-requirement': 'requirement=auth-token; resource-token="rt1"' }))
+      .mockResolvedValueOnce(makeResponse(202, { status: 'pending' }, { 'aauth-requirement': 'requirement=approval', location: 'https://ps.example/pending/P' }))
+      .mockResolvedValueOnce(makeResponse(200, { auth_token: 'at_reach' })) // the poll resolves
+      .mockResolvedValueOnce(makeResponse(200, { ok: true }))
+    const out = await invokeAtResource(config(), l1(), 'x')
+    expect(out).toEqual({ kind: 'result', status: 200, body: { ok: true } })
+    expect(mockSignedFetch.mock.calls[2]![0]).toBe('https://ps.example/pending/P')
+    expect((mockSignedFetch.mock.calls[3]![1] as { signatureKey: { jwt: string } }).signatureKey.jwt).toBe('at_reach')
   })
 })
 

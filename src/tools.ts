@@ -87,7 +87,9 @@ export interface ProxyDeps {
 }
 
 export interface ConnectFlight {
-  interaction: Interaction
+  pollUrl: string
+  /** Absent while the PS is reaching the person by its own channels. */
+  interaction?: Interaction
   account?: string
   startedAt: number
 }
@@ -331,13 +333,17 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
             const refreshed = await refreshConnections(cfg, entry as L1Entry)
             return json({ ...base, outcome: 'ready', reason: outcome.reason, ...(outcome.account ? { account: outcome.account } : {}), ...(outcome.scopes ? { scopes: outcome.scopes } : {}), connections: refreshed.connections ?? [] })
           }
-          case 'still_pending':
-            await inflight.set(host, flight ?? { interaction: outcome.interaction, ...(account ? { account } : {}), startedAt: Date.now() })
+          case 'still_pending': {
+            const next: InFlight = { ...(flight ?? { ...(account ? { account } : {}), startedAt: Date.now() }), pollUrl: outcome.pollUrl, ...(outcome.interaction ? { interaction: outcome.interaction } : {}) }
+            await inflight.set(host, next)
             return text(
               `Connection to ${host} is still pending — the person has not finished at ${entry!.connection!.upstream_name ?? 'the upstream'} yet.\n\n` +
-                `Call connect_resource("${host}"${account ? `, account: "${account}"` : ''}) again to keep waiting. If they need the link:\n\n` +
-                interactionText(outcome.interaction),
+                `Call connect_resource("${host}"${account ? `, account: "${account}"` : ''}) again to keep waiting. ` +
+                (next.interaction
+                  ? `If they need the link:\n\n${interactionText(next.interaction)}`
+                  : `Their wallet is showing them the request (an open wallet tab or their device) — no link to hand over yet.`),
             )
+          }
           case 'error':
             await inflight.clear(host)
             return json({ ...base, outcome: 'error', status: outcome.status, body: outcome.body })
@@ -356,7 +362,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
           await deps.authPending?.resolve(host)
           return json({ ...base, outcome: 'timed_out', detail: 'the person did not finish; call connect_resource again to start over' })
         }
-        return finish(await pollConnection(cfg, existing.interaction, budgetMs), existing)
+        return finish(await pollConnection(cfg, existing.interaction ?? existing.pollUrl, budgetMs), existing)
       }
 
       let outcome: ConnectOutcome
@@ -372,7 +378,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       // slice (B2) before answering. The PS also reaches an open wallet tab
       // on its own; the poll sees the result either way.
       const { interaction } = outcome
-      const flight: InFlight = { interaction, ...(account ? { account } : {}), startedAt: Date.now() }
+      const flight: InFlight = { pollUrl: interaction.pollUrl, interaction, ...(account ? { account } : {}), startedAt: Date.now() }
       await inflight.set(host, flight)
       await deps.onInteraction?.(interaction.url, interaction.code, interaction.pollUrl, () => deps.authPending?.resolve(host))
       await deps.authPending?.register(host)
