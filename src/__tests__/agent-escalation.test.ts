@@ -270,6 +270,7 @@ describe('person tokens', () => {
     expect(ptUrl).toBe('https://ps.example/person')
     expect(JSON.parse(ptInit.body)).toEqual({
       resource: 'https://res.example',
+      capabilities: ['interaction'],
       mission_s256: MISSION,
     })
     // The agent token is presented while requesting the person token …

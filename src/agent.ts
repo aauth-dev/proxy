@@ -354,11 +354,16 @@ export async function obtainPersonToken(
   const cached = await store.get(key, jkt)
   if (cached) return { kind: 'token', personToken: cached }
 
+  // `capabilities` tells the PS this agent can put a URL in front of the
+  // person (§Person Token Request): without it a first binding at a PS that
+  // cannot reach them another way (no open wallet tab, no push device) is
+  // refused with user_unreachable instead of a 202 interaction.
   const res = await signWith(cfg, { kind: 'agent' }, { psOrAs: true })(ps.person_token_endpoint, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
       resource,
+      capabilities: cfg.psHints?.capabilities ?? ['interaction'],
       ...(missionS256 ? { mission_s256: missionS256 } : {}),
     }),
   })
