@@ -23,7 +23,7 @@ import type { AccessModePlan, KnownAccessMode } from './access-mode.js'
 import { agentTokenPs, jwkThumbprint } from './jwt.js'
 import { routeOperation } from './resource.js'
 import { createMemoryPersonTokenStore } from './store.js'
-import type { L1Entry, PersonTokenStore } from './store.js'
+import type { ConnectionRow, L1Entry, PersonTokenStore } from './store.js'
 
 export type AgentSigningKey = Parameters<typeof signedFetch>[1]['signingKey']
 
@@ -89,6 +89,14 @@ export interface InvokeArgs {
 export interface InvokeOptions {
   /** Overrides ProxyConfig.missionS256 for this call. */
   missionS256?: string
+  /**
+   * Which of the person's connected upstream accounts this call is for (the
+   * AAuth `account` extension). Sent on the authorization request; the PS
+   * binds it into the auth token and the resource routes on it. Required by
+   * the resource when the person holds two or more connections — its
+   * `account_required` error names the candidates.
+   */
+  account?: string
 }
 
 export interface Interaction {
@@ -225,12 +233,17 @@ async function terminalChallenge(res: Response, req: ParsedRequirement): Promise
   }
 }
 
-function interactionFrom(res: Response): Interaction | undefined {
+// N7 (§3.8): an interaction needs `code` and the poll URL. The page the
+// person is sent to is a published property of whoever issued the 202 — the
+// resource's `interaction_endpoint` (L1) or the PS's — so a `url=` parameter
+// on the header is honoured when present and composed from metadata when
+// not. Neither → not an interaction this agent can drive.
+function interactionFrom(res: Response, publishedUrl?: string): Interaction | undefined {
   const parsed = parseRequirement(res.headers.get('aauth-requirement'))
   const pollUrl = res.headers.get('location') ?? ''
-  return parsed?.requirement === 'interaction' && parsed.url && parsed.code && pollUrl
-    ? { url: parsed.url, code: parsed.code, pollUrl }
-    : undefined
+  if (parsed?.requirement !== 'interaction' || !parsed.code || !pollUrl) return undefined
+  const url = parsed.url ?? publishedUrl
+  return url ? { url, code: parsed.code, pollUrl } : undefined
 }
 
 async function safeBody(res: Response): Promise<unknown> {
@@ -350,7 +363,7 @@ export async function obtainPersonToken(
   })
 
   if (res.status === 202) {
-    const interaction = interactionFrom(res)
+    const interaction = interactionFrom(res, ps.interaction_endpoint)
     if (interaction) return { kind: 'interaction', interaction }
   }
   if (!res.ok) return { kind: 'result', status: res.status, body: await safeBody(res) }
@@ -449,11 +462,11 @@ type ExchangeOutcome =
 // it is returned.
 async function exchangeAtPS(
   cfg: ProxyConfig,
-  authTokenEndpoint: string,
+  ps: PSMetadata,
   resourceToken: string,
 ): Promise<ExchangeOutcome> {
   const { capabilities, ...otherHints } = cfg.psHints ?? {}
-  const res = await signWith(cfg, { kind: 'agent' }, { psOrAs: true })(authTokenEndpoint, {
+  const res = await signWith(cfg, { kind: 'agent' }, { psOrAs: true })(ps.auth_token_endpoint, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
@@ -463,7 +476,7 @@ async function exchangeAtPS(
     }),
   })
   if (res.status === 202) {
-    const interaction = interactionFrom(res)
+    const interaction = interactionFrom(res, ps.interaction_endpoint)
     if (interaction) return { kind: 'interaction', interaction }
   }
   if (!res.ok) return { kind: 'result', status: res.status, body: await safeBody(res) }
@@ -486,6 +499,7 @@ async function authorizeAtResource(
   personToken: string,
   vocabulary: string,
   operationId: string,
+  account?: string,
 ): Promise<{ kind: 'resourceToken'; resourceToken: string } | { kind: 'result'; status: number; body: unknown }> {
   const res = await signWith(cfg, { kind: 'person', jwt: personToken })(endpoint, {
     method: 'POST',
@@ -497,6 +511,8 @@ async function authorizeAtResource(
         // advertises for this vocabulary (R3 -02 §Operation Identifier Scope).
         operations: [{ operationId }],
       },
+      // N2: bind the authorization to one of the person's connected accounts.
+      ...(account ? { account } : {}),
     }),
   })
   if (!res.ok) return { kind: 'result', status: res.status, body: await safeBody(res) }
@@ -608,9 +624,10 @@ export async function invokeAtResource(
             pt.personToken,
             route.adapter.vocabUri,
             operationId,
+            opts.account,
           )
           if (authz.kind !== 'resourceToken') return authz
-          const ex = await exchangeAtPS(cfg, (await needPS()).auth_token_endpoint, authz.resourceToken)
+          const ex = await exchangeAtPS(cfg, await needPS(), authz.resourceToken)
           if (ex.kind !== 'token') return ex
           cred = { kind: 'auth', jwt: ex.authToken }
         }
@@ -675,14 +692,14 @@ export async function invokeAtResource(
         if (!req.resourceToken) {
           return terminalChallenge(res, req)
         }
-        const ex = await exchangeAtPS(cfg, (await needPS()).auth_token_endpoint, req.resourceToken)
+        const ex = await exchangeAtPS(cfg, await needPS(), req.resourceToken)
         if (ex.kind !== 'token') return ex
         cred = { kind: 'auth', jwt: ex.authToken }
         continue
       }
 
       case 'interaction': {
-        const interaction = interactionFrom(res)
+        const interaction = interactionFrom(res, l1.interaction_endpoint)
         if (!interaction) {
           return { kind: 'result', status: res.status, body: await safeBody(res) }
         }
@@ -765,4 +782,130 @@ export async function invokeAtResourceComplete(
 // Uses the agent token so the resource can verify the caller owns the key.
 export async function deleteAtAdmin(cfg: ProxyConfig, l1: L1Entry, path: string): Promise<Response> {
   return signWith(cfg, { kind: 'agent' })(`${l1.origin}${path}`, { method: 'DELETE' })
+}
+
+// ── Connections (ONBOARDING-PLAN.md §3.0, N3–N6) ──
+//
+// The link ceremony. Where `invoke` authorizes an AGENT for operations,
+// `connectAtResource` links the PERSON's upstream account: POST on the
+// resource's connection collection with a person token, take back a
+// connection-only resource token (an interaction and no `scope`), exchange it
+// at the PS, and drive the interaction the PS answers with. The PS issues no
+// auth token for this shape; it terminates with `connection_established`.
+
+export interface ConnectArgs {
+  /** Present iff the resource declares `connection.account_description`. */
+  account?: string
+  /** Subset of the declared `connection.scopes[]`; omitted → the resource's defaults. */
+  scopes?: string[]
+}
+
+export type ConnectOutcome =
+  /** Nothing to connect: no `connection` published (an agent-token resource), or already connected. */
+  | { kind: 'ready'; reason: 'no_connection_needed' | 'already_connected'; account?: string; scopes?: string[] }
+  /** The flow completed at the PS. */
+  | { kind: 'connected'; account?: string }
+  /** The PS could not reach the person itself; the caller must surface this URL, then poll `pollUrl`. */
+  | { kind: 'interaction'; interaction: Interaction }
+  /** The PS is driving the interaction; the bounded wait elapsed. Poll `pollUrl` or call again. */
+  | { kind: 'still_pending'; interaction: Interaction }
+  | { kind: 'error'; status: number; body: unknown }
+
+/**
+ * POST the connection collection and exchange the resulting token at the PS.
+ * Non-blocking beyond the PS relay: when the PS engages the person itself the
+ * caller decides how long to wait (`pollConnection`); when it cannot, the
+ * interaction is returned for the caller to surface.
+ */
+export async function connectAtResource(cfg: ProxyConfig, l1: L1Entry, args: ConnectArgs = {}): Promise<ConnectOutcome> {
+  if (!l1.connection) return { kind: 'ready', reason: 'no_connection_needed' }
+  const ps = await psMetadata(cfg.psUrl)
+  const pt = await obtainPersonToken(cfg, ps, l1.issuer, cfg.missionS256)
+  if (pt.kind === 'interaction') return { kind: 'interaction', interaction: pt.interaction }
+  if (pt.kind !== 'token') return { kind: 'error', status: pt.status, body: pt.body }
+
+  const res = await signWith(cfg, { kind: 'person', jwt: pt.personToken })(l1.connection.endpoint, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      ...(args.scopes ? { scopes: args.scopes } : {}),
+      ...(args.account ? { account: args.account } : {}),
+    }),
+  })
+  if (!res.ok) return { kind: 'error', status: res.status, body: await safeBody(res) }
+  const body = (await res.json()) as { resource_token?: string; status?: string; account?: string; scopes?: string[] }
+  if (body.status === 'already_connected') {
+    return { kind: 'ready', reason: 'already_connected', ...(body.account ? { account: body.account } : {}), ...(body.scopes ? { scopes: body.scopes } : {}) }
+  }
+  if (!body.resource_token) return { kind: 'error', status: res.status, body }
+
+  const ex = await exchangeAtPS(cfg, ps, body.resource_token)
+  if (ex.kind === 'token') return { kind: 'connected', ...(args.account ? { account: args.account } : {}) }
+  if (ex.kind === 'result') {
+    // N6: a terminal answer that carries no token is the connection-only
+    // ceremony completing on the spot.
+    if (ex.status >= 200 && ex.status < 300) return { kind: 'connected', ...(args.account ? { account: args.account } : {}) }
+    return { kind: 'error', status: ex.status, body: ex.body }
+  }
+  // The PS wants the person. Try its own reach first (live web session, push);
+  // only if it cannot does the caller surface the URL.
+  const engaged = ps.interaction_endpoint
+    ? await relayInteractionToPS(signWith(cfg, { kind: 'agent' }), ps.interaction_endpoint, ex.interaction)
+    : false
+  return engaged ? { kind: 'still_pending', interaction: ex.interaction } : { kind: 'interaction', interaction: ex.interaction }
+}
+
+/**
+ * The bounded wait (D14 B2): poll the PS pending URL for up to `budgetMs`.
+ * Resolves `connected` on any terminal 2xx — with or without a token (N6) —
+ * `still_pending` when the slice elapses, and `error` on a terminal failure.
+ */
+export async function pollConnection(cfg: ProxyConfig, interaction: Interaction, budgetMs: number, onPoll?: (elapsedMs: number) => void | Promise<void>): Promise<ConnectOutcome> {
+  const res = await pollUntilDone(makeAgentPoll(cfg), interaction.pollUrl, budgetMs, onPoll)
+  if (res.status === 202) return { kind: 'still_pending', interaction }
+  if (res.status >= 200 && res.status < 300) return { kind: 'connected' }
+  return { kind: 'error', status: res.status, body: await safeBody(res) }
+}
+
+/** `GET {connection.endpoint}` — this person's connections, as the resource believes them. */
+export async function listConnections(cfg: ProxyConfig, l1: L1Entry): Promise<{ kind: 'rows'; rows: ConnectionRow[] } | { kind: 'error'; status: number; body: unknown }> {
+  if (!l1.connection) return { kind: 'rows', rows: [] }
+  const ps = await psMetadata(cfg.psUrl)
+  const pt = await obtainPersonToken(cfg, ps, l1.issuer, cfg.missionS256)
+  if (pt.kind !== 'token') return { kind: 'error', status: pt.kind === 'result' ? pt.status : 202, body: pt.kind === 'result' ? pt.body : { error: 'person_token_interaction' } }
+  const res = await signWith(cfg, { kind: 'person', jwt: pt.personToken })(l1.connection.endpoint, { method: 'GET' })
+  if (!res.ok) return { kind: 'error', status: res.status, body: await safeBody(res) }
+  const body = (await res.json()) as { connections?: ConnectionRow[] }
+  return { kind: 'rows', rows: Array.isArray(body.connections) ? body.connections : [] }
+}
+
+export interface DisconnectRow {
+  account: string
+  status: number
+  /** What the resource says happened at the upstream: revoked, not_supported, failed, … */
+  upstream?: string
+  detail?: unknown
+}
+
+/** `DELETE {connection.endpoint}/{account}` for every account the resource lists. */
+export async function disconnectAll(cfg: ProxyConfig, l1: L1Entry): Promise<DisconnectRow[]> {
+  if (!l1.connection) return []
+  const listed = await listConnections(cfg, l1)
+  const accounts = listed.kind === 'rows' ? listed.rows.map((r) => r.account) : (l1.connections ?? []).map((r) => r.account)
+  if (accounts.length === 0) return []
+  const ps = await psMetadata(cfg.psUrl)
+  const pt = await obtainPersonToken(cfg, ps, l1.issuer, cfg.missionS256)
+  if (pt.kind !== 'token') return accounts.map((account) => ({ account, status: 0, detail: 'no person token' }))
+  const out: DisconnectRow[] = []
+  for (const account of accounts) {
+    const res = await signWith(cfg, { kind: 'person', jwt: pt.personToken })(`${l1.connection.endpoint}/${encodeURIComponent(account)}`, { method: 'DELETE' })
+    const body = (await safeBody(res)) as { upstream?: string; detail?: unknown; action_required?: string }
+    out.push({
+      account,
+      status: res.status,
+      ...(body && typeof body === 'object' && typeof body.upstream === 'string' ? { upstream: body.upstream } : {}),
+      ...(body && typeof body === 'object' && (body.action_required ?? body.detail) !== undefined ? { detail: body.action_required ?? body.detail } : {}),
+    })
+  }
+  return out
 }

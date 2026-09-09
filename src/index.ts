@@ -5,15 +5,22 @@
 // separately from "@aauth/proxy/local".
 
 export {
+  connectAtResource,
+  disconnectAll,
   flushPersonTokens,
   invokeAtResource,
   invokeAtResourceComplete,
+  listConnections,
   makeAgentPoll,
   obtainPersonToken,
+  pollConnection,
   pollUntilDone,
 } from './agent.js'
 export type {
   AgentSigningKey,
+  ConnectArgs,
+  ConnectOutcome,
+  DisconnectRow,
   Interaction,
   InteractionHandler,
   InvokeArgs,
@@ -63,6 +70,9 @@ export {
 } from './store.js'
 export type {
   AccessMode,
+  ConnectionMetadata,
+  ConnectionRow,
+  ConnectionScope,
   L1Entry,
   L1Store,
   PersonTokenKey,
