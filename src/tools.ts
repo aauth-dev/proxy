@@ -114,6 +114,15 @@ const CONNECT_MAX_MS = 10 * 60_000
 // person with two accounts at the Google family is already past 30 items; the
 // cap is a guard against a runaway list, not a design limit.
 const MAX_CONNECT_ITEMS = 64
+// The live window (D14 revised, 2026-09-12). How many connects may hold a PS
+// interaction at once. The original design started the whole list up front on
+// the premise that a queued PS pending cannot expire while it waits — but the
+// resource-side interaction code carries its OWN few-minute life the PS queue
+// does not govern, so a long list minted a pile of codes that expired before
+// the person reached them (prod incident: 29 queued, the tail dead on arrival).
+// So the proxy keeps only this many live, mints each code just before the
+// person meets it, and starts the rest as slots free on later calls.
+const MAX_LIVE_CONNECTS = 3
 
 const BOOTSTRAP_GUIDANCE = `The agent proxy has no AAuth identity on this machine yet.
 
@@ -340,7 +349,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     {
       description: describeWithL1(
         'Connect one or more AAuth resources for this person in ONE call. Pass `items`, each `{resource, account?, scopes?}` — a bare host, host:port, or full URL; the agent proxy canonicalizes.\n\n' +
-          'QUEUES (D14): every item is started at the Person Server up front, so the person works through them one at a time in their wallet and a queued item cannot expire while it waits behind another. Each item answers `connected`, `ready`, `still_pending`, `timed_out` or `error`; when the bounded wait elapses, call again with the SAME items to keep waiting — started items resume rather than restart.\n\n' +
+          'QUEUES (D14): the person works through connections one at a time in their wallet, so the proxy keeps only a few live at once and starts the rest as each finishes — this stops a long list from minting many short-lived codes that expire before the person reaches them. Each item answers `connected`, `ready`, `still_pending`, `queued` (accepted, waiting for a live slot), `timed_out` or `error`; when the bounded wait elapses, call again with the SAME items to advance the window — live items resume rather than restart, and queued ones start as slots free.\n\n' +
           'Before calling: ask the person which services and which accounts. When a resource declares `account_description`, you MUST pass `account` for that item (the identifier it describes — a Google email, a GitHub username); when it does not, you MUST NOT (the account is chosen in the provider\'s own UI). One item per (resource × account); an already-linked account answers `ready`. `scopes` optionally narrows or widens within the resource\'s declared `connection.scopes[]` (defaults are the read set; write scopes ride the first write). Agent-token resources need no link and answer `ready`.',
       ),
       inputSchema: z.object({
@@ -434,10 +443,12 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
         }
       }
 
-      // Pass 1 — start (or resume) every item. Starting them all up front is the
-      // point of the list form: the PS queues them, so the person sees a queue
-      // with a depth instead of one request that hides the rest, and a queued
-      // item's consent clock only starts when it reaches the head.
+      // Pass 1 — resolve trivial items, resume live ones, and start new
+      // connects only up to MAX_LIVE_CONNECTS. Beyond the window an item is
+      // accepted but marked `queued` and NOT started, so its interaction code
+      // is not minted until a slot frees on a later call — the person never
+      // accrues a pile of codes counting down at once (D14 revised).
+      let live = 0
       for (const item of items) {
         const canonical = canonicalizeHost(item.resource)
         if (!canonical) {
@@ -474,14 +485,27 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
             row.detail = 'the person did not finish; include this item again to start over'
             continue
           }
-          // Resume: do not re-POST, the PS pending is still live.
+          // Resume a live connect — it holds a slot. Do NOT re-POST, and do
+          // NOT pre-surface its stored interaction: a code can die before this
+          // timer-based bound, and surfacing a dead one is exactly what
+          // stranded the person (grokbot, 2026-09-12 — "the proxy resumes dead
+          // interactions instead of starting new ones"). Pass 2 polls it;
+          // settle() surfaces it only once a poll confirms it is still pending,
+          // and clears it (so the next call starts fresh) if the PS says it is
+          // gone.
+          live += 1
           row.outcome = 'still_pending'
           row.waiting_on = entry.connection.upstream_name ?? 'the upstream'
-          if (existing.interaction && !toSurface) {
-            toSurface = existing.interaction
-            surfaceHost = host
-          }
           waiting.push({ host, row, entry })
+          continue
+        }
+
+        // Over the live window: accept this item but hold it back rather than
+        // mint another interaction code that would start expiring behind the
+        // ones ahead of it. A later call starts it once a slot frees.
+        if (live >= MAX_LIVE_CONNECTS) {
+          row.outcome = 'queued'
+          row.waiting_on = entry.connection.upstream_name ?? 'the upstream'
           continue
         }
 
@@ -516,6 +540,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
             toSurface = interaction
             surfaceHost = host
           }
+          live += 1
           waiting.push({ host, row, entry })
           continue
         }
@@ -542,11 +567,16 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       }
 
       const pending = rows.filter((r) => r.outcome === 'still_pending').length
+      // Accepted but not started yet — held out of the live window. They still
+      // need a later call to start, so they keep `next` alive even when nothing
+      // is live right now.
+      const queued = rows.filter((r) => r.outcome === 'queued').length
       const summary = {
         results: rows,
         pending,
-        ...(pending > 0
-          ? { next: `call connect_resources again with the same items — it waits up to ${Math.round(budgetMs / 1000)} seconds each time` }
+        ...(queued > 0 ? { queued } : {}),
+        ...(pending > 0 || queued > 0
+          ? { next: `call connect_resources again with the same items — it waits up to ${Math.round(budgetMs / 1000)} seconds each time and starts queued items as slots free` }
           : {}),
       }
 
