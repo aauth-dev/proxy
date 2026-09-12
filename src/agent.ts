@@ -20,7 +20,7 @@
 import { fetch as signedFetch } from '@hellocoop/httpsig'
 import { planAccessMode } from './access-mode.js'
 import type { AccessModePlan, KnownAccessMode } from './access-mode.js'
-import { agentTokenPs, jwkThumbprint } from './jwt.js'
+import { agentTokenPs, assertAgentSigningKey, jwkThumbprint } from './jwt.js'
 import { routeOperation } from './resource.js'
 import { createMemoryPersonTokenStore } from './store.js'
 import type { ConnectionRow, L1Entry, PersonTokenStore } from './store.js'
@@ -164,7 +164,10 @@ function components(opts: {
 }
 
 function signWith(cfg: ProxyConfig, cred: Credential, opts: { psOrAs?: boolean } = {}) {
-  return (url: string, init: SignedRequestInit = {}): Promise<Response> => {
+  // `async` so a rejected signing key REJECTS rather than throwing
+  // synchronously. The signature promises a Promise; a caller reaching for
+  // .catch() should not have the throw go past it.
+  return async (url: string, init: SignedRequestInit = {}): Promise<Response> => {
     const headers = { ...(init.headers ?? {}) }
     if (cred.kind === 'session') headers.authorization = `AAuth ${cred.token}`
     const jwt =
@@ -174,6 +177,7 @@ function signWith(cfg: ProxyConfig, cred: Credential, opts: { psOrAs?: boolean }
       authorization: cred.kind === 'session',
       psOrAs: opts.psOrAs,
     })
+    assertAgentSigningKey(cfg.agentPrivateJwk)
     return signedFetch(url, {
       ...init,
       headers,
