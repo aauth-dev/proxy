@@ -6,17 +6,26 @@
 // 4.0.0 (ONBOARDING-PLAN.md, Track N): `add_resource` became `connect_resource`
 // and `remove_resource` became `delete_resource` — the rename is the fix for a
 // name that sounded free acquiring a credential-granting side effect (D9).
-// Connecting BLOCKS (D8): it returns when the flow succeeds, times out, or
-// fails; there is no queued outcome. The agent is the picker (D7): it asks in
-// chat which services and which accounts, then calls connect once per
-// (resource × account).
+// The agent is still the picker (D7): it asks in chat which services and which
+// accounts.
+//
+// 4.1.0: `connect_resource` became `connect_resources` and takes a LIST. One
+// call per (resource × account) meant the next request was only created after a
+// model round trip, and the Person Server's consent clock used to start at
+// creation — so a request made while another was waiting could expire before the
+// person ever saw it (beta, 2026-09-11: a Gmail connect created behind two
+// others was never surfaced). The list starts every item up front so the PS
+// queues them in order and the wallet can show a depth. Each item still answers
+// for itself; the call blocks for the bounded slice and the agent calls again
+// with the same items to keep waiting.
 //
 // Transport-agnostic: no fs, no stdio, no child_process. The stdio bin
 // (server.ts) supplies fs/local-keys deps + a browser-launch onInteraction;
 // other hosts supply their own backends and surface interaction URLs however
 // their transport allows.
 
-import type { McpServer, ServerContext } from '@modelcontextprotocol/server'
+import { UrlElicitationRequiredError, inputRequired } from '@modelcontextprotocol/server'
+import type { ClientCapabilities, McpServer, ServerContext } from '@modelcontextprotocol/server'
 import { renderUnicodeCompact } from 'uqr'
 import { z } from 'zod'
 import { planAccessMode } from './access-mode.js'
@@ -70,11 +79,11 @@ export interface ProxyDeps {
     get(): Promise<string | undefined>
     set(value: string): Promise<void>
   }
-  // The bounded-blocking slice (D14 B2): how long connect_resource waits on
+  // The bounded-blocking slice (D14 B2): how long connect_resources waits on
   // the PS before answering `still_pending`. MCP clients commonly time a tool
   // call out around 60 s, so the default stays well inside that.
   connectBudgetMs?: number
-  // In-flight connects, per resource host, so a repeat connect_resource call
+  // In-flight connects, per resource host, so a repeat connect_resources call
   // resumes the same PS pending record instead of starting a new flow. A host
   // that builds a fresh server per request (the hosted MCP) MUST back this
   // with per-user storage that outlives the request; the default is an
@@ -101,6 +110,10 @@ const DEFAULT_CONNECT_BUDGET_MS = 30_000
 // A connect that has been in flight this long is abandoned (the PS pending
 // record has a TTL of that order): `timed_out`, and the next call starts over.
 const CONNECT_MAX_MS = 10 * 60_000
+// Ceiling on one connect_resources call. The whole fleet is ~45 resources and a
+// person with two accounts at the Google family is already past 30 items; the
+// cap is a guard against a runaway list, not a design limit.
+const MAX_CONNECT_ITEMS = 64
 
 const BOOTSTRAP_GUIDANCE = `The agent proxy has no AAuth identity on this machine yet.
 
@@ -212,7 +225,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     if (!entry)
       return {
         ok: false,
-        msg: `Resource not connected: ${canonical.host}. Call connect_resource("${canonical.host}") first.`,
+        msg: `Resource not connected: ${canonical.host}. Call connect_resources({ items: [{ resource: "${canonical.host}" }] }) first.`,
       }
     return { ok: true, l1: entry }
   }
@@ -242,6 +255,47 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     const next = { ...entry, connections: listed.rows }
     await l1.upsert(next)
     return next
+  }
+
+  // Hand an authorization URL to the client as a native prompt, or answer
+  // undefined to let the caller fall back to text + QR.
+  //
+  // Which mechanism is available depends on the era AND on what the client
+  // declared, and the two gates are not the same:
+  //   * 2026-07-28 (the request carries a `_meta` envelope) has no server→client
+  //     request channel. An elicitation rides an `input_required` result, and
+  //     the SDK refuses it with -32021 unless the client declared
+  //     `elicitation.url`. A refusal is worse than text — the person would see
+  //     an error instead of a link — so check first and fall back instead.
+  //   * 2025-era connections still take the push model: the SDK rethrows
+  //     UrlElicitationRequiredError (-32042) unmodified, with no capability
+  //     gate of its own. Clients that implement -32042 handle it even when they
+  //     under-declare (Claude Code 2.1.268 ships the retry loop while declaring
+  //     a bare `elicitation:{}`), so a declared `elicitation` key is enough.
+  // Form mode is deliberately not attempted: it is gated on `elicitation.form`
+  // the same way, and handing over a link is not what form mode is for.
+  function surfaceNatively(ctx: ServerContext, interaction: Interaction, host: string) {
+    const url = `${interaction.url}?code=${interaction.code}`
+    const message = `Authorize ${host} — open this URL to connect, then the agent continues.`
+    // Deprecated accessor, but the supported per-request one: the SDK backfills
+    // it from the validated envelope on instances that never see an initialize.
+    let caps: ClientCapabilities | undefined
+    try {
+      caps = server.server.getClientCapabilities()
+    } catch {
+      return undefined
+    }
+    const elicitation = caps?.elicitation as { url?: unknown } | undefined
+    if (ctx.mcpReq.envelope !== undefined) {
+      if (elicitation?.url === undefined) return undefined
+      return inputRequired({
+        inputRequests: { connect: inputRequired.elicitUrl({ message, url }) },
+      })
+    }
+    if (!elicitation) return undefined
+    throw new UrlElicitationRequiredError([
+      { mode: 'url' as const, message, elicitationId: crypto.randomUUID(), url },
+    ])
   }
 
   // ── Resource lifecycle ──
@@ -282,119 +336,240 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
   )
 
   server.registerTool(
-    'connect_resource',
+    'connect_resources',
     {
       description: describeWithL1(
-        'Connect an AAuth resource for this person. Pass a bare host, host:port, or full URL — the agent proxy canonicalizes. Fetches the resource\'s well-known doc, validates, picks supported vocabularies, and — when the resource fronts an upstream account the person must link — runs the link flow through their Person Server.\n\n' +
-          'BLOCKS: returns `connected` when the flow completes, `still_pending` when the bounded wait elapses (call again to keep waiting), `timed_out` when it is abandoned, or an error. Never queues.\n\n' +
-          'Before calling: ask the person which services and which accounts. When the resource declares `account_description`, you MUST pass `account` (the identifier it describes — a Google email, a GitHub username); when it does not, you MUST NOT (the account is chosen in the provider\'s own UI). Call once per (resource × account); a repeat on an already-linked account answers `ready` immediately. `scopes` optionally narrows or widens the request within the resource\'s declared `connection.scopes[]` (defaults are the read set; write scopes ride the first write). Agent-token resources need no link and answer `ready`.',
+        'Connect one or more AAuth resources for this person in ONE call. Pass `items`, each `{resource, account?, scopes?}` — a bare host, host:port, or full URL; the agent proxy canonicalizes.\n\n' +
+          'QUEUES (D14): every item is started at the Person Server up front, so the person works through them one at a time in their wallet and a queued item cannot expire while it waits behind another. Each item answers `connected`, `ready`, `still_pending`, `timed_out` or `error`; when the bounded wait elapses, call again with the SAME items to keep waiting — started items resume rather than restart.\n\n' +
+          'Before calling: ask the person which services and which accounts. When a resource declares `account_description`, you MUST pass `account` for that item (the identifier it describes — a Google email, a GitHub username); when it does not, you MUST NOT (the account is chosen in the provider\'s own UI). One item per (resource × account); an already-linked account answers `ready`. `scopes` optionally narrows or widens within the resource\'s declared `connection.scopes[]` (defaults are the read set; write scopes ride the first write). Agent-token resources need no link and answer `ready`.',
       ),
       inputSchema: z.object({
-        resource: z.string(),
-        account: z.string().optional(),
-        scopes: z.array(z.string()).optional(),
+        items: z
+          .array(
+            z.object({
+              resource: z.string(),
+              account: z.string().optional(),
+              scopes: z.array(z.string()).optional(),
+            }),
+          )
+          .min(1)
+          .max(MAX_CONNECT_ITEMS),
       }),
     },
-    async ({ resource, account, scopes }, ctx) => {
-      const canonical = canonicalizeHost(resource)
-      if (!canonical) return text(`invalid host: ${resource}`)
-      let entry: L1Entry | undefined
-      try {
-        entry = await l1.get(canonical.host)
-        if (!entry) {
-          entry = toL1Entry(await fetchResource(resource))
-          await l1.upsert(entry)
-        }
-      } catch (err) {
-        return text(`connect_resource error: ${(err as Error).message}`)
-      }
-      const base = {
-        resource: entry.resource,
-        access_mode: entry.access_mode,
-        vocabularies: entry.picked_vocabs.map((v) => v.vocabUri),
-      }
-      if (!entry.connection) return json({ ...base, outcome: 'ready', reason: 'no_connection_needed' })
-
+    async ({ items }, ctx) => {
       const c = await getConfig(ctx)
       if (!c.ok) return text(BOOTSTRAP_GUIDANCE)
       const cfg = c.cfg
-      const host = entry.resource
       const inflight = deps.connectState ?? memoryFlights(cfg)
+      const deadline = Date.now() + budgetMs
 
-      const finish = async (outcome: ConnectOutcome, flight?: InFlight) => {
+      // One row per item, in the order asked. `pending` rows carry the host so a
+      // second pass can poll them; the row itself is what the agent reads.
+      const rows: Record<string, unknown>[] = []
+      const waiting: { host: string; row: Record<string, unknown>; entry: L1Entry }[] = []
+      // The first item that needs the person. Only one can be surfaced — the PS
+      // shows its queue one at a time — and it is the head of that queue.
+      let toSurface: Interaction | undefined
+      let surfaceHost: string | undefined
+
+      const rowFor = (entry: L1Entry, account?: string): Record<string, unknown> => ({
+        resource: entry.resource,
+        access_mode: entry.access_mode,
+        vocabularies: entry.picked_vocabs.map((v) => v.vocabUri),
+        ...(account ? { account } : {}),
+      })
+
+      const settle = async (
+        row: Record<string, unknown>,
+        entry: L1Entry,
+        outcome: ConnectOutcome,
+        flight?: InFlight,
+      ): Promise<void> => {
+        const host = entry.resource
         switch (outcome.kind) {
           case 'connected': {
             await inflight.clear(host)
             await deps.authPending?.resolve(host)
-            const refreshed = await refreshConnections(cfg, entry as L1Entry)
-            return json({ ...base, outcome: 'connected', ...(flight?.account ?? outcome.account ? { account: flight?.account ?? outcome.account } : {}), connections: refreshed.connections ?? [] })
+            const refreshed = await refreshConnections(cfg, entry)
+            row.outcome = 'connected'
+            const account = (flight?.account ?? outcome.account) as string | undefined
+            if (account) row.account = account
+            row.connections = refreshed.connections ?? []
+            return
           }
           case 'ready': {
-            const refreshed = await refreshConnections(cfg, entry as L1Entry)
-            return json({ ...base, outcome: 'ready', reason: outcome.reason, ...(outcome.account ? { account: outcome.account } : {}), ...(outcome.scopes ? { scopes: outcome.scopes } : {}), connections: refreshed.connections ?? [] })
+            const refreshed = await refreshConnections(cfg, entry)
+            row.outcome = 'ready'
+            row.reason = outcome.reason
+            if (outcome.account) row.account = outcome.account
+            if (outcome.scopes) row.scopes = outcome.scopes
+            row.connections = refreshed.connections ?? []
+            return
           }
           case 'still_pending': {
-            const next: InFlight = { ...(flight ?? { ...(account ? { account } : {}), startedAt: Date.now() }), pollUrl: outcome.pollUrl, ...(outcome.interaction ? { interaction: outcome.interaction } : {}) }
+            const next: InFlight = {
+              ...(flight ?? { ...(row.account ? { account: row.account as string } : {}), startedAt: Date.now() }),
+              pollUrl: outcome.pollUrl,
+              ...(outcome.interaction ? { interaction: outcome.interaction } : {}),
+            }
             await inflight.set(host, next)
-            return text(
-              `Connection to ${host} is still pending — the person has not finished at ${entry!.connection!.upstream_name ?? 'the upstream'} yet.\n\n` +
-                `Call connect_resource("${host}"${account ? `, account: "${account}"` : ''}) again to keep waiting. ` +
-                (next.interaction
-                  ? `If they need the link:\n\n${interactionText(next.interaction)}`
-                  : `Their wallet is showing them the request (an open wallet tab or their device) — no link to hand over yet.`),
-            )
+            row.outcome = 'still_pending'
+            row.waiting_on = entry.connection?.upstream_name ?? 'the upstream'
+            if (next.interaction && !toSurface) {
+              toSurface = next.interaction
+              surfaceHost = host
+            }
+            return
           }
           case 'error':
             await inflight.clear(host)
-            return json({ ...base, outcome: 'error', status: outcome.status, body: outcome.body })
+            row.outcome = 'error'
+            row.status = outcome.status
+            row.body = outcome.body
+            return
           case 'interaction':
-            // Reached only through the surfacing path below.
-            return text(interactionText(outcome.interaction))
+            // Never settled here: the caller converts it to a flight first.
+            row.outcome = 'still_pending'
+            return
         }
       }
 
-      // Resume an in-flight connect (D8: blocking governs what the agent sees;
-      // the flow itself lives at the PS). The next slice of waiting, or give up.
-      const existing = await inflight.get(host)
-      if (existing) {
-        if (Date.now() - existing.startedAt > CONNECT_MAX_MS) {
-          await inflight.clear(host)
-          await deps.authPending?.resolve(host)
-          return json({ ...base, outcome: 'timed_out', detail: 'the person did not finish; call connect_resource again to start over' })
+      // Pass 1 — start (or resume) every item. Starting them all up front is the
+      // point of the list form: the PS queues them, so the person sees a queue
+      // with a depth instead of one request that hides the rest, and a queued
+      // item's consent clock only starts when it reaches the head.
+      for (const item of items) {
+        const canonical = canonicalizeHost(item.resource)
+        if (!canonical) {
+          rows.push({ resource: item.resource, outcome: 'error', detail: `invalid host: ${item.resource}` })
+          continue
         }
-        return finish(await pollConnection(cfg, existing.interaction ?? existing.pollUrl, budgetMs), existing)
+        let entry: L1Entry | undefined
+        try {
+          entry = await l1.get(canonical.host)
+          if (!entry) {
+            entry = toL1Entry(await fetchResource(item.resource))
+            await l1.upsert(entry)
+          }
+        } catch (err) {
+          rows.push({ resource: canonical.host, outcome: 'error', detail: (err as Error).message })
+          continue
+        }
+
+        const row = rowFor(entry, item.account)
+        rows.push(row)
+        if (!entry.connection) {
+          row.outcome = 'ready'
+          row.reason = 'no_connection_needed'
+          continue
+        }
+
+        const host = entry.resource
+        const existing = await inflight.get(host)
+        if (existing) {
+          if (Date.now() - existing.startedAt > CONNECT_MAX_MS) {
+            await inflight.clear(host)
+            await deps.authPending?.resolve(host)
+            row.outcome = 'timed_out'
+            row.detail = 'the person did not finish; include this item again to start over'
+            continue
+          }
+          // Resume: do not re-POST, the PS pending is still live.
+          row.outcome = 'still_pending'
+          row.waiting_on = entry.connection.upstream_name ?? 'the upstream'
+          if (existing.interaction && !toSurface) {
+            toSurface = existing.interaction
+            surfaceHost = host
+          }
+          waiting.push({ host, row, entry })
+          continue
+        }
+
+        let outcome: ConnectOutcome
+        try {
+          outcome = await connectAtResource(cfg, entry, {
+            ...(item.account ? { account: item.account } : {}),
+            ...(item.scopes ? { scopes: item.scopes } : {}),
+          })
+        } catch (err) {
+          row.outcome = 'error'
+          row.detail = (err as Error).message
+          continue
+        }
+
+        if (outcome.kind === 'interaction') {
+          const { interaction } = outcome
+          const flight: InFlight = {
+            pollUrl: interaction.pollUrl,
+            interaction,
+            ...(item.account ? { account: item.account } : {}),
+            startedAt: Date.now(),
+          }
+          await inflight.set(host, flight)
+          await deps.onInteraction?.(interaction.url, interaction.code, interaction.pollUrl, () =>
+            deps.authPending?.resolve(host),
+          )
+          await deps.authPending?.register(host)
+          row.outcome = 'still_pending'
+          row.waiting_on = entry.connection.upstream_name ?? 'the upstream'
+          if (!toSurface) {
+            toSurface = interaction
+            surfaceHost = host
+          }
+          waiting.push({ host, row, entry })
+          continue
+        }
+
+        await settle(row, entry, outcome)
+        if (row.outcome === 'still_pending') waiting.push({ host, row, entry })
       }
 
-      let outcome: ConnectOutcome
-      try {
-        outcome = await connectAtResource(cfg, entry, { ...(account ? { account } : {}), ...(scopes ? { scopes } : {}) })
-      } catch (err) {
-        return text(`connect_resource error: ${(err as Error).message}`)
+      // Pass 2 — spend what is left of the budget on the items still waiting, in
+      // order. The head is what the person is being shown, so polling it first
+      // is also what finishes first; each one that lands frees the slice for the
+      // next without another round trip through the model.
+      for (const { host, row, entry } of waiting) {
+        const remaining = deadline - Date.now()
+        if (remaining <= 0) break
+        const flight = await inflight.get(host)
+        if (!flight) continue
+        const polled = await pollConnection(cfg, flight.interaction ?? flight.pollUrl, remaining)
+        await settle(row, entry, polled, flight)
+        if (row.outcome === 'connected' && toSurface && surfaceHost === host) {
+          toSurface = undefined
+          surfaceHost = undefined
+        }
       }
-      if (outcome.kind !== 'interaction') return finish(outcome)
 
-      // The PS wants the person. Hand the URL to the host (B3: may throw a
-      // native elicitation; stdio: opens a browser), then wait the bounded
-      // slice (B2) before answering. The PS also reaches an open wallet tab
-      // on its own; the poll sees the result either way.
-      const { interaction } = outcome
-      const flight: InFlight = { pollUrl: interaction.pollUrl, interaction, ...(account ? { account } : {}), startedAt: Date.now() }
-      await inflight.set(host, flight)
-      await deps.onInteraction?.(interaction.url, interaction.code, interaction.pollUrl, () => deps.authPending?.resolve(host))
-      await deps.authPending?.register(host)
-      const waited = await pollConnection(cfg, interaction, budgetMs)
-      if (waited.kind === 'still_pending') {
-        return text(
-          `Connecting ${host} needs the person to act.\n\n` +
-            `IMPORTANT: You MUST do all of the following in your response:\n` +
-            `1. Display the QR code below verbatim so the user can scan it.\n` +
-            `2. Show the authorization URL so the user can open it.\n` +
-            `3. Offer to open the URL using browser tools if available.\n` +
-            `4. Then call connect_resource("${host}"${account ? `, account: "${account}"` : ''}) again — it waits up to ${Math.round(budgetMs / 1000)} seconds for them to finish.\n\n` +
-            interactionText(interaction),
-        )
+      const pending = rows.filter((r) => r.outcome === 'still_pending').length
+      const summary = {
+        results: rows,
+        pending,
+        ...(pending > 0
+          ? { next: `call connect_resources again with the same items — it waits up to ${Math.round(budgetMs / 1000)} seconds each time` }
+          : {}),
       }
-      return finish(waited, flight)
+
+      // Nothing left for the person to open: either everything landed, or the PS
+      // is reaching them by its own channels (an open wallet tab, a device).
+      if (pending === 0 || !toSurface) return json(summary)
+
+      // The person must open a URL. Prefer a native prompt; the host may already
+      // have taken over (stdio opens a browser, a cloud host may throw its own
+      // elicitation), in which case onInteraction never returned here.
+      const native = surfaceNatively(ctx, toSurface, surfaceHost as string)
+      if (native) return native
+
+      return text(
+        `${JSON.stringify(summary, null, 2)}\n\n` +
+          `Connecting ${surfaceHost} needs the person to act${pending > 1 ? ` (${pending - 1} more queued behind it)` : ''}.\n\n` +
+          `IMPORTANT: You MUST do all of the following in your response:\n` +
+          `1. Display the QR code below verbatim so the user can scan it.\n` +
+          `2. Show the authorization URL so the user can open it.\n` +
+          `3. Offer to open the URL using browser tools if available.\n` +
+          `4. Then call connect_resources again with the same items — it waits up to ${Math.round(budgetMs / 1000)} seconds for them to finish.\n\n` +
+          interactionText(toSurface),
+      )
     },
   )
 
