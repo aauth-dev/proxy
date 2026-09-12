@@ -195,6 +195,70 @@ describe('connect_resources', () => {
     }
   })
 
+  it('starts only up to the live window and marks the rest queued', async () => {
+    const { posted } = routeSignedFetch()
+    const hosts = ['a.example', 'b.example', 'c.example', 'd.example', 'e.example']
+    const l1 = memoryL1(hosts.map((h) => entry(h)))
+    const { client, close } = await connectClient(l1)
+    try {
+      const result = await client.callTool({
+        name: 'connect_resources',
+        arguments: { items: hosts.map((h) => ({ resource: h, account: 'a@b.co' })) },
+      })
+      const body = textOf(result)
+      const summary = JSON.parse(body.slice(0, body.indexOf('\n\n')) || body) as {
+        results: { resource: string; outcome: string }[]
+        pending: number
+        queued: number
+        next?: string
+      }
+
+      // Only three interaction codes were minted — the rest were held back,
+      // so nothing piles up counting down at once.
+      expect(posted).toHaveLength(3)
+      expect(posted).toEqual([
+        'https://a.example/connections',
+        'https://b.example/connections',
+        'https://c.example/connections',
+      ])
+      expect(summary.results.map((r) => r.outcome)).toEqual([
+        'still_pending',
+        'still_pending',
+        'still_pending',
+        'queued',
+        'queued',
+      ])
+      expect(summary.pending).toBe(3)
+      expect(summary.queued).toBe(2)
+      // Queued items keep the agent calling back to advance the window.
+      expect(summary.next).toBeTruthy()
+    } finally {
+      await close()
+    }
+  })
+
+  it('a repeat call resumes the live set without minting a second code, and holds queued items', async () => {
+    // a,b,c go live, d,e queued. A repeat call must resume a,b,c (no re-POST)
+    // and must NOT start d,e while the window is full — no code is minted twice
+    // and no extra codes are minted for the held items.
+    const { posted } = routeSignedFetch()
+    const hosts = ['a.example', 'b.example', 'c.example', 'd.example', 'e.example']
+    const l1 = memoryL1(hosts.map((h) => entry(h)))
+    const { client, close } = await connectClient(l1)
+    try {
+      const args = { items: hosts.map((h) => ({ resource: h, account: 'a@b.co' })) }
+      await client.callTool({ name: 'connect_resources', arguments: args })
+      expect(posted).toHaveLength(3)
+
+      await client.callTool({ name: 'connect_resources', arguments: args })
+      // Still exactly three POSTs total: live ones resumed, queued ones held.
+      expect(posted).toHaveLength(3)
+      expect(new Set(posted).size).toBe(3) // no host POSTed twice
+    } finally {
+      await close()
+    }
+  })
+
   it('an item needing no connection answers ready without calling the PS', async () => {
     const { posted } = routeSignedFetch()
     const bare = { ...entry('whoami.example'), connection: undefined, access_mode: 'agent-token' as const }
