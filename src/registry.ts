@@ -6,6 +6,7 @@
 // RegistryCache; the stdio server uses the filesystem default
 // (createFsRegistryCache), backed by ~/.aauth/proxy/catalog/registry.json.
 
+import { assertAgentSigningKey } from './jwt.js'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -74,6 +75,7 @@ export async function fetchRegistry(cfg: ProxyConfig, cache: RegistryCache): Pro
   const headers: Record<string, string> = { accept: 'application/json' }
   if (cached?.etag) headers['if-none-match'] = cached.etag
 
+  assertAgentSigningKey(cfg.agentPrivateJwk)
   const res = await signedFetch(url, {
     method: 'GET',
     headers,

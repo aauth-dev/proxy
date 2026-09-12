@@ -86,3 +86,68 @@ export async function jwkThumbprint(jwk: ThumbprintableJwk): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonical))
   return base64url(digest)
 }
+
+/**
+ * The fully-specified `alg` a JWK's key material implies (RFC 9864).
+ * Undefined for key types this library has no mapping for — those are left to
+ * whatever `alg` the JWK already carries.
+ */
+function impliedAlg(jwk: { kty?: string; crv?: string }): string | undefined {
+  if (jwk.kty === 'OKP' && jwk.crv === 'Ed25519') return 'Ed25519'
+  if (jwk.kty === 'OKP' && jwk.crv === 'Ed448') return 'Ed448'
+  if (jwk.kty === 'EC' && jwk.crv === 'P-256') return 'ES256'
+  if (jwk.kty === 'EC' && jwk.crv === 'P-384') return 'ES384'
+  if (jwk.kty === 'EC' && jwk.crv === 'P-521') return 'ES512'
+  return undefined
+}
+
+/**
+ * Check the agent's signing key before anything signs with it.
+ *
+ * `@hellocoop/httpsig` 2.x takes the algorithm from the JWK's `alg` and
+ * rejects the polymorphic `EdDSA` (RFC 9864). A key that reaches it without a
+ * fully-specified `alg` fails deep inside a signed call, as
+ * `Polymorphic algorithm identifier "EdDSA" is not permitted` on whatever
+ * request happened to be first — a message that names neither the key nor the
+ * thing that produced it.
+ *
+ * The key comes from an `IdentityProvider`, and there are several: the
+ * filesystem/enclave one here, the Durable-Object-backed one in the hosted
+ * MCP, and whatever a host writes next. They drift. The bundled provider
+ * normalizes (`withFullySpecifiedAlg`); the hosted one did not, and every
+ * signed call through mcp.aauth.dev failed until it was fixed on its own read
+ * path (aauth-mcp #7). One provider getting it right is not a property of this
+ * library — checking here is.
+ *
+ * This REFUSES rather than normalizing, deliberately. Normalizing would hide
+ * the provider's bug, and it would only hide half of it: the same raw JWK
+ * usually goes into the agent token's `cnf.jwk`, which the verifier extracts,
+ * so a silently-fixed signing key buys a signature that verifies against a key
+ * the other end rejects. Better to fail at the source, naming it.
+ */
+export function assertAgentSigningKey(key: unknown): void {
+  const jwk = key as { kty?: string; crv?: string; alg?: string } | null | undefined
+  if (!jwk || typeof jwk !== 'object') {
+    throw new Error('agentPrivateJwk is missing — the identity provider returned no signing key')
+  }
+  const implied = impliedAlg(jwk)
+  if (jwk.alg === undefined) {
+    throw new Error(
+      `agentPrivateJwk has no "alg" (kty=${String(jwk.kty)} crv=${String(jwk.crv)}). ` +
+        `RFC 9864 requires a fully-specified algorithm${implied ? `; this key's material implies "${implied}"` : ''}. ` +
+        `Fix the identity provider that produced it.`,
+    )
+  }
+  if (jwk.alg === 'EdDSA') {
+    throw new Error(
+      `agentPrivateJwk has the polymorphic alg "EdDSA", which RFC 9864 forbids` +
+        `${implied ? ` — use "${implied}"` : ''}. ` +
+        `workerd's crypto.subtle.exportKey produces this; the identity provider must normalize it.`,
+    )
+  }
+  if (implied && jwk.alg !== implied) {
+    throw new Error(
+      `agentPrivateJwk says alg "${jwk.alg}" but its key material (kty=${String(jwk.kty)} crv=${String(jwk.crv)}) is "${implied}".`,
+    )
+  }
+}
