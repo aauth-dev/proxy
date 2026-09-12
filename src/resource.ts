@@ -1,5 +1,5 @@
 // Fetch + validate a resource's well-known doc; pick vocabulary adapters
-// the agent proxy supports. The caller (connect_resource) decides what to do with the
+// the agent proxy supports. The caller (connect_resources) decides what to do with the
 // FetchedResource — typically convert to an L1Entry and store.
 //
 // Mirrors registry/validate.ts:fetchResourceMetadata in spirit: manual
