@@ -25,7 +25,7 @@
 // their transport allows.
 
 import { UrlElicitationRequiredError, inputRequired } from '@modelcontextprotocol/server'
-import type { ClientCapabilities, McpServer, ServerContext } from '@modelcontextprotocol/server'
+import type { ClientCapabilities, Icon, McpServer, RegisteredTool, ServerContext, StandardSchemaWithJSON, ToolAnnotations, ToolCallback } from '@modelcontextprotocol/server'
 import { renderUnicodeCompact } from 'uqr'
 import { z } from 'zod'
 import { planAccessMode } from './access-mode.js'
@@ -35,6 +35,8 @@ import type { ConnectOutcome, Interaction, InvokeResult, ProxyConfig } from './a
 import { canonicalizeHost } from './host.js'
 import { agentTokenPs } from './jwt.js'
 import type { IdentityProvider } from './identity.js'
+import { toolFields } from './log.js'
+import type { ProxyLog } from './log.js'
 import { fetchRegistry } from './registry.js'
 import type { RegistryCache, RegistryEntry } from './registry.js'
 import {
@@ -93,6 +95,12 @@ export interface ProxyDeps {
     set(host: string, flight: ConnectFlight): Promise<void>
     clear(host: string): Promise<void>
   }
+  // Event sink (log.ts): one `tool.call` per invocation of these tools, and the
+  // AAuth exchange underneath — every signed request, resource metadata fetch,
+  // person-token cache hit. The host logs the MCP boundary itself; this is the
+  // other side of it. Copied onto the resolved ProxyConfig when the identity
+  // provider left `cfg.log` unset.
+  log?: ProxyLog
 }
 
 export interface ConnectFlight {
@@ -184,7 +192,44 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
   async function getConfig(ctx: ServerContext): Promise<{ ok: true; cfg: ProxyConfig } | { ok: false }> {
     const status = await identity.resolve({ local: deps.agentLocal?.({ clientName: clientName(ctx) }) })
     if (status.kind === 'needsBootstrap') return { ok: false }
+    // In place, not a copy: the default token and in-flight stores are WeakMaps
+    // keyed on the config object's identity, so a spread here would lose them.
+    if (deps.log && !status.cfg.log) status.cfg.log = deps.log
     return { ok: true, cfg: status.cfg }
+  }
+
+  // Every tool goes through here so each call is reported once, with the
+  // identifiers it named and how it ended — including the URL-elicitation
+  // throw, which is a normal outcome (the client opens the URL), not a fault.
+  // Mirrors McpServer.registerTool's primary (Standard Schema) signature —
+  // the method is overloaded, so a plain `typeof` alias would not type-check.
+  function registerTool<OutputArgs extends StandardSchemaWithJSON, InputArgs extends StandardSchemaWithJSON | undefined = undefined>(
+    name: string,
+    config: {
+      title?: string
+      description?: string
+      inputSchema?: InputArgs
+      outputSchema?: OutputArgs
+      annotations?: ToolAnnotations
+      icons?: Icon[]
+      _meta?: Record<string, unknown>
+    },
+    handler: ToolCallback<InputArgs>,
+  ): RegisteredTool {
+    const wrapped = async (...cbArgs: unknown[]) => {
+      const started = Date.now()
+      const fields = toolFields(name, cbArgs.length > 1 ? cbArgs[0] : undefined)
+      try {
+        const result = (await (handler as (...a: unknown[]) => unknown)(...cbArgs)) as { isError?: boolean }
+        deps.log?.('tool.call', { ...fields, ok: !result?.isError, duration_ms: Date.now() - started })
+        return result
+      } catch (e) {
+        const error = e instanceof UrlElicitationRequiredError ? 'url_elicitation' : ((e as Error)?.name ?? 'error')
+        deps.log?.('tool.call', { ...fields, ok: false, error, duration_ms: Date.now() - started })
+        throw e
+      }
+    }
+    return server.registerTool(name, config, wrapped as unknown as ToolCallback<InputArgs>)
   }
 
   // The MCP client's self-reported name. 2026-07-28 requests carry it in the
@@ -309,7 +354,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
 
   // ── Resource lifecycle ──
 
-  server.registerTool(
+  registerTool(
     'find_resources',
     {
       description: describeWithL1(
@@ -344,7 +389,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     },
   )
 
-  server.registerTool(
+  registerTool(
     'connect_resources',
     {
       description: describeWithL1(
@@ -459,7 +504,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
         try {
           entry = await l1.get(canonical.host)
           if (!entry) {
-            entry = toL1Entry(await fetchResource(item.resource))
+            entry = toL1Entry(await fetchResource(item.resource, { log: deps.log }))
             await l1.upsert(entry)
           }
         } catch (err) {
@@ -603,7 +648,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     },
   )
 
-  server.registerTool(
+  registerTool(
     'list_resources',
     {
       inputSchema: z.object({}),
@@ -642,7 +687,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     },
   )
 
-  server.registerTool(
+  registerTool(
     'delete_resource',
     {
       description: describeWithL1(
@@ -673,7 +718,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
 
   // ── Operations ──
 
-  server.registerTool(
+  registerTool(
     'list_operations',
     {
       description: describeWithL1(
@@ -700,7 +745,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     },
   )
 
-  server.registerTool(
+  registerTool(
     'get_operation_schemas',
     {
       description: describeWithL1(
@@ -720,7 +765,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     },
   )
 
-  server.registerTool(
+  registerTool(
     'invoke',
     {
       description: describeWithL1(
@@ -796,7 +841,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     },
   )
 
-  server.registerTool(
+  registerTool(
     'reset_tokens',
     {
       description: describeWithL1(
