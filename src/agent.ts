@@ -21,6 +21,8 @@ import { fetch as signedFetch } from '@hellocoop/httpsig'
 import { planAccessMode } from './access-mode.js'
 import type { AccessModePlan, KnownAccessMode } from './access-mode.js'
 import { agentTokenPs, jwkThumbprint } from './jwt.js'
+import { loggedFetch, logUrl } from './log.js'
+import type { ProxyLog } from './log.js'
 import { routeOperation } from './resource.js'
 import { createMemoryPersonTokenStore } from './store.js'
 import type { ConnectionRow, L1Entry, PersonTokenStore } from './store.js'
@@ -96,6 +98,12 @@ export interface ProxyConfig {
    * Hosts can use this to record or validate the PS sub across exchanges.
    */
   onAuthToken?: (token: string) => void | Promise<void>
+  /**
+   * Event sink for the AAuth exchange this config drives (see log.ts). A host
+   * that builds tools with `buildProxyTools` can set `ProxyDeps.log` instead;
+   * the tools copy it here when the identity provider left it unset.
+   */
+  log?: ProxyLog
 }
 
 export interface InvokeArgs {
@@ -193,13 +201,15 @@ function signWith(cfg: ProxyConfig, cred: Credential, opts: { psOrAs?: boolean }
       authorization: cred.kind === 'session',
       psOrAs: opts.psOrAs,
     })
-    return signedFetch(url, {
-      ...init,
-      headers,
-      signingKey: cfg.agentPrivateJwk,
-      signatureKey: { type: 'jwt', jwt },
-      ...(list ? { components: list } : {}),
-    })
+    return loggedFetch(cfg.log, 'aauth.request', { credential: cred.kind, method: init.method ?? 'GET', url: logUrl(url) }, () =>
+      signedFetch(url, {
+        ...init,
+        headers,
+        signingKey: cfg.agentPrivateJwk,
+        signatureKey: { type: 'jwt', jwt },
+        ...(list ? { components: list } : {}),
+      }),
+    )
   }
 }
 
@@ -398,7 +408,10 @@ export async function obtainPersonToken(
   const key = { resource, ...(missionS256 ? { mission_s256: missionS256 } : {}) }
 
   const cached = await store.get(key, jkt)
-  if (cached) return { kind: 'token', personToken: cached }
+  if (cached) {
+    cfg.log?.('person_token.hit', { resource })
+    return { kind: 'token', personToken: cached }
+  }
 
   // `capabilities` tells the PS this agent can put a URL in front of the
   // person (§Person Token Request): without it a first binding at a PS that

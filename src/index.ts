@@ -41,6 +41,8 @@ export type { ConnectFlight, ProxyDeps } from './tools.js'
 
 export type { BootstrapStatus, IdentityProvider } from './identity.js'
 
+export type { ProxyLog, ProxyLogFields } from './log.js'
+
 export { canonicalizeHost } from './host.js'
 export type { CanonicalHost } from './host.js'
 
