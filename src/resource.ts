@@ -10,6 +10,8 @@
 
 import { canonicalizeHost } from './host.js'
 import { effectiveAccessMode, getAdapter, supportedVocabUris } from './vocab/index.js'
+import { loggedFetch } from './log.js'
+import type { ProxyLog } from './log.js'
 import type { AccessMode, ConnectionMetadata, L1Entry } from './store.js'
 import type {
   InvocationPlan,
@@ -49,16 +51,18 @@ export interface FetchedResource {
   pickedVocabs: PickedVocab[]
 }
 
-export async function fetchResource(hostOrUrl: string): Promise<FetchedResource> {
+export async function fetchResource(hostOrUrl: string, opts: { log?: ProxyLog } = {}): Promise<FetchedResource> {
   const canonical = canonicalizeHost(hostOrUrl)
   if (!canonical) throw new Error(`invalid host: ${hostOrUrl}`)
   const { host, origin } = canonical
   const url = `${origin}/.well-known/aauth-resource.json`
 
-  const res = await fetch(url, {
-    redirect: 'manual',
-    headers: { accept: 'application/json' },
-  })
+  const res = await loggedFetch(opts.log, 'resource.fetch', { host }, () =>
+    fetch(url, {
+      redirect: 'manual',
+      headers: { accept: 'application/json' },
+    }),
+  )
   if (res.status >= 300 && res.status < 400) {
     throw new Error(`resource ${host}: unexpected redirect`)
   }
