@@ -164,6 +164,8 @@ Acquisition is a signed POST to the PS's `person_token_endpoint` (published in `
 
 **Caching.** A person token is scoped to one resource and, when it carries `mission_s256`, to one mission, so the cache key is the pair. Every person token binds the same key through `cnf`, so a signing-key rotation invalidates the whole set at once — the store records the RFC 7638 thumbprint it was populated under and flushes everything the moment a different one is presented. There is no partial invalidation and no migration.
 
+**Hints.** `psHints.login_hint`, `domain_hint`, `tenant`, `prompt` and `justification` are forwarded on the person token request as well as on the auth token exchange. The person token is where the PS first picks the account the agent acts for; a PS with more than one binding for the agent needs `login_hint` there, not only later.
+
 **Missions.** `mission_s256` is forwarded to the person token endpoint, stamped into the person token, copied by the resource into the resource token, and copied by the PS into the auth token. It appears in no auth-token request body — the claim travels inside the tokens. No PS implements `mission_endpoint` yet; the claim path is built regardless.
 
 ## Access modes
