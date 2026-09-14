@@ -29,8 +29,15 @@ export type AgentSigningKey = Parameters<typeof signedFetch>[1]['signingKey']
 
 /**
  * Optional hints forwarded verbatim as extra body parameters in every POST to
- * the PS auth token endpoint (protocol §Agent Token Request). All fields are
+ * the PS auth token endpoint (protocol §Auth Token Request). All fields are
  * optional; include only those the host has learned about the user.
+ *
+ * The person token endpoint gets the subset that says WHO the token is for and
+ * how to ask them (`PERSON_TOKEN_HINTS`): a PS that binds one agent to several
+ * accounts needs `login_hint` there too, or it issues for whichever binding it
+ * finds first. `upstream_token` and `subagent_token` are not hints on that
+ * endpoint — they are request parameters with their own semantics (§Person
+ * Token Endpoint) and are not forwarded from here.
  */
 export interface PSTokenHints {
   login_hint?: string // user identifier hint (e.g. Hello wallet sub or email)
@@ -43,6 +50,18 @@ export interface PSTokenHints {
   subagent_token?: string // parent agent requesting auth on behalf of a sub-agent
   prompt?: string // space-delimited; controls reauthentication / consent prompts
   capabilities?: string[] // overrides the default ['interaction'] sent to the PS
+}
+
+/** The hints a person token request carries (see `PSTokenHints`). */
+const PERSON_TOKEN_HINTS = ['login_hint', 'domain_hint', 'tenant', 'prompt', 'justification'] as const
+
+function personTokenHints(cfg: ProxyConfig): Partial<PSTokenHints> {
+  const out: Partial<PSTokenHints> = {}
+  for (const k of PERSON_TOKEN_HINTS) {
+    const v = cfg.psHints?.[k]
+    if (v !== undefined) out[k] = v
+  }
+  return out
 }
 
 /** Opaque per-resource session token from the AAuth-Access header. */
@@ -385,6 +404,11 @@ export async function obtainPersonToken(
   // person (§Person Token Request): without it a first binding at a PS that
   // cannot reach them another way (no open wallet tab, no push device) is
   // refused with user_unreachable instead of a 202 interaction.
+  //
+  // The person-identifying hints (login_hint, tenant, …) go here as well as on
+  // the auth token exchange: the person token is where the PS first decides
+  // WHICH account the agent acts for, and a PS bound to more than one has
+  // nothing else to choose by.
   const res = await signWith(cfg, { kind: 'agent' }, { psOrAs: true })(ps.person_token_endpoint, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -392,6 +416,7 @@ export async function obtainPersonToken(
       resource,
       capabilities: cfg.psHints?.capabilities ?? ['interaction'],
       ...(missionS256 ? { mission_s256: missionS256 } : {}),
+      ...personTokenHints(cfg),
     }),
   })
 
@@ -484,7 +509,7 @@ const PS_REACH_TIMEOUT_MS = 180_000
 // verify it against the `presented_jti` / `ps` / `sub` the resource copied;
 // a PS refuses the exchange without it when the resource token names one.
 //
-// cfg.psHints (if set) are spread into the body — all §Agent Token Request
+// cfg.psHints (if set) are spread into the body — all §Auth Token Request
 // optional params. cfg.onAuthToken (if set) is called with the auth_token before
 // it is returned.
 async function exchangeAtPS(

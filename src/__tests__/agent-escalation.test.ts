@@ -279,6 +279,44 @@ describe('person tokens', () => {
     expect(mockSignedFetch.mock.calls[1][1].signatureKey).toEqual({ type: 'jwt', jwt: 'pt_abc' })
   })
 
+  it('carries the person-identifying hints, but not the exchange-only ones', async () => {
+    mockPSWellKnown()
+    routeTo('person-token')
+    mockSignedFetch
+      .mockResolvedValueOnce(makeResponse(200, { person_token: 'pt_abc', expires_in: 3600 }))
+      .mockResolvedValueOnce(makeResponse(200, { ok: true }))
+
+    const result = await invokeAtResource(
+      config({
+        psHints: {
+          login_hint: 'sub_123',
+          tenant: 'org_1',
+          prompt: 'consent',
+          upstream_token: 'up_tok',
+          subagent_token: 'sub_tok',
+          platform: 'cloud',
+          capabilities: ['interaction', 'push'],
+        },
+      }),
+      l1({ access_mode: 'person-token' }),
+      'whoami',
+    )
+    expect(result).toEqual({ kind: 'result', status: 200, body: { ok: true } })
+
+    // login_hint is how a PS bound to several accounts knows which one the
+    // person token is for; upstream/subagent tokens are endpoint parameters
+    // with their own rules, and platform is a consent-display hint for the
+    // exchange — none of those are forwarded here.
+    expect(JSON.parse(mockSignedFetch.mock.calls[0][1].body)).toEqual({
+      resource: 'https://res.example',
+      capabilities: ['interaction', 'push'],
+      mission_s256: MISSION,
+      login_hint: 'sub_123',
+      tenant: 'org_1',
+      prompt: 'consent',
+    })
+  })
+
   it('caches by (resource, mission) and re-uses on a second invoke', async () => {
     mockPSWellKnown()
     routeTo('person-token')
