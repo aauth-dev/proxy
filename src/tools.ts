@@ -786,13 +786,50 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       const found = await requireL1(resource)
       if (!found.ok) return text(found.msg)
       const invokeArgs = { pathParams: path_params, query, body }
+      const host = found.l1.resource
+      const inflight = deps.connectState ?? memoryFlights(c.cfg)
 
-      // If there's an in-flight authorization for this resource, wait up to 30s
-      // for it to complete before hitting the resource/PS again. This avoids
-      // creating new temporal state (codes, pending interactions) on every retry.
-      if (await deps.authPending?.checkAndWait(found.l1.resource, 30_000) === 'waiting') {
+      // Resume before re-requesting. A flight for this host means the PS (or
+      // the resource) is already waiting on the person for it — the same
+      // store connect_resources uses, so a connect and an invoke never race
+      // each other for one host. Poll that pending for the bounded slice
+      // instead of calling again: every fresh call minted a new interaction
+      // code (four for one approval, 2026-09-14), and the code the person
+      // was looking at died under them.
+      const existing = await inflight.get(host)
+      if (existing) {
+        if (Date.now() - existing.startedAt > CONNECT_MAX_MS) {
+          await inflight.clear(host)
+          await deps.authPending?.resolve(host)
+        } else {
+          const polled = await pollConnection(c.cfg, existing.interaction ?? existing.pollUrl, budgetMs)
+          if (polled.kind === 'still_pending') {
+            const next: InFlight = {
+              ...existing,
+              pollUrl: polled.pollUrl,
+              ...(polled.interaction ? { interaction: polled.interaction } : {}),
+            }
+            await inflight.set(host, next)
+            return text(
+              `Authorization for ${host} is still in progress.\n\n` +
+                (next.interaction
+                  ? `The person has not finished yet. Show them the SAME authorization URL and QR code again — do not start over.\n\n${interactionText(next.interaction)}\n\nRetry invoke after they approve.`
+                  : `The person server is reaching the person directly. Retry invoke in a moment.`),
+            )
+          }
+          // Approved, or the pending is gone (declined, expired): either way
+          // the wait is over. Clear it and make the call; a dead pending
+          // starts a fresh one below.
+          await inflight.clear(host)
+          await deps.authPending?.resolve(host)
+        }
+      }
+
+      // Belt and braces for hosts without a durable flight store: an in-memory
+      // pending marker registered by the fallback path below.
+      if (await deps.authPending?.checkAndWait(host, 30_000) === 'waiting') {
         return text(
-          `Authorization for ${found.l1.resource} is still in progress.\n\n` +
+          `Authorization for ${host} is still in progress.\n\n` +
           `The user has not yet completed authorization. Try again in a moment.`,
         )
       }
@@ -816,6 +853,9 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       }
 
       if (result.kind === 'interaction') {
+        // Record the flight FIRST: onInteraction may throw (cloud hosts raise
+        // an MCP URL elicitation) and the retry must find it either way.
+        await inflight.set(host, { pollUrl: result.interaction.pollUrl, interaction: result.interaction, startedAt: Date.now() })
         // onComplete resolves the UserStore pending-auth waiter when the poll finishes.
         const onComplete = () => deps.authPending?.resolve(found.l1.resource)
 
