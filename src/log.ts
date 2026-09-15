@@ -23,6 +23,12 @@
 //                       host, status?, ok, duration_ms, error?
 //   person_token.hit  — a person token served from cache (no PS round trip).
 //                       resource
+//   invoke.resume     — invoke found an in-flight authorization for the host.
+//                       resource, op_id, outcome (still_pending | settled |
+//                       gone | abandoned), adopted? (settled: which of
+//                       person_token / auth_token / session_token the pending
+//                       delivered — names only), status? (gone), age_ms?
+//                       (abandoned)
 //
 // Never carried: token values, request or response bodies, invoke's
 // path_params / query / body, or the connect `account` value. Those are the
