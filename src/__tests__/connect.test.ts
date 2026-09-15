@@ -162,7 +162,7 @@ describe('pollConnection (B2 slice)', () => {
   it('connected on a token-less 2xx, still_pending on 202 at the budget, error otherwise', async () => {
     const interaction = { url: 'https://ps.example/auth', code: 'ABCD-EFGH', pollUrl: 'https://ps.example/pending/x' }
     mockSignedFetch.mockResolvedValueOnce(makeResponse(200, { status: 'connection_established' }))
-    expect(await pollConnection(config(), interaction, 10)).toEqual({ kind: 'connected' })
+    expect(await pollConnection(config(), interaction, 10)).toEqual({ kind: 'connected', body: { status: 'connection_established' } })
     mockSignedFetch.mockResolvedValue(makeResponse(202, {}))
     expect(await pollConnection(config(), interaction, 10)).toEqual({ kind: 'still_pending', pollUrl: interaction.pollUrl, interaction })
     mockSignedFetch.mockResolvedValueOnce(makeResponse(410, { error: 'expired' }))

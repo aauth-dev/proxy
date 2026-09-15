@@ -124,6 +124,12 @@ export interface InvokeOptions {
    * `account_required` error names the candidates.
    */
   account?: string
+  /**
+   * An auth token a settled pending delivered (`adoptSettled`). Presented as
+   * the opening credential instead of acquiring one; the requirement loop
+   * still handles any challenge it draws.
+   */
+  authToken?: string
 }
 
 export interface Interaction {
@@ -679,7 +685,9 @@ export async function invokeAtResource(
   // the auth-token path whenever the caller named one.
   const mode = accessPlan.kind === 'satisfiable' && accessPlan.mode === 'person-token' && opts.account ? 'auth-token' : accessPlan.kind === 'satisfiable' ? accessPlan.mode : undefined
 
-  if (accessPlan.kind === 'satisfiable') {
+  if (opts.authToken) {
+    cred = { kind: 'auth', jwt: opts.authToken }
+  } else if (accessPlan.kind === 'satisfiable') {
     switch (mode) {
       case 'agent-token':
         break
@@ -889,8 +897,12 @@ export interface ConnectArgs {
 export type ConnectOutcome =
   /** Nothing to connect: no `connection` published (an agent-token resource), or already connected. */
   | { kind: 'ready'; reason: 'no_connection_needed' | 'already_connected'; account?: string; scopes?: string[] }
-  /** The flow completed at the PS. */
-  | { kind: 'connected'; account?: string }
+  /**
+   * The flow completed at the PS. From `pollConnection`, `body` is the terminal
+   * response body and `access` its AAuth-Access header: a pending delivers the
+   * token it settled with there, and nowhere else (`adoptSettled`).
+   */
+  | { kind: 'connected'; account?: string; body?: unknown; access?: string }
   /** The person must act: the caller surfaces `{url}?code=`, then polls `pollUrl` (`pollConnection`). */
   | { kind: 'interaction'; interaction: Interaction }
   /**
@@ -962,8 +974,53 @@ export async function pollConnection(cfg: ProxyConfig, pending: string | Interac
     const interaction = advertised ?? prior
     return { kind: 'still_pending', pollUrl, ...(interaction ? { interaction } : {}) }
   }
-  if (res.status >= 200 && res.status < 300) return { kind: 'connected' }
+  if (res.status >= 200 && res.status < 300) {
+    const access = res.headers.get('aauth-access')
+    return { kind: 'connected', body: await safeBody(res), ...(access ? { access } : {}) }
+  }
   return { kind: 'error', status: res.status, body: await safeBody(res) }
+}
+
+/**
+ * Keep what a settled pending delivered. The PS answers the pending URL with
+ * the token it issued on approval — `person_token` for a person token request,
+ * `auth_token` for an exchange — and a resource-owned consent settles with
+ * AAuth-Access. That response is the only delivery: a fresh request is a new
+ * request, and a PS that prompts per request mints a new interaction for it.
+ * The person token goes into the cache `obtainPersonToken` reads, the session
+ * token into the session store; the auth token is returned for the caller to
+ * present (`InvokeOptions.authToken`).
+ */
+export async function adoptSettled(
+  cfg: ProxyConfig,
+  l1: L1Entry,
+  settled: { body?: unknown; access?: string },
+  missionS256 = cfg.missionS256,
+): Promise<{ adopted: Array<'person_token' | 'auth_token' | 'session_token'>; authToken?: string }> {
+  const adopted: Array<'person_token' | 'auth_token' | 'session_token'> = []
+  const body = (settled.body && typeof settled.body === 'object' ? settled.body : {}) as {
+    person_token?: unknown
+    auth_token?: unknown
+    expires_in?: unknown
+  }
+  if (typeof body.person_token === 'string' && body.person_token) {
+    const jkt = await jwkThumbprint(cfg.agentPrivateJwk as { kty?: string })
+    const key = { resource: l1.issuer, ...(missionS256 ? { mission_s256: missionS256 } : {}) }
+    const expiresIn = typeof body.expires_in === 'number' ? body.expires_in : 3600
+    await personTokenStore(cfg).set(key, jkt, body.person_token, Math.floor(Date.now() / 1000) + expiresIn)
+    adopted.push('person_token')
+  }
+  if (settled.access) {
+    await sessionTokenStore(cfg).set(l1.resource, settled.access)
+    adopted.push('session_token')
+  }
+  let authToken: string | undefined
+  if (typeof body.auth_token === 'string' && body.auth_token) {
+    if (cfg.onAuthToken) await cfg.onAuthToken(body.auth_token)
+    authToken = body.auth_token
+    adopted.push('auth_token')
+  }
+  return { adopted, ...(authToken ? { authToken } : {}) }
 }
 
 /** `GET {connection.endpoint}` — this person's connections, as the resource believes them. */

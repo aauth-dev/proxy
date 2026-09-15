@@ -155,13 +155,38 @@ function cacheKey(host: string, vocabUri: string): string {
   return `${host}|${vocabUri}`
 }
 
-async function loadDoc(host: string, vocab: PickedVocab, cache: DocCache): Promise<unknown> {
+// How long a fetched vocabulary doc is served before it is fetched again. Until
+// 4.5.1 there was no expiry: a host with a durable cache (aauth-mcp's R2) served
+// the first copy forever, so an operation a resource added later never appeared
+// (secret.agent.coop's createAccount, 2026-09-15).
+export const DOC_TTL_MS = 60 * 60 * 1000
+
+// What the cache holds. A bare doc (written before 4.5.1) has no fetchedAt and
+// counts as expired.
+interface CachedDoc {
+  aauth_doc_cache: 1
+  fetchedAt: number
+  doc: unknown
+}
+
+function isCachedDoc(v: unknown): v is CachedDoc {
+  return !!v && typeof v === 'object' && (v as CachedDoc).aauth_doc_cache === 1 && typeof (v as CachedDoc).fetchedAt === 'number'
+}
+
+export async function loadDoc(host: string, vocab: PickedVocab, cache: DocCache, now = Date.now()): Promise<unknown> {
   const key = cacheKey(host, vocab.vocabUri)
-  let doc = await cache.get(key)
-  if (doc === undefined) {
+  const cached = await cache.get(key)
+  if (isCachedDoc(cached) && now - cached.fetchedAt < DOC_TTL_MS) return cached.doc
+  let doc: unknown
+  try {
     doc = await vocab.adapter.load(vocab.docUrl)
-    await cache.set(key, doc)
+  } catch (e) {
+    // The resource is unreachable right now: a stale copy beats no operations.
+    if (isCachedDoc(cached)) return cached.doc
+    if (cached !== undefined) return cached
+    throw e
   }
+  await cache.set(key, { aauth_doc_cache: 1, fetchedAt: now, doc } satisfies CachedDoc)
   return doc
 }
 

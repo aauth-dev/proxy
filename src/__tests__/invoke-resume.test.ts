@@ -72,14 +72,16 @@ const makeCfg = (): ProxyConfig => ({
 })
 
 /**
- * A PS that hands out a new code on every person-token request, and a pending
- * URL whose answer the test flips. Counting codes is the assertion.
+ * A PS that behaves like Hellō: every person-token request is a new request and
+ * gets a new code, approved or not, and the approved token is delivered once,
+ * on the pending URL. The 4.4.0 fake answered a repeat request with 200 after
+ * approval, which is what hid the proxy dropping the delivered token.
+ * Counting codes is the assertion.
  */
 function fakePS() {
-  const state = { codes: 0, pending: 202 as 200 | 202 | 410 }
-  mockSignedFetch.mockImplementation(async (url: string, init?: { method?: string }) => {
+  const state = { codes: 0, pending: 202 as 200 | 202 | 410, presented: [] as string[] }
+  mockSignedFetch.mockImplementation(async (url: string, init?: { method?: string; signatureKey?: { jwt?: string } }) => {
     if (url === 'https://ps.example/person') {
-      if (state.pending === 200) return makeResponse(200, { person_token: 'pt_ok', expires_in: 3600 })
       state.codes += 1
       const code = `CODE-${state.codes}`
       return makeResponse(202, {}, {
@@ -87,8 +89,13 @@ function fakePS() {
         location: `https://ps.example/pending/${code}`,
       })
     }
-    if (url.startsWith('https://ps.example/pending/')) return makeResponse(state.pending, {})
-    if (url === 'https://gmail.example/whoami') return makeResponse(200, { ok: true })
+    if (url.startsWith('https://ps.example/pending/')) {
+      return makeResponse(state.pending, state.pending === 200 ? { person_token: 'pt_ok', expires_in: 3600 } : {})
+    }
+    if (url === 'https://gmail.example/whoami') {
+      state.presented.push(init?.signatureKey?.jwt ?? '')
+      return makeResponse(200, { ok: true })
+    }
     throw new Error(`unexpected signed fetch: ${url} ${init?.method ?? 'GET'}`)
   })
   return state
@@ -149,6 +156,12 @@ describe('invoke resumes a pending authorization', () => {
       const third = await call()
       expect(JSON.parse(textOf(third))).toEqual({ status: 200, body: { ok: true } })
       expect(ps.codes).toBe(1)
+      // The token the pending delivered is the one presented, and it is cached:
+      // the next call needs no PS round trip at all.
+      expect(ps.presented).toEqual(['pt_ok'])
+      expect(JSON.parse(textOf(await call()))).toEqual({ status: 200, body: { ok: true } })
+      expect(ps.codes).toBe(1)
+      expect(ps.presented).toEqual(['pt_ok', 'pt_ok'])
     } finally {
       await close()
     }
@@ -164,6 +177,46 @@ describe('invoke resumes a pending authorization', () => {
       const retry = textOf(await call())
       expect(retry).toContain('CODE-2')
       expect(ps.codes).toBe(2)
+    } finally {
+      await close()
+    }
+  })
+
+  it('an auth token delivered on the pending is presented on the retry, not re-requested', async () => {
+    // Person token cached already; the resource steps up to an auth token and
+    // the exchange needs the person. Hellō delivers the auth token on the
+    // pending; a second exchange would mint a second code.
+    const state = { codes: 0, exchanges: 0, pending: 202 as 200 | 202, presented: [] as string[] }
+    mockSignedFetch.mockImplementation(async (url: string, init?: { method?: string; signatureKey?: { jwt?: string } }) => {
+      if (url === 'https://ps.example/person') return makeResponse(200, { person_token: 'pt_ok', expires_in: 3600 })
+      if (url === 'https://ps.example/token') {
+        state.exchanges += 1
+        state.codes += 1
+        const code = `AUTH-${state.codes}`
+        return makeResponse(202, {}, {
+          'aauth-requirement': `requirement=interaction; code="${code}"`,
+          location: `https://ps.example/pending/${code}`,
+        })
+      }
+      if (url.startsWith('https://ps.example/pending/')) {
+        return makeResponse(state.pending, state.pending === 200 ? { auth_token: 'at_ok', expires_in: 3600 } : {})
+      }
+      if (url === 'https://gmail.example/whoami') {
+        const jwt = init?.signatureKey?.jwt ?? ''
+        state.presented.push(jwt)
+        if (jwt === 'at_ok') return makeResponse(200, { ok: true })
+        return makeResponse(401, {}, { 'aauth-requirement': 'requirement=auth-token; resource-token="rt_1"' })
+      }
+      throw new Error(`unexpected signed fetch: ${url} ${init?.method ?? 'GET'}`)
+    })
+    const { client, close } = await connectClient(memoryL1([entry('gmail.example')]))
+    const call = () => client.callTool({ name: 'invoke', arguments: { resource: 'gmail.example', op_id: 'whoami' } })
+    try {
+      expect(textOf(await call())).toContain('AUTH-1')
+      state.pending = 200
+      expect(JSON.parse(textOf(await call()))).toEqual({ status: 200, body: { ok: true } })
+      expect(state.exchanges).toBe(1)
+      expect(state.presented).toEqual(['pt_ok', 'at_ok'])
     } finally {
       await close()
     }

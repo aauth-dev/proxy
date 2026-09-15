@@ -30,7 +30,7 @@ import { renderUnicodeCompact } from 'uqr'
 import { z } from 'zod'
 import { planAccessMode } from './access-mode.js'
 import type { AgentSetup } from './access-mode.js'
-import { connectAtResource, deleteAtAdmin, disconnectAll, invokeAtResource, listConnections, pollConnection } from './agent.js'
+import { adoptSettled, connectAtResource, deleteAtAdmin, disconnectAll, invokeAtResource, listConnections, pollConnection } from './agent.js'
 import type { ConnectOutcome, Interaction, InvokeResult, ProxyConfig } from './agent.js'
 import { canonicalizeHost } from './host.js'
 import { agentTokenPs } from './jwt.js'
@@ -797,13 +797,16 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       // code (four for one approval, 2026-09-14), and the code the person
       // was looking at died under them.
       const existing = await inflight.get(host)
+      let resumedAuthToken: string | undefined
       if (existing) {
         if (Date.now() - existing.startedAt > CONNECT_MAX_MS) {
+          deps.log?.('invoke.resume', { resource: host, op_id, outcome: 'abandoned', age_ms: Date.now() - existing.startedAt })
           await inflight.clear(host)
           await deps.authPending?.resolve(host)
         } else {
           const polled = await pollConnection(c.cfg, existing.interaction ?? existing.pollUrl, budgetMs)
           if (polled.kind === 'still_pending') {
+            deps.log?.('invoke.resume', { resource: host, op_id, outcome: 'still_pending' })
             const next: InFlight = {
               ...existing,
               pollUrl: polled.pollUrl,
@@ -818,8 +821,17 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
             )
           }
           // Approved, or the pending is gone (declined, expired): either way
-          // the wait is over. Clear it and make the call; a dead pending
-          // starts a fresh one below.
+          // the wait is over. On approval the poll response IS the delivery —
+          // keep the token it carries, or the call below asks the PS again and
+          // Hellō answers with a new code (4.5.0, 2026-09-15: every approval
+          // produced another). A dead pending starts a fresh one below.
+          if (polled.kind === 'connected') {
+            const { adopted, authToken } = await adoptSettled(c.cfg, found.l1, polled)
+            resumedAuthToken = authToken
+            deps.log?.('invoke.resume', { resource: host, op_id, outcome: 'settled', adopted })
+          } else {
+            deps.log?.('invoke.resume', { resource: host, op_id, outcome: 'gone', ...(polled.kind === 'error' ? { status: polled.status } : {}) })
+          }
           await inflight.clear(host)
           await deps.authPending?.resolve(host)
         }
@@ -836,7 +848,10 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
 
       let result: InvokeResult
       try {
-        result = await invokeAtResource(c.cfg, found.l1, op_id, invokeArgs, account ? { account } : {})
+        result = await invokeAtResource(c.cfg, found.l1, op_id, invokeArgs, {
+          ...(account ? { account } : {}),
+          ...(resumedAuthToken ? { authToken: resumedAuthToken } : {}),
+        })
       } catch (err) {
         return text(`invoke error: ${(err as Error).message}`)
       }
