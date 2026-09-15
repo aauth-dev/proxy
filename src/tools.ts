@@ -111,6 +111,8 @@ export interface ConnectFlight {
   startedAt: number
 }
 
+type ConnectItem = { resource: string; account?: string; scopes?: string[] }
+
 const text = (s: string) => ({ content: [{ type: 'text' as const, text: s }] })
 const json = (v: unknown) => text(JSON.stringify(v, null, 2))
 
@@ -122,15 +124,17 @@ const CONNECT_MAX_MS = 10 * 60_000
 // person with two accounts at the Google family is already past 30 items; the
 // cap is a guard against a runaway list, not a design limit.
 const MAX_CONNECT_ITEMS = 64
-// The live window (D14 revised, 2026-09-12). How many connects may hold a PS
-// interaction at once. The original design started the whole list up front on
-// the premise that a queued PS pending cannot expire while it waits — but the
-// resource-side interaction code carries its OWN few-minute life the PS queue
-// does not govern, so a long list minted a pile of codes that expired before
-// the person reached them (prod incident: 29 queued, the tail dead on arrival).
-// So the proxy keeps only this many live, mints each code just before the
-// person meets it, and starts the rest as slots free on later calls.
-const MAX_LIVE_CONNECTS = 3
+// The live window (D14 revised, 2026-09-12; narrowed to one 2026-09-15). How
+// many connects may hold a PS interaction at once. The original design started
+// the whole list up front on the premise that a queued PS pending cannot expire
+// while it waits — but the resource-side interaction code carries its OWN
+// few-minute life the PS queue does not govern, so a long list minted a pile of
+// codes that expired before the person reached them (prod incident: 29 queued,
+// the tail dead on arrival). One live at a time means the only code in
+// existence is the one the person is looking at: nothing can expire behind it.
+// The next item starts the moment the head lands — inside the same call when
+// budget remains (pass 2), otherwise on the next call.
+const MAX_LIVE_CONNECTS = 1
 
 const BOOTSTRAP_GUIDANCE = `The agent proxy has no AAuth identity on this machine yet.
 
@@ -488,12 +492,64 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
         }
       }
 
+      // Start one connect and account for it. Returns true when the item now
+      // holds a live slot (the person, or the PS reaching the person, still has
+      // to act) and has been added to `waiting`; false when it settled on the
+      // spot (ready / connected / error).
+      const start = async (item: ConnectItem, entry: L1Entry, row: Record<string, unknown>): Promise<boolean> => {
+        const host = entry.resource
+        let outcome: ConnectOutcome
+        try {
+          outcome = await connectAtResource(cfg, entry, {
+            ...(item.account ? { account: item.account } : {}),
+            ...(item.scopes ? { scopes: item.scopes } : {}),
+          })
+        } catch (err) {
+          row.outcome = 'error'
+          row.detail = (err as Error).message
+          return false
+        }
+
+        if (outcome.kind === 'interaction') {
+          const { interaction } = outcome
+          const flight: InFlight = {
+            pollUrl: interaction.pollUrl,
+            interaction,
+            ...(item.account ? { account: item.account } : {}),
+            startedAt: Date.now(),
+          }
+          await inflight.set(host, flight)
+          await deps.onInteraction?.(interaction.url, interaction.code, interaction.pollUrl, () =>
+            deps.authPending?.resolve(host),
+          )
+          await deps.authPending?.register(host)
+          row.outcome = 'still_pending'
+          row.waiting_on = entry.connection?.upstream_name ?? 'the upstream'
+          if (!toSurface) {
+            toSurface = interaction
+            surfaceHost = host
+          }
+          waiting.push({ host, row, entry })
+          return true
+        }
+
+        await settle(row, entry, outcome)
+        if (row.outcome !== 'still_pending') return false
+        // A bare 202 — the PS reaching the person by its own channels, no
+        // interaction advertised yet — holds a slot exactly like an advertised
+        // interaction does. This is the path the wallet takes; not counting it
+        // is what let a 27-item list start every item at once (2026-09-15).
+        waiting.push({ host, row, entry })
+        return true
+      }
+
       // Pass 1 — resolve trivial items, resume live ones, and start new
       // connects only up to MAX_LIVE_CONNECTS. Beyond the window an item is
       // accepted but marked `queued` and NOT started, so its interaction code
-      // is not minted until a slot frees on a later call — the person never
-      // accrues a pile of codes counting down at once (D14 revised).
+      // is not minted until a slot frees — the person never accrues a pile of
+      // codes counting down at once (D14 revised).
       let live = 0
+      const held: { item: ConnectItem; entry: L1Entry; row: Record<string, unknown> }[] = []
       for (const item of items) {
         const canonical = canonicalizeHost(item.resource)
         if (!canonical) {
@@ -551,63 +607,43 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
         if (live >= MAX_LIVE_CONNECTS) {
           row.outcome = 'queued'
           row.waiting_on = entry.connection.upstream_name ?? 'the upstream'
+          held.push({ item, entry, row })
           continue
         }
 
-        let outcome: ConnectOutcome
-        try {
-          outcome = await connectAtResource(cfg, entry, {
-            ...(item.account ? { account: item.account } : {}),
-            ...(item.scopes ? { scopes: item.scopes } : {}),
-          })
-        } catch (err) {
-          row.outcome = 'error'
-          row.detail = (err as Error).message
-          continue
-        }
-
-        if (outcome.kind === 'interaction') {
-          const { interaction } = outcome
-          const flight: InFlight = {
-            pollUrl: interaction.pollUrl,
-            interaction,
-            ...(item.account ? { account: item.account } : {}),
-            startedAt: Date.now(),
-          }
-          await inflight.set(host, flight)
-          await deps.onInteraction?.(interaction.url, interaction.code, interaction.pollUrl, () =>
-            deps.authPending?.resolve(host),
-          )
-          await deps.authPending?.register(host)
-          row.outcome = 'still_pending'
-          row.waiting_on = entry.connection.upstream_name ?? 'the upstream'
-          if (!toSurface) {
-            toSurface = interaction
-            surfaceHost = host
-          }
-          live += 1
-          waiting.push({ host, row, entry })
-          continue
-        }
-
-        await settle(row, entry, outcome)
-        if (row.outcome === 'still_pending') waiting.push({ host, row, entry })
+        if (await start(item, entry, row)) live += 1
       }
 
       // Pass 2 — spend what is left of the budget on the items still waiting, in
       // order. The head is what the person is being shown, so polling it first
       // is also what finishes first; each one that lands frees the slice for the
       // next without another round trip through the model.
-      for (const { host, row, entry } of waiting) {
+      //
+      // `start` appends to `waiting`, so this is an index loop: an item started
+      // to fill a freed slot is polled in the same pass with what budget is left.
+      for (let i = 0; i < waiting.length; i++) {
+        const { host, row, entry } = waiting[i]
         const remaining = deadline - Date.now()
         if (remaining <= 0) break
         const flight = await inflight.get(host)
         if (!flight) continue
         const polled = await pollConnection(cfg, flight.interaction ?? flight.pollUrl, remaining)
         await settle(row, entry, polled, flight)
-        if (row.outcome === 'connected' && toSurface && surfaceHost === host) {
+        if (row.outcome === 'still_pending') continue
+        // This one landed (or failed): it no longer holds a slot, and it is no
+        // longer what the person should be looking at.
+        live -= 1
+        if (surfaceHost === host) {
           toSurface = undefined
           surfaceHost = undefined
+        }
+        // Refill the window now, in this call, rather than making the agent
+        // call again just to advance it — with one slot that would be one round
+        // trip through the model per connection.
+        while (live < MAX_LIVE_CONNECTS && held.length > 0 && deadline - Date.now() > 0) {
+          const next = held.shift() as { item: ConnectItem; entry: L1Entry; row: Record<string, unknown> }
+          delete next.row.waiting_on
+          if (await start(next.item, next.entry, next.row)) live += 1
         }
       }
 
@@ -637,7 +673,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
 
       return text(
         `${JSON.stringify(summary, null, 2)}\n\n` +
-          `Connecting ${surfaceHost} needs the person to act${pending > 1 ? ` (${pending - 1} more queued behind it)` : ''}.\n\n` +
+          `Connecting ${surfaceHost} needs the person to act${pending + queued > 1 ? ` (${pending + queued - 1} more queued behind it)` : ''}.\n\n` +
           `IMPORTANT: You MUST do all of the following in your response:\n` +
           `1. Display the QR code below verbatim so the user can scan it.\n` +
           `2. Show the authorization URL so the user can open it.\n` +

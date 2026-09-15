@@ -2,13 +2,16 @@
 // over an in-memory transport so the tool handler itself is under test — not
 // just the agent.ts functions it calls.
 //
-// The regression this guards is the one that motivated the tool. With
+// Two regressions are guarded here. The first motivated the tool: with
 // connect_resource, item N+1 was only created after the model saw item N's
-// answer and called again; on the Person Server a request created while another
-// was waiting could expire before the person ever saw it (beta, 2026-09-11: a
-// Gmail connect created behind two others was never surfaced and timed out).
-// The list form must start EVERY item inside one call, and a second call must
-// resume the same PS pendings rather than create a second set.
+// answer and called again, and a second call must resume the same PS pendings
+// rather than create a second set. The second motivated the live window (D14
+// revised): starting every item up front minted a pile of resource-side
+// interaction codes that expired before the person reached them (prod,
+// 2026-09-12: 29 queued, the tail dead on arrival; prod, 2026-09-15: 27 started
+// at once because a bare 202 from the PS was not counted as live). So ONE item
+// is live at a time, the rest are accepted as `queued`, and the next starts the
+// moment the head lands — in the same call when budget remains.
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
@@ -79,7 +82,7 @@ const makeCfg = (): ProxyConfig => ({
  * each, and an ordered queue would only assert the order this implementation
  * happens to use today.
  */
-function routeSignedFetch(opts: { pollStatus?: number } = {}) {
+function routeSignedFetch(opts: { pollStatus?: number; bare202?: boolean } = {}) {
   const posted: string[] = []
   let codeSeq = 0
   mockSignedFetch.mockImplementation(async (url: string, init?: { method?: string }) => {
@@ -94,8 +97,11 @@ function routeSignedFetch(opts: { pollStatus?: number } = {}) {
     if (url === 'https://ps.example/token') {
       codeSeq += 1
       const code = `CODE-${String(codeSeq).padStart(4, '0')}`
+      // bare202: the PS is reaching the person by its own channels (an open
+      // wallet tab) and advertises no interaction yet — Location only. This is
+      // what the wallet answers in production.
       return makeResponse(202, {}, {
-        'aauth-requirement': `requirement=interaction; code="${code}"`,
+        ...(opts.bare202 ? {} : { 'aauth-requirement': `requirement=interaction; code="${code}"` }),
         location: `https://ps.example/pending/${code}`,
       })
     }
@@ -105,16 +111,15 @@ function routeSignedFetch(opts: { pollStatus?: number } = {}) {
   return { posted }
 }
 
-async function connectClient(l1: L1Store) {
+async function connectClient(l1: L1Store, connectBudgetMs = 30) {
   const server = new McpServer({ name: 'test', version: '0.0.0' })
   const cfg = makeCfg()
   await buildProxyTools(server, {
     l1,
     registryCache: { read: async () => undefined, write: async () => {} },
     identity: { resolve: async () => ({ kind: 'ready', cfg }), peek: () => cfg },
-    // A short slice keeps the test fast: every item is still started, only the
-    // waiting is cut short.
-    connectBudgetMs: 30,
+    // A short slice keeps the test fast: only the waiting is cut short.
+    connectBudgetMs,
   })
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
   const client = new Client({ name: 'test-client', version: '0.0.0' })
@@ -134,7 +139,7 @@ beforeEach(() => {
 })
 
 describe('connect_resources', () => {
-  it('starts every item in ONE call — the second is not waiting on another model round trip', async () => {
+  it('starts the head in ONE call and holds the rest queued behind it', async () => {
     const { posted } = routeSignedFetch()
     const l1 = memoryL1([entry('gmail.example'), entry('calendar.example')])
     const { client, close } = await connectClient(l1)
@@ -149,21 +154,22 @@ describe('connect_resources', () => {
         },
       })
 
-      // Both PS pendings exist by the time the call answers. Under
-      // connect_resource only the first would have been created.
-      expect(posted).toEqual(['https://gmail.example/connections', 'https://calendar.example/connections'])
+      // Only the head's code exists: the second is accepted but not minted
+      // until the first lands, so it cannot expire while the person is busy.
+      expect(posted).toEqual(['https://gmail.example/connections'])
 
       const body = textOf(result)
       const summary = JSON.parse(body.slice(0, body.indexOf('\n\n')) || body) as {
         results: { resource: string; outcome: string }[]
         pending: number
+        queued: number
       }
       expect(summary.results.map((r) => r.resource)).toEqual(['gmail.example', 'calendar.example'])
-      expect(summary.results.every((r) => r.outcome === 'still_pending')).toBe(true)
-      expect(summary.pending).toBe(2)
+      expect(summary.results.map((r) => r.outcome)).toEqual(['still_pending', 'queued'])
+      expect(summary.pending).toBe(1)
+      expect(summary.queued).toBe(1)
 
-      // Only the head is surfaced: the PS shows its queue one at a time, so
-      // handing the person two URLs at once would be a lie about the order.
+      // Only the head is surfaced, and the person is told what is behind it.
       expect(body).toContain('CODE-0001')
       expect(body).not.toContain('CODE-0002')
       expect(body).toContain('1 more queued behind it')
@@ -184,12 +190,12 @@ describe('connect_resources', () => {
         ],
       }
       await client.callTool({ name: 'connect_resources', arguments: args })
-      expect(posted).toHaveLength(2)
+      expect(posted).toHaveLength(1)
 
       await client.callTool({ name: 'connect_resources', arguments: args })
-      // Still two: the second call polled the live pendings. Re-POSTing would
-      // orphan the records the person is looking at.
-      expect(posted).toHaveLength(2)
+      // Still one: the second call polled the live pending. Re-POSTing would
+      // orphan the record the person is looking at.
+      expect(posted).toHaveLength(1)
     } finally {
       await close()
     }
@@ -213,23 +219,18 @@ describe('connect_resources', () => {
         next?: string
       }
 
-      // Only three interaction codes were minted — the rest were held back,
-      // so nothing piles up counting down at once.
-      expect(posted).toHaveLength(3)
-      expect(posted).toEqual([
-        'https://a.example/connections',
-        'https://b.example/connections',
-        'https://c.example/connections',
-      ])
+      // One interaction code was minted — the rest were held back, so nothing
+      // piles up counting down at once.
+      expect(posted).toEqual(['https://a.example/connections'])
       expect(summary.results.map((r) => r.outcome)).toEqual([
         'still_pending',
-        'still_pending',
-        'still_pending',
+        'queued',
+        'queued',
         'queued',
         'queued',
       ])
-      expect(summary.pending).toBe(3)
-      expect(summary.queued).toBe(2)
+      expect(summary.pending).toBe(1)
+      expect(summary.queued).toBe(4)
       // Queued items keep the agent calling back to advance the window.
       expect(summary.next).toBeTruthy()
     } finally {
@@ -238,8 +239,8 @@ describe('connect_resources', () => {
   })
 
   it('a repeat call resumes the live set without minting a second code, and holds queued items', async () => {
-    // a,b,c go live, d,e queued. A repeat call must resume a,b,c (no re-POST)
-    // and must NOT start d,e while the window is full — no code is minted twice
+    // a goes live, b..e queued. A repeat call must resume a (no re-POST) and
+    // must NOT start b..e while the window is full — no code is minted twice
     // and no extra codes are minted for the held items.
     const { posted } = routeSignedFetch()
     const hosts = ['a.example', 'b.example', 'c.example', 'd.example', 'e.example']
@@ -248,12 +249,59 @@ describe('connect_resources', () => {
     try {
       const args = { items: hosts.map((h) => ({ resource: h, account: 'a@b.co' })) }
       await client.callTool({ name: 'connect_resources', arguments: args })
-      expect(posted).toHaveLength(3)
+      expect(posted).toHaveLength(1)
 
       await client.callTool({ name: 'connect_resources', arguments: args })
-      // Still exactly three POSTs total: live ones resumed, queued ones held.
-      expect(posted).toHaveLength(3)
-      expect(new Set(posted).size).toBe(3) // no host POSTed twice
+      // Still exactly one POST total: the live one resumed, queued ones held.
+      expect(posted).toEqual(['https://a.example/connections'])
+    } finally {
+      await close()
+    }
+  })
+
+  it('a bare 202 from the PS (no interaction advertised) still holds the one live slot', async () => {
+    // The wallet answers the exchange with 202 + Location and no
+    // AAuth-Requirement when it believes it can reach the person itself. That
+    // item is just as live as one with an advertised code — not counting it is
+    // what let 27 items start at once (prod, 2026-09-15).
+    const { posted } = routeSignedFetch({ bare202: true })
+    const hosts = ['a.example', 'b.example', 'c.example']
+    const l1 = memoryL1(hosts.map((h) => entry(h)))
+    const { client, close } = await connectClient(l1)
+    try {
+      const result = await client.callTool({
+        name: 'connect_resources',
+        arguments: { items: hosts.map((h) => ({ resource: h, account: 'a@b.co' })) },
+      })
+      expect(posted).toEqual(['https://a.example/connections'])
+      const summary = JSON.parse(textOf(result)) as { results: { outcome: string }[]; pending: number; queued: number }
+      expect(summary.results.map((r) => r.outcome)).toEqual(['still_pending', 'queued', 'queued'])
+      expect(summary.pending).toBe(1)
+      expect(summary.queued).toBe(2)
+    } finally {
+      await close()
+    }
+  })
+
+  it('starts the next queued item in the same call as soon as the head lands', async () => {
+    // Every poll answers 200 (the person approves at once), so one call should
+    // walk the whole list: land a, start b, land b, ... — no round trip through
+    // the model between connections, and never more than one code alive.
+    const { posted } = routeSignedFetch({ pollStatus: 200 })
+    const hosts = ['a.example', 'b.example', 'c.example', 'd.example', 'e.example']
+    const l1 = memoryL1(hosts.map((h) => entry(h)))
+    const { client, close } = await connectClient(l1, 5_000)
+    try {
+      const result = await client.callTool({
+        name: 'connect_resources',
+        arguments: { items: hosts.map((h) => ({ resource: h, account: 'a@b.co' })) },
+      })
+      expect(posted).toEqual(hosts.map((h) => `https://${h}/connections`))
+      const summary = JSON.parse(textOf(result)) as { results: { outcome: string }[]; pending: number; queued?: number; next?: string }
+      expect(summary.results.map((r) => r.outcome)).toEqual(['connected', 'connected', 'connected', 'connected', 'connected'])
+      expect(summary.pending).toBe(0)
+      expect(summary.queued).toBeUndefined()
+      expect(summary.next).toBeUndefined()
     } finally {
       await close()
     }
