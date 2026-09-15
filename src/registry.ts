@@ -22,6 +22,40 @@ export interface RegistryEntry {
   logo_uri?: string
   added: string
   submitted_by?: { agent: string; ap: string; user?: string }
+  // Present means NOT available (coming): nothing the public can connect to
+  // exists at this host yet, and the string says why, in plain language. An
+  // entry with `availability` keeps its issuer — the host is its id — and must
+  // never be presented as connectable.
+  availability?: string
+  // Host of the API this resource proxies (e.g. api.github.com). Not unique:
+  // several resources can front one API. Lets an agent find what fronts an
+  // API it knows by name.
+  upstream?: string
+  // Distinct people who registered interest in a coming resource.
+  interest_count?: number
+}
+
+// A coming entry: listed and described, not connectable.
+export function isComing(r: RegistryEntry): boolean {
+  return typeof r.availability === 'string'
+}
+
+// Available entries first, coming entries after, each group in the order the
+// registry gave them (it sorts by issuer).
+export function orderCatalog(resources: RegistryEntry[]): RegistryEntry[] {
+  return [...resources.filter((r) => !isComing(r)), ...resources.filter(isComing)]
+}
+
+// The registry entry for a host, if the index has one.
+export function findEntry(index: RegistryIndex, host: string): RegistryEntry | undefined {
+  const want = host.toLowerCase()
+  return index.resources.find((r) => {
+    try {
+      return new URL(r.issuer).host.toLowerCase() === want
+    } catch {
+      return false
+    }
+  })
 }
 
 export interface RegistryIndex {

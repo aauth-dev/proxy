@@ -37,8 +37,8 @@ import { agentTokenPs } from './jwt.js'
 import type { IdentityProvider } from './identity.js'
 import { toolFields } from './log.js'
 import type { ProxyLog } from './log.js'
-import { fetchRegistry } from './registry.js'
-import type { RegistryCache, RegistryEntry } from './registry.js'
+import { fetchRegistry, findEntry, isComing, orderCatalog } from './registry.js'
+import type { RegistryCache, RegistryEntry, RegistryIndex } from './registry.js'
 import {
   fetchResource,
   getOperationsForResource,
@@ -290,9 +290,16 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
 
   // The catalog view of one registry entry, tagged with whether it is already
   // in this person's set and whether this agent could complete its mode.
+  //
+  // A coming entry (registry `availability` set) is listed for what it is —
+  // a resource that does not exist yet, or is built but gated by its provider
+  // — and never as connectable: `connectable: false`, the reason verbatim,
+  // and how many people have registered interest. Its access_mode is not
+  // planned against, so it carries no skip_reason.
   function catalogRow(r: RegistryEntry, added: Set<string>, setup: AgentSetup) {
     const host = canonicalizeHost(r.issuer)?.host ?? r.issuer
-    const reason = skipReason(r.access_mode, setup)
+    const coming = isComing(r)
+    const reason = coming ? undefined : skipReason(r.access_mode, setup)
     return {
       resource: host,
       name: r.name,
@@ -300,6 +307,10 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       access_mode: r.access_mode,
       added: r.added,
       connected: added.has(host),
+      ...(r.upstream ? { upstream: r.upstream } : {}),
+      ...(coming
+        ? { connectable: false, availability: r.availability, interest_count: r.interest_count ?? 0 }
+        : {}),
       ...(reason ? { skip_reason: reason } : {}),
       ...(r.logo_uri ? { logo_uri: r.logo_uri } : {}),
     }
@@ -362,7 +373,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     'find_resources',
     {
       description: describeWithL1(
-        'Search the AAuth registry for discoverable resources by free-text query against name/description. With no query, returns the whole catalog plus `new_since_last_seen` — resources added since you last looked. Each result is tagged `connected: true` if already in your set. A result carrying `skip_reason` declares an access_mode this agent cannot complete — do not connect or plan against it.',
+        'Search the AAuth registry for discoverable resources by free-text query against name, description, host and `upstream` (the API a resource fronts, e.g. api.github.com). With no query, returns the whole catalog plus `new_since_last_seen` — resources added since you last looked. Each result is tagged `connected: true` if already in your set. A result carrying `skip_reason` declares an access_mode this agent cannot complete — do not connect or plan against it.\n\nAvailable resources come first. A result with `connectable: false` is COMING: nothing the public can connect to exists at that host yet, and `availability` says why, verbatim. connect_resources refuses it. Read this freely — before telling the person a service is impossible, check whether it is listed as coming, including by `upstream`. Do not register interest or send feedback on the person\'s behalf unless they actually asked for that resource.',
       ),
       inputSchema: z.object({ query: z.string().optional() }),
     },
@@ -374,17 +385,24 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
         const index = await fetchRegistry(c.cfg, registryCache)
         const q = (query ?? '').trim().toLowerCase()
         const added = new Set((await l1.list()).map((e) => e.resource))
+        const ordered = orderCatalog(index.resources)
         if (q) {
-          const resources = index.resources
-            .filter((r) => r.name.toLowerCase().includes(q) || r.description.toLowerCase().includes(q) || r.issuer.toLowerCase().includes(q))
+          const resources = ordered
+            .filter(
+              (r) =>
+                r.name.toLowerCase().includes(q) ||
+                r.description.toLowerCase().includes(q) ||
+                r.issuer.toLowerCase().includes(q) ||
+                (r.upstream?.toLowerCase().includes(q) ?? false),
+            )
             .map((r) => catalogRow(r, added, setup))
           return json({ resources })
         }
         // The catalog, and what is new since this person last looked (N5/H2):
         // the watermark is the index's own `updated` stamp, kept by the host.
         const lastSeen = await deps.lastSeen?.get()
-        const resources = index.resources.map((r) => catalogRow(r, added, setup))
-        const fresh = lastSeen ? index.resources.filter((r) => r.added > lastSeen).map((r) => catalogRow(r, added, setup)) : undefined
+        const resources = ordered.map((r) => catalogRow(r, added, setup))
+        const fresh = lastSeen ? ordered.filter((r) => r.added > lastSeen).map((r) => catalogRow(r, added, setup)) : undefined
         if (deps.lastSeen && index.updated) await deps.lastSeen.set(index.updated)
         return json({ resources, ...(fresh ? { new_since_last_seen: fresh } : {}) })
       } catch (err) {
@@ -399,7 +417,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       description: describeWithL1(
         'Connect one or more AAuth resources for this person in ONE call. Pass `items`, each `{resource, account?, scopes?}` — a bare host, host:port, or full URL; the agent proxy canonicalizes.\n\n' +
           'QUEUES (D14): the person works through connections one at a time in their wallet, so the proxy keeps only a few live at once and starts the rest as each finishes — this stops a long list from minting many short-lived codes that expire before the person reaches them. Each item answers `connected`, `ready`, `still_pending`, `queued` (accepted, waiting for a live slot), `timed_out` or `error`; when the bounded wait elapses, call again with the SAME items to advance the window — live items resume rather than restart, and queued ones start as slots free.\n\n' +
-          'Before calling: ask the person which services and which accounts. When a resource declares `account_description`, you MUST pass `account` for that item (the identifier it describes — a Google email, a GitHub username); when it does not, you MUST NOT (the account is chosen in the provider\'s own UI). One item per (resource × account); an already-linked account answers `ready`. `scopes` optionally narrows or widens within the resource\'s declared `connection.scopes[]` (defaults are the read set; write scopes ride the first write). Agent-token resources need no link and answer `ready`.',
+          'Before calling: ask the person which services and which accounts. When a resource declares `account_description`, you MUST pass `account` for that item (the identifier it describes — a Google email, a GitHub username); when it does not, you MUST NOT (the account is chosen in the provider\'s own UI). One item per (resource × account); an already-linked account answers `ready`. `scopes` optionally narrows or widens within the resource\'s declared `connection.scopes[]` (defaults are the read set; write scopes ride the first write). Agent-token resources need no link and answer `ready`. A resource the registry lists as coming (`connectable: false` in find_resources) answers `error` with `not_available` and the reason — there is nothing to connect to yet.',
       ),
       inputSchema: z.object({
         items: z
@@ -550,10 +568,38 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       // codes counting down at once (D14 revised).
       let live = 0
       const held: { item: ConnectItem; entry: L1Entry; row: Record<string, unknown> }[] = []
+
+      // The registry's word on a host, read once per call and only when a
+      // host needs it. A coming entry is refused before anything is fetched
+      // from the host: a gated resource serves valid metadata and would
+      // otherwise be connected only to answer every call with an access
+      // error. A registry that cannot be reached blocks nothing — a host that
+      // is not listed is still connectable directly.
+      let indexPromise: Promise<RegistryIndex | undefined> | undefined
+      const comingEntry = async (host: string): Promise<RegistryEntry | undefined> => {
+        indexPromise ??= fetchRegistry(cfg, registryCache).catch(() => undefined)
+        const index = await indexPromise
+        const found = index ? findEntry(index, host) : undefined
+        return found && isComing(found) ? found : undefined
+      }
+
       for (const item of items) {
         const canonical = canonicalizeHost(item.resource)
         if (!canonical) {
           rows.push({ resource: item.resource, outcome: 'error', detail: `invalid host: ${item.resource}` })
+          continue
+        }
+        const coming = await comingEntry(canonical.host)
+        if (coming) {
+          rows.push({
+            resource: canonical.host,
+            outcome: 'error',
+            detail: `not_available: ${coming.availability}`,
+            connectable: false,
+            availability: coming.availability,
+            ...(coming.upstream ? { upstream: coming.upstream } : {}),
+            interest_count: coming.interest_count ?? 0,
+          })
           continue
         }
         let entry: L1Entry | undefined
