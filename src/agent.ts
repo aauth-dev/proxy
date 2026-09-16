@@ -24,6 +24,7 @@ import { agentTokenPs, jwkThumbprint } from './jwt.js'
 import { loggedFetch, logUrl } from './log.js'
 import type { ProxyLog } from './log.js'
 import { routeOperation } from './resource.js'
+import { jsonRpcFromSse } from './vocab/mcp.js'
 import { createMemoryPersonTokenStore } from './store.js'
 import type { ConnectionRow, L1Entry, PersonTokenStore } from './store.js'
 
@@ -356,6 +357,12 @@ async function drivePending(
 
 async function safeBody(res: Response): Promise<unknown> {
   const text = await res.text()
+  // An MCP server may answer tools/call as an SSE stream; the caller wants the
+  // JSON-RPC response in it, not the framing.
+  if ((res.headers.get('content-type') ?? '').toLowerCase().includes('text/event-stream')) {
+    const msg = jsonRpcFromSse(text)
+    if (msg !== undefined) return msg
+  }
   try {
     return JSON.parse(text)
   } catch {
@@ -636,7 +643,7 @@ async function authorizeAtResource(
   endpoint: string,
   personToken: string,
   vocabulary: string,
-  operationId: string,
+  operation: Record<string, string>,
   account?: string,
 ): Promise<{ kind: 'resourceToken'; resourceToken: string } | { kind: 'result'; status: number; body: unknown }> {
   const res = await signWith(cfg, { kind: 'person', jwt: personToken })(endpoint, {
@@ -646,8 +653,10 @@ async function authorizeAtResource(
       r3_operations: {
         vocabulary,
         // Bare identifiers, scoped to the one discovery endpoint the resource
-        // advertises for this vocabulary (R3 -02 §Operation Identifier Scope).
-        operations: [{ operationId }],
+        // advertises for this vocabulary (R3 -02 §Operation Identifier Scope),
+        // in the vocabulary's own entry shape: `{ operationId }` for OpenAPI,
+        // `{ tool }` for MCP.
+        operations: [operation],
       },
       // N2: bind the authorization to one of the person's connected accounts.
       ...(account ? { account } : {}),
@@ -770,7 +779,7 @@ export async function invokeAtResource(
             l1.authorization_endpoint,
             pt.personToken,
             route.adapter.vocabUri,
-            operationId,
+            route.adapter.operationEntry(operationId),
             opts.account,
           )
           if (authz.kind !== 'resourceToken') return authz

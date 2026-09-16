@@ -80,7 +80,7 @@ function config(overrides: Partial<ProxyConfig> = {}): ProxyConfig {
 /** Route to a plain `sync.request`, optionally carrying an access annotation. */
 function routeTo(accessMode: string, annotations: Record<string, unknown> = {}): void {
   mockRouteOperation.mockResolvedValue({
-    adapter: { vocabUri: 'urn:aauth:vocabulary:openapi' },
+    adapter: { vocabUri: 'urn:aauth:vocabulary:openapi', operationEntry: (id: string) => ({ operationId: id }) },
     plan: { kind: 'sync.request', method: 'GET', path: '/whoami', query: 'scope=profile' },
     annotations,
     accessMode,
@@ -206,7 +206,7 @@ describe('agent-token per-call escalation', () => {
   it('retries the per-call operation with byte-identical parameters', async () => {
     mockPSWellKnown()
     mockRouteOperation.mockResolvedValue({
-      adapter: { vocabUri: 'urn:aauth:vocabulary:openapi' },
+      adapter: { vocabUri: 'urn:aauth:vocabulary:openapi', operationEntry: (id: string) => ({ operationId: id }) },
       plan: {
         kind: 'sync.request',
         method: 'POST',
