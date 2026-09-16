@@ -285,7 +285,34 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
         ok: false,
         msg: `Resource not connected: ${canonical.host}. Call connect_resources({ items: [{ resource: "${canonical.host}" }] }) first.`,
       }
-    return { ok: true, l1: entry }
+    return { ok: true, l1: await refetchIfNoVocabs(entry) }
+  }
+
+  // An entry stored with no picked vocabularies has nothing to list or invoke.
+  // That is what a resource added before this build supported its vocabulary
+  // looks like (an MCP-only resource added before the MCP adapter was stored with
+  // picked_vocabs: []), and the stored entry would otherwise never change. So
+  // re-read the well-known and keep what this person has accumulated on the
+  // entry (added, last_used, connections). A resource that really advertises
+  // nothing usable costs one metadata fetch per call; a fetch that fails leaves
+  // the entry as it was.
+  async function refetchIfNoVocabs(entry: L1Entry): Promise<L1Entry> {
+    if (entry.picked_vocabs.length > 0) return entry
+    let fresh: L1Entry
+    try {
+      fresh = toL1Entry(await fetchResource(entry.resource, { log: deps.log }))
+    } catch {
+      return entry
+    }
+    if (fresh.picked_vocabs.length === 0) return entry
+    const next: L1Entry = {
+      ...fresh,
+      added: entry.added,
+      ...(entry.last_used ? { last_used: entry.last_used } : {}),
+      ...(entry.connections ? { connections: entry.connections } : {}),
+    }
+    await l1.upsert(next)
+    return next
   }
 
   // The catalog view of one registry entry, tagged with whether it is already
@@ -608,6 +635,8 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
           if (!entry) {
             entry = toL1Entry(await fetchResource(item.resource, { log: deps.log }))
             await l1.upsert(entry)
+          } else {
+            entry = await refetchIfNoVocabs(entry)
           }
         } catch (err) {
           rows.push({ resource: canonical.host, outcome: 'error', detail: (err as Error).message })
@@ -851,7 +880,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     'invoke',
     {
       description: describeWithL1(
-        'Invoke an operation on a resource. Pass `path_params`, `query`, `body` (object) as needed. Pass `account` when the person has more than one account connected at the resource (list_resources shows them) — the resource refuses an unbound call with `account_required` naming the candidates. If authorization is required, the client opens the auth URL automatically — call invoke again after authorization completes. async.receive operations return `subscribe_requires_subagent` (v.next). An operation whose access_mode this agent cannot complete is refused without any request being made, with the reason stated. When the resource meters the call, the result carries `budget` (from the AAuth-Budget header): `remaining` on this auth token and, when known, `cost` of this call.',
+        'Invoke an operation on a resource. Pass `path_params`, `query`, `body` (object) as needed; an MCP tool takes its arguments as `body` (its `bodySchema` in get_operation_schemas). Pass `account` when the person has more than one account connected at the resource (list_resources shows them) — the resource refuses an unbound call with `account_required` naming the candidates. If authorization is required, the client opens the auth URL automatically — call invoke again after authorization completes. async.receive operations return `subscribe_requires_subagent` (v.next). An operation whose access_mode this agent cannot complete is refused without any request being made, with the reason stated. When the resource meters the call, the result carries `budget` (from the AAuth-Budget header): `remaining` on this auth token and, when known, `cost` of this call.',
       ),
       inputSchema: z.object({
         resource: z.string(),

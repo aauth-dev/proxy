@@ -75,7 +75,7 @@ export async function fetchResource(hostOrUrl: string, opts: { log?: ProxyLog } 
     host,
     origin,
     meta,
-    pickedVocabs: pickVocabs(meta.r3_vocabularies ?? {}),
+    pickedVocabs: pickVocabs(meta.r3_vocabularies ?? {}, origin),
   }
 }
 
@@ -107,13 +107,16 @@ function validate(meta: AAuthResourceMeta, host: string, origin: string): void {
   // so direct-URL adds of resources without a description still work.
 }
 
-function pickVocabs(advertised: Record<string, string>): PickedVocab[] {
+function pickVocabs(advertised: Record<string, string>, origin: string): PickedVocab[] {
   const out: PickedVocab[] = []
   for (const uri of supportedVocabUris()) {
     const docUrl = advertised[uri]
     if (typeof docUrl !== 'string' || !docUrl) continue
     const adapter = getAdapter(uri)
     if (!adapter) continue
+    // An MCP endpoint on another origin could only be called as some other
+    // resource; drop it rather than sign calls for the wrong audience.
+    if (adapter.usableAt && !adapter.usableAt(docUrl, origin)) continue
     out.push({ vocabUri: uri, docUrl, adapter })
   }
   return out
@@ -251,10 +254,11 @@ export interface RoutedOperation {
   accessMode: string
 }
 
-// Resolve an opId on a resource by trying each picked vocab in order. First
-// adapter that builds a plan wins. v1 has a single adapter (OpenAPI), so
-// "first wins" is unambiguous; the collision-prefix rule for multi-adapter
-// resources is an agent-proxy-side concern at list time, not invoke time.
+// Resolve an opId on a resource by trying each picked vocab in order (the
+// adapter table's order: OpenAPI, then MCP). First adapter that builds a plan
+// wins. A resource advertising both vocabularies with a colliding identifier
+// gets the OpenAPI operation; the collision-prefix rule for multi-adapter
+// resources (design.md §OpId namespacing) is not implemented.
 export async function routeOperation(
   l1: L1Entry,
   opId: string,

@@ -173,6 +173,10 @@ export class OpenAPIAdapter implements VocabAdapter<OpenAPIVocabDoc> {
     return getOps(doc).get(opId)?.annotations ?? {}
   }
 
+  operationEntry(opId: string): Record<string, string> {
+    return { operationId: opId }
+  }
+
   buildInvocation(doc: OpenAPIVocabDoc, opId: string, args: InvokeArgs): InvocationPlan {
     const op = getOps(doc).get(opId)
     if (!op) throw new Error(`openapi: unknown operation ${opId}`)

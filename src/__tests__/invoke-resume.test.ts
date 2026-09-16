@@ -124,7 +124,7 @@ beforeEach(() => {
   vi.restoreAllMocks()
   vi.spyOn(globalThis, 'fetch').mockImplementation(async () => makeResponse(200, PS_METADATA))
   mockRouteOperation.mockResolvedValue({
-    adapter: { vocabUri: 'urn:aauth:vocabulary:openapi' },
+    adapter: { vocabUri: 'urn:aauth:vocabulary:openapi', operationEntry: (id: string) => ({ operationId: id }) },
     plan: { kind: 'sync.request', method: 'GET', path: '/whoami' },
     annotations: {},
     accessMode: 'person-token',

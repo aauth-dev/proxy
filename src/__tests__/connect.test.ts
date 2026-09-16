@@ -190,7 +190,7 @@ describe('pollConnection (B2 slice)', () => {
   it('invoke waits out a PS that is reaching the person itself and continues with the token', async () => {
     mockPSWellKnown()
     mockRouteOperation.mockResolvedValue({
-      adapter: { vocabUri: 'urn:aauth:vocabulary:openapi' },
+      adapter: { vocabUri: 'urn:aauth:vocabulary:openapi', operationEntry: (id: string) => ({ operationId: id }) },
       plan: { kind: 'sync.request', method: 'GET', path: '/x', query: '' },
       annotations: {},
       accessMode: 'agent-token',
@@ -238,7 +238,7 @@ describe('N2 — account on the authorize request', () => {
   it('sends `account` in the /authorize body when the caller names one', async () => {
     mockPSWellKnown()
     mockRouteOperation.mockResolvedValue({
-      adapter: { vocabUri: 'urn:aauth:vocabulary:openapi' },
+      adapter: { vocabUri: 'urn:aauth:vocabulary:openapi', operationEntry: (id: string) => ({ operationId: id }) },
       plan: { kind: 'sync.request', method: 'GET', path: '/x', query: '' },
       annotations: {},
       accessMode: 'auth-token',
@@ -259,7 +259,7 @@ describe('D2 — a 401 auth-token whose resource token carries interaction_code 
   it('exchanges at the PS and surfaces its 202 with the URL composed from PS metadata', async () => {
     mockPSWellKnown()
     mockRouteOperation.mockResolvedValue({
-      adapter: { vocabUri: 'urn:aauth:vocabulary:openapi' },
+      adapter: { vocabUri: 'urn:aauth:vocabulary:openapi', operationEntry: (id: string) => ({ operationId: id }) },
       plan: { kind: 'sync.request', method: 'GET', path: '/x', query: '' },
       annotations: {},
       accessMode: 'agent-token',
@@ -284,7 +284,7 @@ describe('N7 — a resource 202 with only a code composes the URL from L1', () =
   it('uses interaction_endpoint when the header carries no url=, and nothing is relayed', async () => {
     mockPSWellKnown()
     mockRouteOperation.mockResolvedValue({
-      adapter: { vocabUri: 'urn:aauth:vocabulary:openapi' },
+      adapter: { vocabUri: 'urn:aauth:vocabulary:openapi', operationEntry: (id: string) => ({ operationId: id }) },
       plan: { kind: 'sync.request', method: 'GET', path: '/x', query: '' },
       annotations: {},
       accessMode: 'agent-token',

@@ -6,6 +6,7 @@
 //   - turn (opId, args) into an InvocationPlan the agent proxy's `invoke` can execute
 //   - read each operation's access annotations (R3 -02 §Operation Access
 //     Annotations) off the vocabulary document
+//   - name an operation in the vocabulary's own `r3_operations` entry shape
 //
 // See design.md §"Vocabularies". The LLM never sees `vocab` — it sees
 // `kind` (sync.request | async.send | async.receive) on each OpSummary, plus
@@ -93,4 +94,17 @@ export interface VocabAdapter<Doc = unknown> {
   buildInvocation(doc: Doc, opId: string, args: InvokeArgs): InvocationPlan
   /** This operation's access annotations, or {} when it carries none. */
   annotationsFor(doc: Doc, opId: string): OperationAnnotations
+  /**
+   * The entry naming this operation in `r3_operations.operations`. Its shape is
+   * vocabulary-specific (R3 -02 §Standard Vocabularies): OpenAPI `{ operationId }`,
+   * MCP `{ tool }`.
+   */
+  operationEntry(opId: string): Record<string, string>
+  /**
+   * Whether the discovery URL a resource advertises for this vocabulary can be
+   * used for the resource at `origin`. Optional; absent means always. MCP uses
+   * it: its discovery URL is also the call target, and calls go to the
+   * resource's own origin.
+   */
+  usableAt?(docUrl: string, origin: string): boolean
 }

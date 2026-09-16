@@ -1,6 +1,6 @@
 # agent proxy — the user's AAuth agent in MCP form
 
-**Status: v1 invoke spine ✅ proven live (2026-05-25); discovery layer redesigned 2026-06-09; AAuth -11 / R3 -02 landed 2026-08-11 (v0.6.0).** The agent proxy drives the authorize-first R3 flow end-to-end against a real Person Server + AAuth resource, signing with the bootstrapped `@aauth/local-keys` identity. -11 adds person-token acquisition and caching in front of the authorize-first path, the `auth_token_endpoint` / `person_token_endpoint` split in PS metadata, and three-way `access_mode` planning; R3 -02 adds operation access annotations and the per-call proposal flow, and removes the openapi-gateway vocabulary. Discovery generalizes to multi-resource: signed-call registry client, three-layer state (added / discoverable / per-resource ops), vocabulary-adapter abstraction (OpenAPI today, AsyncAPI partial, MCP-tools/GraphQL later). v.next (sub-agents, WASM runtime) is still ahead.
+**Status: v1 invoke spine ✅ proven live (2026-05-25); discovery layer redesigned 2026-06-09; AAuth -11 / R3 -02 landed 2026-08-11 (v0.6.0).** The agent proxy drives the authorize-first R3 flow end-to-end against a real Person Server + AAuth resource, signing with the bootstrapped `@aauth/local-keys` identity. -11 adds person-token acquisition and caching in front of the authorize-first path, the `auth_token_endpoint` / `person_token_endpoint` split in PS metadata, and three-way `access_mode` planning; R3 -02 adds operation access annotations and the per-call proposal flow, and removes the openapi-gateway vocabulary. Discovery generalizes to multi-resource: signed-call registry client, three-layer state (added / discoverable / per-resource ops), vocabulary-adapter abstraction (OpenAPI and MCP tools today, AsyncAPI partial, GraphQL later). v.next (sub-agents, WASM runtime) is still ahead.
 
 Reference implementation of an AAuth agent for MCP-aware agent hosts. The agent proxy represents the user as an AAuth agent, exposes that agent's capabilities to an LLM via MCP, and opens the AAuth interactions that need the person. Published as `@aauth/proxy` from `aauth-dev/praca`.
 
@@ -248,7 +248,7 @@ The vocabulary is **internal to the agent proxy**. The LLM never sees the URN, t
 |---|---|---|
 | `urn:aauth:vocabulary:openapi` | v1 adapter, full | OpenAPI 3.x. All ops have `kind: sync.request`. |
 | `urn:aauth:vocabulary:asyncapi` | v1 adapter, partial | AsyncAPI 3.x. `send` operations → `kind: async.send` (invokable). `receive` operations → `kind: async.receive` (listed; `invoke` returns `async_subscribe_requires_subagent`). |
-| `urn:aauth:vocabulary:mcp` | future | MCP tool-list as a vocab — useful for resources that ARE MCP servers fronted by AAuth. |
+| `urn:aauth:vocabulary:mcp` | adapter, full | MCP tools (R3 -02 §MCP Vocabulary). All ops have `kind: sync.request`. See "MCP tools" below. |
 | `urn:aauth:vocabulary:graphql` | future | GraphQL schema as a vocab. |
 
 The URN registry now lives in the R3 spec (`urn:aauth:vocabulary:`), which defines seven standard vocabularies.
@@ -265,6 +265,8 @@ interface VocabAdapter {
   getOperations(doc: VocabDoc, opIds: string[]): OpDetail[]
   buildInvocation(doc: VocabDoc, opId: string, args: unknown): InvocationPlan
   annotationsFor(doc: VocabDoc, opId: string): OperationAnnotations   // access mode + budget
+  operationEntry(opId: string): Record<string, string>   // r3_operations entry: { operationId } | { tool }
+  usableAt?(docUrl: string, origin: string): boolean      // optional; MCP requires same origin
 }
 
 type InvocationPlan =
@@ -274,6 +276,17 @@ type InvocationPlan =
 ```
 
 The agent proxy's adapter table is keyed by URN. At `add_resource` time, the agent proxy walks `r3_vocabularies`, picks every URN it has an adapter for, and stores the picked list on the L1 entry. `list_operations` runs all picked adapters and flattens results; `get_operation_schemas` and `invoke` look up the owning adapter by `(resource, opId)`.
+
+### MCP tools
+
+The discovery endpoint is the MCP server URL. `load` speaks Streamable HTTP directly (no SDK client): `initialize`, `notifications/initialized`, then `tools/list` following `nextCursor`, with `accept: application/json, text/event-stream`, carrying `Mcp-Session-Id` and `MCP-Protocol-Version` once the server returns them, and reading either a JSON or an SSE answer. The cached doc is `{ endpoint, protocolVersion, tools[] }` — plain JSON, so it survives a JSON-backed DocCache.
+
+- opId = tool name; summary = title and description; `bodySchema` = `inputSchema`, `responseSchema` = `outputSchema`; annotations from the tool's `_meta` (`aauth.dev/access-mode`, `aauth.dev/budget`).
+- The authorize request names the operation as `{ "tool": "<name>" }` (`operationEntry`).
+- `invoke` POSTs `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":opId,"arguments":body}}` to the endpoint path. The call goes to the resource's own origin, so an MCP endpoint on another origin is not picked (`usableAt`). AAuth challenges stay HTTP-level (401 + `AAuth-Requirement`, `AAuth-Budget`) and are read before the body; an SSE answer is reduced to its JSON-RPC response.
+- The discovery session is not carried into `invoke`. A server that requires `Mcp-Session-Id` on `tools/call` is not supported.
+
+An L1 entry stored with no picked vocabularies (a resource added before its vocabulary had an adapter) is re-read from the well-known when a tool next touches it, keeping `added`, `last_used`, and `connections`.
 
 ### OpId namespacing
 
@@ -376,7 +389,7 @@ What v1 doesn't ship:
 - Dynamic code execution
 - Saved-function tools surfaced in `tools/list`
 - AsyncAPI subscribe (`async.receive`) invocation
-- MCP-tools / GraphQL vocabulary adapters
+- GraphQL vocabulary adapter
 - Operator-selection policy (registry doesn't carry `kind`/`wraps`/`operator` signals yet)
 - Per-host AAuth identities (AAuth issue #22's `class` claim is deferred)
 - Daemon mode / Unix socket bridge
@@ -515,7 +528,7 @@ Get these right in v1 and v.next is a runtime bolt-on.
 - Sub-agents and the WASM programmable runtime (v.next, full design above)
 - Saved-function tools surfaced in `tools/list` (v.next, Option A — Anthropic clients support `list_changed`; coverage for non-Claude clients is uneven, so an Option-B fallback may land alongside)
 - AsyncAPI subscribe invocation — only useful behind a sub-agent, so deferred to v.next
-- MCP-tools and GraphQL vocabulary adapters
+- GraphQL vocabulary adapter
 - Operator-selection policy (waiting on registry `kind`/`wraps`/`operator` signals)
 - **Multiple accounts per service** — hold more than one connected upstream account at the same resource (e.g. two Gmail accounts behind the same proxy host), with the user/LLM choosing which account an `invoke` runs against. Today the agent proxy keeps a single `connections/{host}.json` per resource; this needs per-account connection state (`connections/{host}/{account}.json`), an `account` selector on `connect`/`invoke` (default when one is connected, disambiguate when several), and `list_resources`/`connect` surfacing the connected-account set. Distinct from operator-selection (which operator fronts an upstream) — this is *which end-user account* at the chosen operator. Falls out of user-held identity: each account is just another grant under the same AAuth identity, not a new operator-scoped token slot. Contrast: Arcade Omni caps at one account per provider per Arcade user — `switch_account` replaces rather than adds (see `ponte/omni-compete.md` §2).
 - AAuth issue #22's `class` claim for distinguishing hosts on shared per-machine agent proxy
@@ -539,4 +552,4 @@ Get these right in v1 and v.next is a runtime bolt-on.
 
 ## Single-sentence summary
 
-the agent proxy is the user's AAuth agent in MCP form — a stdio-launched Node process that holds the user's parent identity, exposes a fixed eight-tool meta-surface (`find_resources` / `add_resource` / `list_resources` / `remove_resource` / `connect` / `list_operations` / `get_operation_schemas` / `invoke`) over three layers of state (added resources / cached registry / per-resource ops), dispatches via vocabulary adapters (OpenAPI today; AsyncAPI partial; MCP-tools and GraphQL later) through a single `hostCall(caller, resource, opId, args)` chokepoint, and opens the AAuth interactions that need the person — so that v1 ships as a clean, token-flat MCP↔AAuth bridge and v.next bolts on a QuickJS-WASM sub-agent runtime whose saved functions appear as first-class MCP tools without rewriting a line of v1.
+the agent proxy is the user's AAuth agent in MCP form — a stdio-launched Node process that holds the user's parent identity, exposes a fixed eight-tool meta-surface (`find_resources` / `add_resource` / `list_resources` / `remove_resource` / `connect` / `list_operations` / `get_operation_schemas` / `invoke`) over three layers of state (added resources / cached registry / per-resource ops), dispatches via vocabulary adapters (OpenAPI and MCP tools today; AsyncAPI partial; GraphQL later) through a single `hostCall(caller, resource, opId, args)` chokepoint, and opens the AAuth interactions that need the person — so that v1 ships as a clean, token-flat MCP↔AAuth bridge and v.next bolts on a QuickJS-WASM sub-agent runtime whose saved functions appear as first-class MCP tools without rewriting a line of v1.

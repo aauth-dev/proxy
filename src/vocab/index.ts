@@ -10,17 +10,20 @@
 // no composite `service:operationId` identity and no `{service, operationId}`
 // entry shape any more.
 
+import { MCPAdapter } from './mcp.js'
 import { OpenAPIAdapter } from './openapi.js'
 import type { VocabAdapter } from './types.js'
 
 export * from './types.js'
 export * from './annotations.js'
 export { OpenAPIAdapter } from './openapi.js'
+export { MCPAdapter, MCP_VOCABULARY, jsonRpcFromSse, parseSseMessages } from './mcp.js'
+export type { McpTool, McpVocabDoc } from './mcp.js'
 
 const ADAPTERS: Record<string, VocabAdapter> = {
   'urn:aauth:vocabulary:openapi': new OpenAPIAdapter(),
+  'urn:aauth:vocabulary:mcp': new MCPAdapter(),
   // 'urn:aauth:vocabulary:asyncapi': new AsyncAPIAdapter(),   // Phase 3
-  // 'urn:aauth:vocabulary:mcp':      new MCPAdapter(),        // future
   // 'urn:aauth:vocabulary:graphql':  new GraphQLAdapter(),    // future
 }
 
