@@ -160,6 +160,64 @@ describe('proxy log sink', () => {
     }
   })
 
+  it('a non-2xx aauth.request carries the error CODE and nothing else from the body', async () => {
+    // The two shapes seen in production: a resource's OAuth-style
+    // `{"error":"account_required", …}` and the wallet's
+    // `{"error":{"message":"NO_SESSION"}}`. Without the code a 400 was
+    // indistinguishable from any other 400 (2026-09-15); the rest of the body
+    // (`detail`, `account_description`) stays out — it can echo what was sent.
+    mockSignedFetch.mockImplementation(async (url: string, init?: { method?: string }) => {
+      if (url === 'https://ps.example/person') {
+        return makeResponse(403, { error: { message: 'NO_SESSION' }, detail: 'session for person@example.com' })
+      }
+      throw new Error(`unexpected signed fetch: ${url}`)
+    })
+    const l1 = memoryL1([entry('github.example')])
+    const { client, events, close } = await connectClient(l1)
+    try {
+      const result = await client.callTool({
+        name: 'connect_resources',
+        arguments: { items: [{ resource: 'github.example', account: 'octocat' }] },
+      })
+      const req = events.find((e) => e.event === 'aauth.request' && e.fields.url === 'https://ps.example/person')
+      expect(req?.fields).toMatchObject({ status: 403, ok: false, error_code: 'NO_SESSION' })
+      expect(req?.fields.error).toBeUndefined() // `error` means the fetch threw; it did not
+
+      // The caller still reads the body itself (logging reads a clone).
+      const text = (result as { content: { text?: string }[] }).content.map((c) => c.text ?? '').join('')
+      expect(text).toContain('NO_SESSION')
+
+      const serialized = JSON.stringify(events)
+      expect(serialized).not.toContain('person@example.com')
+      expect(serialized).not.toContain('detail')
+    } finally {
+      await close()
+    }
+
+    // A string `error` (resource proxies): the code is lifted, its neighbours are not.
+    mockSignedFetch.mockImplementation(async (url: string, init?: { method?: string }) => {
+      if (url === 'https://ps.example/person') return makeResponse(200, { person_token: 'pt_secret', expires_in: 3600 })
+      if (url === 'https://github.example/connections' && init?.method === 'POST') {
+        return makeResponse(400, { error: 'account_required', account_description: 'GitHub username', detail: 'octocat' })
+      }
+      throw new Error(`unexpected signed fetch: ${url}`)
+    })
+    const second = await connectClient(memoryL1([entry('github.example')]))
+    try {
+      await second.client.callTool({
+        name: 'connect_resources',
+        arguments: { items: [{ resource: 'github.example', account: 'octocat' }] },
+      })
+      const req = second.events.find((e) => e.event === 'aauth.request' && e.fields.url === 'https://github.example/connections')
+      expect(req?.fields).toMatchObject({ status: 400, ok: false, error_code: 'account_required' })
+      const serialized = JSON.stringify(second.events)
+      expect(serialized).not.toContain('GitHub username')
+      expect(serialized).not.toContain('octocat')
+    } finally {
+      await second.close()
+    }
+  })
+
   it('logUrl strips the query and toolFields reduces values to presence', () => {
     expect(logUrl('https://r.example/v1/messages?q=from%3Aboss')).toBe('https://r.example/v1/messages')
     expect(toolFields('invoke', {
