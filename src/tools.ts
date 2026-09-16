@@ -851,7 +851,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     'invoke',
     {
       description: describeWithL1(
-        'Invoke an operation on a resource. Pass `path_params`, `query`, `body` (object) as needed. Pass `account` when the person has more than one account connected at the resource (list_resources shows them) — the resource refuses an unbound call with `account_required` naming the candidates. If authorization is required, the client opens the auth URL automatically — call invoke again after authorization completes. async.receive operations return `subscribe_requires_subagent` (v.next). An operation whose access_mode this agent cannot complete is refused without any request being made, with the reason stated.',
+        'Invoke an operation on a resource. Pass `path_params`, `query`, `body` (object) as needed. Pass `account` when the person has more than one account connected at the resource (list_resources shows them) — the resource refuses an unbound call with `account_required` naming the candidates. If authorization is required, the client opens the auth URL automatically — call invoke again after authorization completes. async.receive operations return `subscribe_requires_subagent` (v.next). An operation whose access_mode this agent cannot complete is refused without any request being made, with the reason stated. When the resource meters the call, the result carries `budget` (from the AAuth-Budget header): `remaining` on this auth token and, when known, `cost` of this call.',
       ),
       inputSchema: z.object({
         resource: z.string(),
@@ -974,7 +974,8 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       }
 
       if (result.status >= 200 && result.status < 300) await l1.touch(found.l1.resource)
-      return json({ status: result.status, body: result.body })
+      // budget before body: the balance stays readable when the body is large.
+      return json({ status: result.status, ...(result.budget ? { budget: result.budget } : {}), body: result.body })
     },
   )
 
