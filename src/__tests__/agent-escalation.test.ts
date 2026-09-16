@@ -169,6 +169,40 @@ describe('agent-token per-call escalation', () => {
     expect(JSON.parse(mockSignedFetch.mock.calls[3][1].body).resource_token).toBe('rt_2')
   })
 
+  it('carries the AAuth-Budget header on a served call', async () => {
+    mockSignedFetch.mockResolvedValueOnce(
+      makeResponse(200, { hits: 84 }, { 'aauth-budget': 'cost=2, remaining=98, unit="credits", decimals=0' }),
+    )
+
+    const result = await invokeAtResource(config(), l1(), 'whoami', { query: 'scope=profile' })
+
+    expect(result).toEqual({
+      kind: 'result',
+      status: 200,
+      body: { hits: 84 },
+      budget: { cost: 2, remaining: 98, unit: 'credits', decimals: 0 },
+    })
+  })
+
+  it('carries the AAuth-Budget header on a terminal budget challenge', async () => {
+    mockPSWellKnown()
+    const challenge = (rt: string) =>
+      makeResponse(401, { error: 'insufficient_budget' }, {
+        'aauth-requirement': `requirement=auth-token; resource-token="${rt}"; reason=insufficient-budget`,
+        'aauth-budget': 'remaining=1, required=8',
+      })
+    mockSignedFetch
+      .mockResolvedValueOnce(challenge('rt_1'))
+      .mockResolvedValueOnce(makeResponse(200, { auth_token: 'auth_A' }))
+      .mockResolvedValueOnce(challenge('rt_2'))
+      .mockResolvedValueOnce(makeResponse(200, { auth_token: 'auth_B' }))
+      .mockResolvedValueOnce(challenge('rt_3'))
+
+    const result = await invokeAtResource(config(), l1(), 'whoami', { query: 'scope=profile' })
+
+    expect(result).toMatchObject({ kind: 'result', status: 401, budget: { remaining: 1, required: 8 } })
+  })
+
   it('retries the per-call operation with byte-identical parameters', async () => {
     mockPSWellKnown()
     mockRouteOperation.mockResolvedValue({

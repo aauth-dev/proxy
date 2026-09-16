@@ -139,7 +139,7 @@ export interface Interaction {
 }
 
 export type InvokeResult =
-  | { kind: 'result'; status: number; body: unknown }
+  | { kind: 'result'; status: number; body: unknown; budget?: BudgetStatus }
   | { kind: 'interaction'; interaction: Interaction }
   /**
    * The resource (or this operation) declares an access mode this agent's setup
@@ -256,6 +256,50 @@ function parseRequirement(headerValue: string | null): ParsedRequirement | undef
   }
 }
 
+/**
+ * The resource's `AAuth-Budget` response header (draft-hardt-aauth-budgets
+ * §AAuth-Budget Response Header): what is left of the auth token's budget and,
+ * when known, what this request cost. Integers are in the granted scale.
+ */
+export interface BudgetStatus {
+  remaining?: number
+  cost?: number
+  reserved?: number
+  required?: number
+  unit?: string
+  decimals?: number
+}
+
+// An RFC 9651 Dictionary, read for the members this agent uses: Integer and
+// String values. Unrecognized members and other value types are ignored, as
+// the draft requires of recipients.
+export function parseBudget(headerValue: string | null): BudgetStatus | undefined {
+  if (!headerValue) return undefined
+  const out: BudgetStatus = {}
+  const re = /([a-z*][a-z0-9_.*-]*)\s*=\s*(-?\d+|"(?:[^"\\]|\\.)*")/g
+  for (const [, key, raw] of headerValue.matchAll(re)) {
+    const value = raw.startsWith('"') ? raw.slice(1, -1).replace(/\\(.)/g, '$1') : Number(raw)
+    switch (key) {
+      case 'remaining':
+      case 'cost':
+      case 'reserved':
+      case 'required':
+      case 'decimals':
+        if (typeof value === 'number') out[key] = value
+        break
+      case 'unit':
+        if (typeof value === 'string') out.unit = value
+        break
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined
+}
+
+function withBudget(res: Response): { budget?: BudgetStatus } {
+  const budget = parseBudget(res.headers.get('aauth-budget'))
+  return budget ? { budget } : {}
+}
+
 // A terminal challenge response, annotated with the challenge's `reason` when
 // one was sent so the caller (ultimately the LLM) sees `budget-exhausted` /
 // `insufficient-budget` instead of a bare status.
@@ -265,6 +309,7 @@ async function terminalChallenge(res: Response, req: ParsedRequirement): Promise
     kind: 'result',
     status: res.status,
     body: req.reason ? { error: req.reason, detail: body } : body,
+    ...withBudget(res),
   }
 }
 
@@ -757,7 +802,7 @@ export async function invokeAtResource(
     }
 
     const req = parseRequirement(res.headers.get('aauth-requirement'))
-    if (!req) return { kind: 'result', status: res.status, body: await safeBody(res) }
+    if (!req) return { kind: 'result', status: res.status, body: await safeBody(res), ...withBudget(res) }
 
     const marker = `${req.requirement}:${cred.kind}`
     if (satisfied.has(marker)) {
