@@ -18,6 +18,8 @@
 //                       credential (agent|person|auth|session), method, url
 //                       (origin + path, query stripped), status, ok,
 //                       requirement? (AAuth-Requirement on the response),
+//                       error_code? (non-2xx: the body's `error` string, or
+//                       `error.message` — the code only, never the body),
 //                       duration_ms, error? (fetch threw)
 //   resource.fetch    — the resource's /.well-known/aauth-resource.json.
 //                       host, status?, ok, duration_ms, error?
@@ -33,7 +35,11 @@
 // Never carried: token values, request or response bodies, invoke's
 // path_params / query / body, or the connect `account` value. Those are the
 // person's data or credentials; the sink gets the shape of the call, not its
-// content.
+// content. The one thing lifted out of a failure body is its error CODE
+// (`account_required`, `NO_SESSION`): without it a 400 from a resource is
+// indistinguishable from any other 400 (prod, 2026-09-15), and a code is the
+// shape of the failure, not the person's data. `detail` and the like stay
+// out — they can echo what was submitted.
 
 export type ProxyLogFields = Record<string, unknown>
 export type ProxyLog = (event: string, fields: ProxyLogFields) => void
@@ -45,6 +51,28 @@ export function logUrl(url: string): string {
     return `${u.origin}${u.pathname}`
   } catch {
     return url.split('?')[0]
+  }
+}
+
+/**
+ * The error code of a failure body, and nothing else: a string `error`
+ * (`{"error":"account_required",…}` — resources, OAuth-style) or
+ * `error.message` (`{"error":{"message":"NO_SESSION"}}` — the wallet). Reads
+ * a clone so the caller's own body read is untouched; anything unparseable
+ * or unshaped is simply absent.
+ */
+async function errorCodeOf(res: Response): Promise<string | undefined> {
+  try {
+    const body = (await res.clone().json()) as unknown
+    if (!body || typeof body !== 'object') return undefined
+    const err = (body as { error?: unknown }).error
+    if (typeof err === 'string') return err.slice(0, 64)
+    if (err && typeof err === 'object' && typeof (err as { message?: unknown }).message === 'string') {
+      return ((err as { message: string }).message).slice(0, 64)
+    }
+    return undefined
+  } catch {
+    return undefined
   }
 }
 
@@ -60,11 +88,13 @@ export async function loggedFetch(
   try {
     const res = await run()
     const requirement = /requirement=([A-Za-z0-9_-]+)/.exec(res.headers.get('aauth-requirement') ?? '')?.[1]
+    const errorCode = res.ok ? undefined : await errorCodeOf(res)
     log(event, {
       ...fields,
       status: res.status,
       ok: res.ok,
       ...(requirement ? { requirement } : {}),
+      ...(errorCode ? { error_code: errorCode } : {}),
       duration_ms: Date.now() - started,
     })
     return res
