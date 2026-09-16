@@ -157,6 +157,7 @@ describe('authorize-first operation entries', () => {
       kind: 'result',
       status: 200,
       body: { jsonrpc: '2.0', id: 1, result: { content: [{ type: 'text', text: 'ok' }] } },
+      budget: { remaining: 9 },
     })
   })
 })
