@@ -8,6 +8,7 @@
 import { readOpenApiAnnotations } from './annotations.js'
 import type { OperationAnnotations } from './annotations.js'
 import type {
+  LoadedDoc,
   InvocationPlan,
   InvokeArgs,
   OpDetail,
@@ -82,6 +83,22 @@ function indexOperations(doc: OpenAPIDoc): Map<string, ResolvedOp> {
   return ops
 }
 
+// The Accept header for an operation: the media types its success responses
+// (2xx, 2XX, default) declare. JSON alone when any of them offers it, since the
+// body goes to an LLM; a resource that negotiates on Accept then answers JSON
+// instead of its default (raw bytes, say). Nothing declared → no header.
+export function acceptFor(responses: Record<string, unknown> | undefined): string | undefined {
+  const types: string[] = []
+  for (const [code, response] of Object.entries(responses ?? {})) {
+    if (!/^(2\d\d|2XX|default)$/i.test(code)) continue
+    const content = (response as { content?: unknown } | null)?.content
+    if (!content || typeof content !== 'object') continue
+    for (const t of Object.keys(content)) if (!types.includes(t)) types.push(t)
+  }
+  if (types.length === 0) return undefined
+  return types.find((t) => /^application\/([\w.-]+\+)?json(\s*;|$)/i.test(t)) ?? types.join(', ')
+}
+
 function matches(op: ResolvedOp, query: string): boolean {
   if (!query) return true
   // Path prefix mode: '/foo' or '/foo/*' — match against the op's path.
@@ -123,10 +140,21 @@ export class OpenAPIAdapter implements VocabAdapter<OpenAPIVocabDoc> {
   readonly vocabUri = 'urn:aauth:vocabulary:openapi'
 
   async load(url: string): Promise<OpenAPIVocabDoc> {
-    const res = await fetch(url)
+    const loaded = await this.loadCached(url)
+    if (loaded.notModified) throw new Error(`openapi load ${url}: 304 to an unconditional request`)
+    return loaded.doc
+  }
+
+  // The document with the resource's Cache-Control and ETag, so the doc cache
+  // can honor them; with ifNoneMatch, a 304 comes back as notModified.
+  async loadCached(url: string, opts: { ifNoneMatch?: string } = {}): Promise<LoadedDoc<OpenAPIVocabDoc>> {
+    const res = await fetch(url, opts.ifNoneMatch ? { headers: { 'if-none-match': opts.ifNoneMatch } } : undefined)
+    const cacheControl = res.headers.get('cache-control') ?? undefined
+    const etag = res.headers.get('etag') ?? undefined
+    if (res.status === 304 && opts.ifNoneMatch) return { notModified: true, cacheControl, etag }
     if (!res.ok) throw new Error(`openapi load ${url}: ${res.status}`)
     const raw = (await res.json()) as OpenAPIDoc
-    return { raw, ops: indexOperations(raw) }
+    return { doc: { raw, ops: indexOperations(raw) }, cacheControl, etag }
   }
 
   listOperations(doc: OpenAPIVocabDoc, query?: string): OpSummary[] {
@@ -182,17 +210,17 @@ export class OpenAPIAdapter implements VocabAdapter<OpenAPIVocabDoc> {
     if (!op) throw new Error(`openapi: unknown operation ${opId}`)
     const path = applyPathParams(op.path, args.pathParams)
     const body = args.body
+    const headers: Record<string, string> = {}
+    const accept = acceptFor(op.responses)
+    if (accept) headers.accept = accept
+    if (body !== undefined) headers['content-type'] = args.contentType ?? 'application/json'
     return {
       kind: 'sync.request',
       method: op.method,
       path,
       ...(args.query !== undefined ? { query: args.query } : {}),
-      ...(body !== undefined
-        ? {
-            headers: { 'content-type': args.contentType ?? 'application/json' },
-            body: typeof body === 'string' ? body : JSON.stringify(body),
-          }
-        : {}),
+      ...(Object.keys(headers).length > 0 ? { headers } : {}),
+      ...(body !== undefined ? { body: typeof body === 'string' ? body : JSON.stringify(body) } : {}),
     }
   }
 }
