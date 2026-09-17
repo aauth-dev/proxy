@@ -82,6 +82,13 @@ export interface InvokeArgs {
   message?: unknown
 }
 
+// What a conditional, cache-aware load returns: the document with the
+// response's Cache-Control and ETag, or notModified for a 304 to If-None-Match.
+// The cache in resource.ts (loadDoc) decides the lifetime from them.
+export type LoadedDoc<Doc = unknown> =
+  | { notModified?: false; doc: Doc; cacheControl?: string; etag?: string }
+  | { notModified: true; cacheControl?: string; etag?: string }
+
 export interface VocabAdapter<Doc = unknown> {
   readonly vocabUri: string
   // The r3_vocabularies discovery value: one doc URL per vocabulary. Operation
@@ -89,6 +96,13 @@ export interface VocabAdapter<Doc = unknown> {
   // Scope), so a resource fronting several backends either presents them as one
   // definition or exposes them under separate resource identifiers.
   load(source: string): Promise<Doc>
+  /**
+   * load, with the response's caching headers, and conditional on an ETag the
+   * cache already holds. Optional: a vocabulary whose document is not one HTTP
+   * GET (MCP tools/list) has no headers to honor and is cached for the default
+   * lifetime.
+   */
+  loadCached?(source: string, opts?: { ifNoneMatch?: string }): Promise<LoadedDoc<Doc>>
   listOperations(doc: Doc, query?: string): OpSummary[]
   getOperations(doc: Doc, opIds: string[]): OpDetail[]
   buildInvocation(doc: Doc, opId: string, args: InvokeArgs): InvocationPlan

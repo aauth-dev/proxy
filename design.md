@@ -101,7 +101,7 @@ Three layers, all file-backed, all per-machine.
 |---|---|---|
 | `resources.json` | **L1** — added resources: `{ resource, name, description, access_mode, picked_vocabs[], last_used }[]` | written on `add_resource` / `remove_resource` / first successful auth |
 | `catalog/registry.json` | **L2** — cached `GET registry.aauth.dev/resources` result | refreshed on startup + 24h background; ETag-conditional |
-| `catalog/{host}/{vocab}.json` | **L3** — cached vocabulary docs (OpenAPI / AsyncAPI / …) per resource | fetched on first `list_operations`/`get_operation_schemas`; cached with TTL |
+| `catalog/{host}/{vocab}.json` | **L3** — cached vocabulary docs (OpenAPI / AsyncAPI / …) per resource | fetched on first `list_operations`/`get_operation_schemas`; cached per the resource's `Cache-Control`, at most one hour; ETag-conditional on expiry |
 | `connections/{host}.json` | per-resource session state — stored auth-tokens, refresh state, last interaction | written by R3 flow |
 | `person-tokens.json` | PS-issued person tokens, keyed `(resource, mission_s256)`, plus the thumbprint of the agent key they all bind | written on person-token acquisition; flushed whole on key rotation |
 | `pending-interactions.json` | open interactions awaiting user resolution | written/cleared as interactions open and resolve |
@@ -152,7 +152,9 @@ After `add_resource`:
 
 ### L3 — operations within a resource
 
-Per-resource ops are fetched on first `list_operations`/`get_operation_schemas` call against that resource, cached at `~/.aauth/proxy/catalog/{host}/{vocab}.json`. The agent proxy reads the resource's `r3_vocabularies` and loads each one through the matching adapter; vocab docs are cached with a TTL and refreshed lazily.
+Per-resource ops are fetched on first `list_operations`/`get_operation_schemas` call against that resource, cached at `~/.aauth/proxy/catalog/{host}/{vocab}.json`. The agent proxy reads the resource's `r3_vocabularies` and loads each one through the matching adapter; vocab docs are cached and refreshed lazily.
+
+**Vocab doc lifetime (4.9.0).** The resource's `Cache-Control` on the vocabulary document decides how long a copy is served, never more than one hour: `s-maxage` or `max-age` when present (capped at an hour); `no-cache` means ask every time; `no-store` means ask every time and keep nothing; no header means one hour, as since 4.5.1. When a copy has expired and the resource sent an `ETag`, the refetch carries `If-None-Match`, and a `304` renews the copy without a new body. An unreachable resource still gets the stale copy, except under `no-store`. An adapter opts in with `loadCached`; the OpenAPI adapter does, and the MCP adapter (whose document is a `tools/list` exchange, not one GET) keeps the one-hour default. `/.well-known/aauth-resource.json` is not held in a timed cache: it is read at `connect_resources` and stored on the L1 entry.
 
 `list_operations` returns a bounded summary list (no schemas); `get_operation_schemas` is the explicit "give me the full schemas for these op_ids" call. This separation matters because schemas dominate token cost — Speakeasy's published numbers show schema-bearing tool listings 5-10× larger than summary-only listings. (See "Tool surface".)
 

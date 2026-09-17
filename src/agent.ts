@@ -355,7 +355,20 @@ async function drivePending(
   return { kind: 'done', body: await safeBody(res), res }
 }
 
-async function safeBody(res: Response): Promise<unknown> {
+// Media types whose bodies are text. Anything else is read as bytes and handed
+// back base64-encoded: decoding bytes as UTF-8 replaces every invalid sequence
+// and the original cannot be recovered (ciphertext, images, archives).
+const TEXTUAL = /^(text\/|application\/([\w.-]+\+)?(json|xml)(\s*;|$)|application\/(x-www-form-urlencoded|javascript|ecmascript)(\s*;|$)|image\/svg\+xml)/i
+
+/** A response body for the caller: parsed JSON, text, or `{content_type, size, base64}` for bytes. */
+export async function safeBody(res: Response): Promise<unknown> {
+  const contentType = (res.headers.get('content-type') ?? '').trim()
+  if (contentType && !TEXTUAL.test(contentType)) {
+    const bytes = new Uint8Array(await res.arrayBuffer())
+    let bin = ''
+    for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000))
+    return { content_type: contentType, size: bytes.byteLength, base64: btoa(bin) }
+  }
   const text = await res.text()
   // An MCP server may answer tools/call as an SSE stream; the caller wants the
   // JSON-RPC response in it, not the framing.

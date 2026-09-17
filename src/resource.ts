@@ -15,6 +15,7 @@ import type { ProxyLog } from './log.js'
 import type { AccessMode, ConnectionMetadata, L1Entry } from './store.js'
 import type {
   InvocationPlan,
+  LoadedDoc,
   InvokeArgs,
   OpDetail,
   OperationAnnotations,
@@ -158,17 +159,28 @@ function cacheKey(host: string, vocabUri: string): string {
   return `${host}|${vocabUri}`
 }
 
-// How long a fetched vocabulary doc is served before it is fetched again. Until
-// 4.5.1 there was no expiry: a host with a durable cache (aauth-mcp's R2) served
-// the first copy forever, so an operation a resource added later never appeared
-// (secret.agent.coop's createAccount, 2026-09-15).
+// How long a fetched vocabulary doc is served when the resource says nothing,
+// and the most it is ever served for. Until 4.5.1 there was no expiry: a host
+// with a durable cache (aauth-mcp's R2) served the first copy forever, so an
+// operation a resource added later never appeared (secret.agent.coop's
+// createAccount, 2026-09-15). Since 4.9.0 the resource's own Cache-Control
+// decides inside that hour, so a resource that sends max-age=300 has a changed
+// operation reach agents within five minutes of a deploy (secret-agent-coop
+// plan read-send-services section 12).
 export const DOC_TTL_MS = 60 * 60 * 1000
 
 // What the cache holds. A bare doc (written before 4.5.1) has no fetchedAt and
-// counts as expired.
+// counts as expired. An entry written by 4.5.1–4.8.x has no expiresAt and
+// expires DOC_TTL_MS after fetchedAt, as it did then.
 interface CachedDoc {
   aauth_doc_cache: 1
   fetchedAt: number
+  /** when this copy stops being served without asking the resource again */
+  expiresAt?: number
+  /** the lifetime that expiresAt came from, reused when a 304 carries no Cache-Control */
+  maxAgeMs?: number
+  /** the resource's ETag, sent back as If-None-Match once the copy has expired */
+  etag?: string
   doc: unknown
 }
 
@@ -176,21 +188,80 @@ function isCachedDoc(v: unknown): v is CachedDoc {
   return !!v && typeof v === 'object' && (v as CachedDoc).aauth_doc_cache === 1 && typeof (v as CachedDoc).fetchedAt === 'number'
 }
 
+/**
+ * How long a response may be served, from its Cache-Control (RFC 9111):
+ *   no-store             → 'no-store': do not keep it at all
+ *   no-cache             → 0: keep it, but ask every time (a 304 is enough)
+ *   s-maxage, max-age    → that many seconds, capped at one hour; s-maxage
+ *                          wins, since a host may share this cache
+ *   nothing usable       → one hour, as before 4.9.0
+ */
+export function docLifetimeMs(cacheControl: string | undefined): number | 'no-store' {
+  if (!cacheControl) return DOC_TTL_MS
+  const directives = new Map<string, string | undefined>()
+  for (const part of cacheControl.split(',')) {
+    const [name, value] = part.trim().split('=', 2)
+    if (name) directives.set(name.toLowerCase(), value?.trim().replace(/^"|"$/g, ''))
+  }
+  if (directives.has('no-store')) return 'no-store'
+  if (directives.has('no-cache')) return 0
+  for (const name of ['s-maxage', 'max-age']) {
+    const raw = directives.get(name)
+    if (raw === undefined || !/^\d+$/.test(raw)) continue
+    return Math.min(Number(raw) * 1000, DOC_TTL_MS)
+  }
+  return DOC_TTL_MS
+}
+
+function expiresAtOf(cached: CachedDoc): number {
+  return cached.expiresAt ?? cached.fetchedAt + DOC_TTL_MS
+}
+
 export async function loadDoc(host: string, vocab: PickedVocab, cache: DocCache, now = Date.now()): Promise<unknown> {
   const key = cacheKey(host, vocab.vocabUri)
   const cached = await cache.get(key)
-  if (isCachedDoc(cached) && now - cached.fetchedAt < DOC_TTL_MS) return cached.doc
-  let doc: unknown
+  // An entry emptied by no-store (below) holds nothing to serve.
+  const held = isCachedDoc(cached) && cached.doc !== undefined ? cached : undefined
+  if (held && now < expiresAtOf(held)) return held.doc
+
+  let loaded: LoadedDoc
   try {
-    doc = await vocab.adapter.load(vocab.docUrl)
+    // Expired with an ETag: revalidate, so an unchanged doc costs a 304.
+    loaded = vocab.adapter.loadCached
+      ? await vocab.adapter.loadCached(vocab.docUrl, held?.etag ? { ifNoneMatch: held.etag } : {})
+      : { doc: await vocab.adapter.load(vocab.docUrl) }
   } catch (e) {
     // The resource is unreachable right now: a stale copy beats no operations.
-    if (isCachedDoc(cached)) return cached.doc
-    if (cached !== undefined) return cached
+    if (held) return held.doc
+    // A bare doc written before 4.5.1.
+    if (cached !== undefined && !isCachedDoc(cached)) return cached
     throw e
   }
-  await cache.set(key, { aauth_doc_cache: 1, fetchedAt: now, doc } satisfies CachedDoc)
-  return doc
+
+  if (loaded.notModified) {
+    // Nothing held to renew: a 304 to a request that carried no ETag. Ask plainly.
+    if (!held) return vocab.adapter.load(vocab.docUrl)
+    // A 304 renews the copy without a new body. Its Cache-Control replaces the
+    // stored one; without one the lifetime the copy came with stands.
+    const lifetime = loaded.cacheControl === undefined ? (held.maxAgeMs ?? DOC_TTL_MS) : docLifetimeMs(loaded.cacheControl)
+    if (lifetime !== 'no-store') {
+      await cache.set(key, { ...held, fetchedAt: now, expiresAt: now + lifetime, maxAgeMs: lifetime, ...(loaded.etag ? { etag: loaded.etag } : {}) } satisfies CachedDoc)
+    }
+    return held.doc
+  }
+
+  const lifetime = docLifetimeMs(loaded.cacheControl)
+  // no-store: serve it for this call and keep nothing. The DocCache has no
+  // delete, so a copy stored under an earlier policy is overwritten as expired
+  // and without the doc it held.
+  if (lifetime === 'no-store') {
+    if (cached !== undefined) await cache.set(key, { aauth_doc_cache: 1, fetchedAt: 0, expiresAt: 0, doc: undefined } satisfies CachedDoc)
+    return loaded.doc
+  }
+  await cache.set(key, {
+    aauth_doc_cache: 1, fetchedAt: now, expiresAt: now + lifetime, maxAgeMs: lifetime, ...(loaded.etag ? { etag: loaded.etag } : {}), doc: loaded.doc,
+  } satisfies CachedDoc)
+  return loaded.doc
 }
 
 function rehydrate(picked: L1Entry['picked_vocabs']): PickedVocab[] {

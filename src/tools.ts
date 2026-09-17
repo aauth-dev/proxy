@@ -245,12 +245,15 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     return envelope?.clientInfo?.name ?? server.server.getClientVersion()?.name
   }
 
-  // Snapshot of L1 for tool descriptions, taken once at registration. Keeps the
-  // always-loaded context cheap; list_resources is the authoritative fresh view.
+  // Snapshot of L1 for tool descriptions, taken once at registration and never
+  // refreshed: connect_resources and delete_resource do not rewrite
+  // descriptions (a tools/list_changed would reload every tool and drop the
+  // client's prompt cache). Labelled as a snapshot so the model does not trust
+  // it after a connect; list_resources is the authoritative fresh view.
   const snapshot = (await l1.list()).map((e) => e.resource)
-  const l1Snapshot = snapshot.length === 0 ? 'no resources connected yet' : snapshot.join(', ')
+  const l1Snapshot = snapshot.length === 0 ? 'none' : snapshot.join(', ')
   const describeWithL1 = (base: string): string =>
-    `${base}\n\nCurrently connected resources: ${l1Snapshot}`
+    `${base}\n\nConnected when this session started: ${l1Snapshot}. Call list_resources for the current set.`
 
   // What this agent's setup can complete. An agent token with no `ps` claim has
   // no person server, so nothing beyond `agent-token` and `session-token` is
