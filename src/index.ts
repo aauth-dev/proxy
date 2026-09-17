@@ -49,6 +49,9 @@ export type { CanonicalHost } from './host.js'
 export {
   createMemoryDocCache,
   fetchResource,
+  fetchResourceConditional,
+  refreshResourceEntry,
+  docLifetimeMs,
   getOperationsForResource,
   listOperationsForResource,
   routeOperation,
@@ -58,6 +61,7 @@ export type {
   AAuthResourceMeta,
   DocCache,
   FetchedResource,
+  ResourceFetch,
   PickedVocab,
   RoutedOperation,
 } from './resource.js'

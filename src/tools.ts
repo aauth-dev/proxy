@@ -41,6 +41,7 @@ import { fetchRegistry, findEntry, isComing, orderCatalog } from './registry.js'
 import type { RegistryCache, RegistryEntry, RegistryIndex } from './registry.js'
 import {
   fetchResource,
+  refreshResourceEntry,
   getOperationsForResource,
   listOperationsForResource,
   toL1Entry,
@@ -288,33 +289,17 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
         ok: false,
         msg: `Resource not connected: ${canonical.host}. Call connect_resources({ items: [{ resource: "${canonical.host}" }] }) first.`,
       }
-    return { ok: true, l1: await refetchIfNoVocabs(entry) }
+    return { ok: true, l1: await refreshEntry(entry) }
   }
 
-  // An entry stored with no picked vocabularies has nothing to list or invoke.
-  // That is what a resource added before this build supported its vocabulary
-  // looks like (an MCP-only resource added before the MCP adapter was stored with
-  // picked_vocabs: []), and the stored entry would otherwise never change. So
-  // re-read the well-known and keep what this person has accumulated on the
-  // entry (added, last_used, connections). A resource that really advertises
-  // nothing usable costs one metadata fetch per call; a fetch that fails leaves
-  // the entry as it was.
-  async function refetchIfNoVocabs(entry: L1Entry): Promise<L1Entry> {
-    if (entry.picked_vocabs.length > 0) return entry
-    let fresh: L1Entry
-    try {
-      fresh = toL1Entry(await fetchResource(entry.resource, { log: deps.log }))
-    } catch {
-      return entry
-    }
-    if (fresh.picked_vocabs.length === 0) return entry
-    const next: L1Entry = {
-      ...fresh,
-      added: entry.added,
-      ...(entry.last_used ? { last_used: entry.last_used } : {}),
-      ...(entry.connections ? { connections: entry.connections } : {}),
-    }
-    await l1.upsert(next)
+  // The stored entry while its metadata is fresh, otherwise re-read from the
+  // resource's well-known per its Cache-Control (resource.ts
+  // refreshResourceEntry). An entry with no picked vocabularies is re-read
+  // whatever its age: that is what a resource added before this build supported
+  // its vocabulary looks like.
+  async function refreshEntry(entry: L1Entry): Promise<L1Entry> {
+    const { entry: next, changed } = await refreshResourceEntry(entry, { log: deps.log })
+    if (changed) await l1.upsert(next)
     return next
   }
 
@@ -639,7 +624,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
             entry = toL1Entry(await fetchResource(item.resource, { log: deps.log }))
             await l1.upsert(entry)
           } else {
-            entry = await refetchIfNoVocabs(entry)
+            entry = await refreshEntry(entry)
           }
         } catch (err) {
           rows.push({ resource: canonical.host, outcome: 'error', detail: (err as Error).message })

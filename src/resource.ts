@@ -50,9 +50,28 @@ export interface FetchedResource {
   origin: string
   meta: AAuthResourceMeta
   pickedVocabs: PickedVocab[]
+  /** The response's Cache-Control and ETag: how long the entry made from this may be used (refreshResourceEntry). */
+  cacheControl?: string
+  etag?: string
 }
 
+/** fetchResourceConditional: the resource, or notModified for a 304 to If-None-Match. */
+export type ResourceFetch =
+  | ({ notModified?: false } & FetchedResource)
+  | { notModified: true; cacheControl?: string; etag?: string }
+
 export async function fetchResource(hostOrUrl: string, opts: { log?: ProxyLog } = {}): Promise<FetchedResource> {
+  const fetched = await fetchResourceConditional(hostOrUrl, { log: opts.log })
+  if (fetched.notModified) throw new Error(`resource ${hostOrUrl}: 304 to an unconditional request`)
+  return fetched
+}
+
+// The well-known, with the response's caching headers, and conditional on an
+// ETag the stored entry already holds.
+export async function fetchResourceConditional(
+  hostOrUrl: string,
+  opts: { log?: ProxyLog; ifNoneMatch?: string } = {},
+): Promise<ResourceFetch> {
   const canonical = canonicalizeHost(hostOrUrl)
   if (!canonical) throw new Error(`invalid host: ${hostOrUrl}`)
   const { host, origin } = canonical
@@ -61,9 +80,12 @@ export async function fetchResource(hostOrUrl: string, opts: { log?: ProxyLog } 
   const res = await loggedFetch(opts.log, 'resource.fetch', { host }, () =>
     fetch(url, {
       redirect: 'manual',
-      headers: { accept: 'application/json' },
+      headers: { accept: 'application/json', ...(opts.ifNoneMatch ? { 'if-none-match': opts.ifNoneMatch } : {}) },
     }),
   )
+  const cacheControl = res.headers.get('cache-control') ?? undefined
+  const etag = res.headers.get('etag') ?? undefined
+  if (res.status === 304 && opts.ifNoneMatch) return { notModified: true, cacheControl, etag }
   if (res.status >= 300 && res.status < 400) {
     throw new Error(`resource ${host}: unexpected redirect`)
   }
@@ -77,6 +99,8 @@ export async function fetchResource(hostOrUrl: string, opts: { log?: ProxyLog } 
     origin,
     meta,
     pickedVocabs: pickVocabs(meta.r3_vocabularies ?? {}, origin),
+    ...(cacheControl !== undefined ? { cacheControl } : {}),
+    ...(etag !== undefined ? { etag } : {}),
   }
 }
 
@@ -360,7 +384,7 @@ export async function routeOperation(
 // but no access_mode, infer auth-token (the R3 flow is the only thing
 // authorization_endpoint exists for). Absent both, default to agent-token
 // (resource accepts agent-signed requests directly — the registry's own mode).
-export function toL1Entry(r: FetchedResource): L1Entry {
+export function toL1Entry(r: FetchedResource, now = Date.now()): L1Entry {
   const inferredMode: AccessMode =
     r.meta.access_mode ?? (r.meta.authorization_endpoint ? 'auth-token' : 'agent-token')
   return {
@@ -380,6 +404,75 @@ export function toL1Entry(r: FetchedResource): L1Entry {
     ...(typeof r.meta.interaction_endpoint === 'string' ? { interaction_endpoint: r.meta.interaction_endpoint } : {}),
     ...(r.meta.connection && typeof r.meta.connection.endpoint === 'string' ? { connection: r.meta.connection } : {}),
     picked_vocabs: r.pickedVocabs.map((v) => ({ vocabUri: v.vocabUri, docUrl: v.docUrl })),
-    added: new Date().toISOString(),
+    added: new Date(now).toISOString(),
+    ...metaLifetime(r.cacheControl, r.etag, now),
+  }
+}
+
+// ── Keeping a stored entry current ──
+//
+// An L1 entry is the person's record of a resource, so it is always kept; what
+// expires is the metadata on it. The rule is loadDoc's: the resource's
+// Cache-Control decides, at most one hour, and an expired entry with an ETag is
+// revalidated with If-None-Match. no-store cannot mean "keep nothing" here, so
+// it means what no-cache means: ask every time. Until 4.10.0 the well-known was
+// read once at connect_resources and never again, so a changed access_mode,
+// connection object or vocabulary URL reached nobody who was already connected.
+
+function metaLifetime(cacheControl: string | undefined, etag: string | undefined, now: number): Pick<L1Entry, 'meta_expires_at' | 'meta_max_age_ms' | 'meta_etag'> {
+  const lifetime = docLifetimeMs(cacheControl)
+  const ms = lifetime === 'no-store' ? 0 : lifetime
+  return { meta_expires_at: now + ms, meta_max_age_ms: ms, ...(etag ? { meta_etag: etag } : {}) }
+}
+
+/**
+ * The entry to use now: the stored one while it is fresh, otherwise re-read
+ * from the well-known. What the person has accumulated on the entry (added,
+ * last_used, connections) is kept. `changed` says the caller should store it.
+ * A fetch that fails, or a resource that suddenly advertises nothing usable,
+ * leaves the entry as it was: a stale entry beats none.
+ */
+export async function refreshResourceEntry(
+  entry: L1Entry,
+  opts: { log?: ProxyLog; now?: number } = {},
+): Promise<{ entry: L1Entry; changed: boolean }> {
+  const now = opts.now ?? Date.now()
+  // An entry with no usable vocabulary is re-read whatever its age: that is
+  // what a resource added before its vocabulary was supported looks like.
+  const fresh = entry.meta_expires_at !== undefined && now < entry.meta_expires_at
+  if (fresh && entry.picked_vocabs.length > 0) return { entry, changed: false }
+
+  let fetched: ResourceFetch
+  try {
+    fetched = await fetchResourceConditional(entry.resource, { log: opts.log, ...(entry.meta_etag ? { ifNoneMatch: entry.meta_etag } : {}) })
+  } catch {
+    return { entry, changed: false }
+  }
+
+  if (fetched.notModified) {
+    const lifetime = fetched.cacheControl === undefined ? (entry.meta_max_age_ms ?? DOC_TTL_MS) : docLifetimeMs(fetched.cacheControl)
+    const ms = lifetime === 'no-store' ? 0 : lifetime
+    return {
+      entry: { ...entry, meta_expires_at: now + ms, meta_max_age_ms: ms, ...(fetched.etag ? { meta_etag: fetched.etag } : {}) },
+      changed: true,
+    }
+  }
+
+  const next = toL1Entry(fetched, now)
+  if (next.picked_vocabs.length === 0) {
+    // The resource advertises nothing this build can use. An entry that never
+    // had a vocabulary stays exactly as it was (and is asked again next call);
+    // one that has them keeps what works and is asked again after this lifetime.
+    if (entry.picked_vocabs.length === 0) return { entry, changed: false }
+    return { entry: { ...entry, meta_expires_at: next.meta_expires_at, meta_max_age_ms: next.meta_max_age_ms }, changed: true }
+  }
+  return {
+    entry: {
+      ...next,
+      added: entry.added,
+      ...(entry.last_used ? { last_used: entry.last_used } : {}),
+      ...(entry.connections ? { connections: entry.connections } : {}),
+    },
+    changed: true,
   }
 }

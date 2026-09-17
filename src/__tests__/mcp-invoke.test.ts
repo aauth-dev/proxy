@@ -253,14 +253,33 @@ describe('an entry stored with no picked vocabularies is re-read', () => {
     }
   })
 
-  it('does not re-read an entry that already has vocabularies', async () => {
+  it('does not re-read an entry whose metadata is still fresh', async () => {
     const host = 'fresh.example'
     const hits = routeFetch({ [host]: mcpWellKnown(host) })
-    const store = memoryL1([l1(host, { vocabUri: 'urn:aauth:vocabulary:mcp', docUrl: `https://${host}/mcp` })])
+    const store = memoryL1([{ ...l1(host, { vocabUri: 'urn:aauth:vocabulary:mcp', docUrl: `https://${host}/mcp` }), meta_expires_at: Date.now() + 60_000 }])
     const { client, close } = await connectClient(store)
     try {
       await client.callTool({ name: 'list_operations', arguments: { resource: host } })
       expect(hits).not.toContain(`https://${host}/.well-known/aauth-resource.json`)
+    } finally {
+      await close()
+    }
+  })
+
+  // 4.10.0: an entry stored by an earlier version records no lifetime, so it is
+  // re-read on its next use, once; after that its own lifetime applies.
+  it('re-reads an entry stored before 4.10.0 once, then not again inside its lifetime', async () => {
+    const host = 'older.example'
+    const hits = routeFetch({ [host]: mcpWellKnown(host) })
+    const store = memoryL1([l1(host, { vocabUri: 'urn:aauth:vocabulary:mcp', docUrl: `https://${host}/mcp` })])
+    const { client, close } = await connectClient(store)
+    const wellKnown = `https://${host}/.well-known/aauth-resource.json`
+    try {
+      await client.callTool({ name: 'list_operations', arguments: { resource: host } })
+      expect(hits.filter((u) => u === wellKnown)).toHaveLength(1)
+      expect(store.map.get(host)!.meta_expires_at).toBeGreaterThan(Date.now())
+      await client.callTool({ name: 'list_operations', arguments: { resource: host } })
+      expect(hits.filter((u) => u === wellKnown)).toHaveLength(1)
     } finally {
       await close()
     }
