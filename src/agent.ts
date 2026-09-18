@@ -143,6 +143,13 @@ export type InvokeResult =
   | { kind: 'result'; status: number; body: unknown; budget?: BudgetStatus }
   | { kind: 'interaction'; interaction: Interaction }
   /**
+   * The PS is reaching the person by its own channels (`requirement=approval`)
+   * and had not answered within the in-call wait. The caller keeps `pollUrl`
+   * and polls it on the retry: the pending delivers the token, and a fresh
+   * request would mint a new one.
+   */
+  | { kind: 'pending'; pollUrl: string }
+  /**
    * The resource (or this operation) declares an access mode this agent's setup
    * cannot complete — typically `auth-token` or `person-token` at an agent whose
    * agent token carries no `ps` claim. No request was made. Case (c) of the
@@ -328,6 +335,13 @@ function interactionFrom(res: Response, publishedUrl?: string): Interaction | un
   return url ? { url, code: parsed.code, pollUrl } : undefined
 }
 
+// A 202 that advertises an interaction code. The URL may still come from
+// metadata; this is only whether to stop polling and surface it.
+function advertisesInteraction(res: Response): boolean {
+  const parsed = parseRequirement(res.headers.get('aauth-requirement'))
+  return parsed?.requirement === 'interaction' && !!parsed.code
+}
+
 // A 202 that carries no interaction code: the PS is reaching the person by
 // its own channels (an open wallet tab, a registered device) and the agent
 // has only the poll URL — `requirement=approval`. Poll it; a later poll may
@@ -337,16 +351,18 @@ function pendingFrom(res: Response): string | undefined {
   return res.headers.get('location') ?? undefined
 }
 
-// Poll a PS pending URL to completion on the agent's behalf. Terminal 2xx →
-// the body; a 202 that (now) advertises an interaction → the interaction to
-// surface; a 202 at the deadline → still pending; anything else → the result.
+// Poll a PS pending URL on the agent's behalf. Terminal 2xx → the body; a 202
+// that advertises an interaction → the interaction to surface, at once — the
+// PS falls back from approval to interaction ~10 s in, and the person needs
+// the URL before the client gives up on the tool call (issue #21); a 202 at
+// the deadline → still pending; anything else → the result.
 async function drivePending(
   cfg: ProxyConfig,
   pollUrl: string,
   publishedUrl: string | undefined,
   timeoutMs: number,
 ): Promise<{ kind: 'done'; body: unknown; res: Response } | { kind: 'interaction'; interaction: Interaction } | { kind: 'pending' } | { kind: 'result'; status: number; body: unknown }> {
-  const res = await pollUntilDone(makeAgentPoll(cfg), pollUrl, timeoutMs)
+  const res = await pollUntilDone(makeAgentPoll(cfg), pollUrl, timeoutMs, undefined, advertisesInteraction)
   if (res.status === 202) {
     const interaction = interactionFrom(res, publishedUrl)
     return interaction ? { kind: 'interaction', interaction } : { kind: 'pending' }
@@ -442,6 +458,7 @@ function sessionTokenStore(cfg: ProxyConfig): SessionTokenStore {
 type PersonTokenOutcome =
   | { kind: 'token'; personToken: string }
   | { kind: 'interaction'; interaction: Interaction }
+  | { kind: 'pending'; pollUrl: string }
   | { kind: 'result'; status: number; body: unknown }
 
 /**
@@ -513,7 +530,7 @@ export async function obtainPersonToken(
     // The PS is reaching the person itself; wait here.
     const driven = await drivePending(cfg, pollUrl, ps.interaction_endpoint, PS_REACH_TIMEOUT_MS)
     if (driven.kind === 'interaction') return driven
-    if (driven.kind === 'pending') return { kind: 'result', status: 202, body: { error: 'ps_reach_timeout', poll_url: pollUrl } }
+    if (driven.kind === 'pending') return { kind: 'pending', pollUrl }
     if (driven.kind === 'result') return driven
     body = driven.body as typeof body
   } else {
@@ -548,17 +565,19 @@ type Poller = (url: string) => Promise<Response>
 //
 // `onPoll` (optional) is invoked once per poll iteration with elapsed ms — a
 // heartbeat hook for hosts that hold a request open (e.g. emit progress
-// notifications over a long-running tool call).
+// notifications over a long-running tool call). `stop` (optional) ends the
+// wait early on a 202 the caller wants to act on.
 export async function pollUntilDone(
   poll: Poller,
   locationUrl: string,
   timeoutMs = 180_000,
   onPoll?: (elapsedMs: number) => void | Promise<void>,
+  stop?: (res: Response) => boolean,
 ): Promise<Response> {
   const start = Date.now()
   const deadline = start + timeoutMs
   let res = await poll(locationUrl)
-  while (res.status === 202 && Date.now() < deadline) {
+  while (res.status === 202 && Date.now() < deadline && !stop?.(res)) {
     await onPoll?.(Date.now() - start)
     await new Promise((r) => setTimeout(r, 1000))
     res = await poll(locationUrl)
@@ -574,8 +593,10 @@ type ExchangeOutcome =
   | { kind: 'result'; status: number; body: unknown }
 
 // How long the agent waits on a PS that is reaching the person itself before
-// handing the wait back to the caller (a person at a wallet tab, not a machine).
-const PS_REACH_TIMEOUT_MS = 180_000
+// handing the wait back to the caller as `pending`. One invoke can wait twice
+// (person token, then the exchange), and MCP clients abandon a tool call at
+// about 60 s, so each wait stays well under half of that.
+const PS_REACH_TIMEOUT_MS = 20_000
 
 // Exchange a resource token at the PS for an auth token. `capabilities` tells the
 // PS the agent can relay interactions to the user, so it returns a 202 consent
@@ -633,12 +654,12 @@ async function tokenFrom(cfg: ProxyConfig, body: { auth_token?: string }): Promi
 
 // Exchange, and when the PS is reaching the person itself, wait for it —
 // the invoke path has nothing else to do until the token exists.
-async function exchangeAtPSAndWait(cfg: ProxyConfig, ps: PSMetadata, resourceToken: string, presentedToken?: string): Promise<Exclude<ExchangeOutcome, { kind: 'pending' }>> {
+async function exchangeAtPSAndWait(cfg: ProxyConfig, ps: PSMetadata, resourceToken: string, presentedToken?: string): Promise<ExchangeOutcome> {
   const ex = await exchangeAtPS(cfg, ps, resourceToken, presentedToken)
   if (ex.kind !== 'pending') return ex
   const driven = await drivePending(cfg, ex.pollUrl, ps.interaction_endpoint, PS_REACH_TIMEOUT_MS)
   if (driven.kind === 'interaction') return driven
-  if (driven.kind === 'pending') return { kind: 'result', status: 202, body: { error: 'ps_reach_timeout', poll_url: ex.pollUrl } }
+  if (driven.kind === 'pending') return ex
   if (driven.kind === 'result') return driven
   return tokenFrom(cfg, driven.body as { auth_token?: string })
 }
@@ -927,6 +948,12 @@ export async function invokeAtResourceComplete(
     if (result.kind === 'skipped') {
       return { status: 0, body: { error: 'access_mode_unsatisfiable', ...result } }
     }
+    if (result.kind === 'pending') {
+      // The PS is still reaching the person. Keep waiting; if it falls back
+      // to an interaction, the next round surfaces it.
+      await pollUntilDone(poll, result.pollUrl, pollTimeoutMs, onPoll, advertisesInteraction)
+      continue
+    }
     await onInteraction(result.interaction.url, result.interaction.code)
     const completed = await pollUntilDone(poll, result.interaction.pollUrl, pollTimeoutMs, onPoll)
     // A resource-managed consent settles with the session token on the poll
@@ -991,6 +1018,7 @@ export async function connectAtResource(cfg: ProxyConfig, l1: L1Entry, args: Con
   const ps = await psMetadata(cfg.psUrl)
   const pt = await obtainPersonToken(cfg, ps, l1.issuer, cfg.missionS256)
   if (pt.kind === 'interaction') return { kind: 'interaction', interaction: pt.interaction }
+  if (pt.kind === 'pending') return { kind: 'still_pending', pollUrl: pt.pollUrl }
   if (pt.kind !== 'token') return { kind: 'error', status: pt.status, body: pt.body }
 
   const res = await signWith(cfg, { kind: 'person', jwt: pt.personToken })(l1.connection.endpoint, {
@@ -1035,7 +1063,9 @@ export async function connectAtResource(cfg: ProxyConfig, l1: L1Entry, args: Con
 export async function pollConnection(cfg: ProxyConfig, pending: string | Interaction, budgetMs: number, onPoll?: (elapsedMs: number) => void | Promise<void>): Promise<ConnectOutcome> {
   const pollUrl = typeof pending === 'string' ? pending : pending.pollUrl
   const prior = typeof pending === 'string' ? undefined : pending
-  const res = await pollUntilDone(makeAgentPoll(cfg), pollUrl, budgetMs, onPoll)
+  // With no interaction known yet, one the PS starts advertising ends the wait:
+  // the person needs its URL now, not at the end of the slice.
+  const res = await pollUntilDone(makeAgentPoll(cfg), pollUrl, budgetMs, onPoll, prior ? undefined : advertisesInteraction)
   if (res.status === 202) {
     const advertised = interactionFrom(res, prior?.url ?? (await psMetadata(cfg.psUrl).catch(() => undefined))?.interaction_endpoint)
     const interaction = advertised ?? prior
