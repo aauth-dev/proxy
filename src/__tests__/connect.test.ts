@@ -207,6 +207,62 @@ describe('pollConnection (B2 slice)', () => {
   })
 })
 
+describe('invoke on the approval → interaction fallback (issue #21)', () => {
+  const agentTokenOp = () =>
+    mockRouteOperation.mockResolvedValue({
+      adapter: { vocabUri: 'urn:aauth:vocabulary:openapi', operationEntry: (id: string) => ({ operationId: id }) },
+      plan: { kind: 'sync.request', method: 'GET', path: '/x', query: '' },
+      annotations: {},
+      accessMode: 'agent-token',
+    })
+  const approval = () => makeResponse(202, { status: 'pending' }, { 'aauth-requirement': 'requirement=approval', location: 'https://ps.example/pending/P' })
+
+  it('surfaces the interaction as soon as a poll advertises it, without waiting out the PS', async () => {
+    mockPSWellKnown()
+    agentTokenOp()
+    mockSignedFetch
+      .mockResolvedValueOnce(makeResponse(401, {}, { 'aauth-requirement': 'requirement=auth-token; resource-token="rt1"' }))
+      .mockResolvedValueOnce(approval())
+      .mockResolvedValueOnce(approval())
+      .mockResolvedValue(makeResponse(202, { status: 'pending' }, { 'aauth-requirement': 'requirement=interaction; code="1T87-J12E"', location: 'https://ps.example/pending/P' }))
+    const start = Date.now()
+    const out = await invokeAtResource(config(), l1(), 'x')
+    expect(out).toEqual({
+      kind: 'interaction',
+      interaction: { url: 'https://ps.example/auth', code: '1T87-J12E', pollUrl: 'https://ps.example/pending/P' },
+    })
+    // exchange, two polls: one sleep between them, then stop
+    expect(mockSignedFetch).toHaveBeenCalledTimes(4)
+    expect(Date.now() - start).toBeLessThan(5_000)
+  })
+
+  it('hands the wait back as pending with the poll URL instead of blocking the tool call', async () => {
+    vi.useFakeTimers()
+    try {
+      mockPSWellKnown()
+      agentTokenOp()
+      mockSignedFetch
+        .mockResolvedValueOnce(makeResponse(401, {}, { 'aauth-requirement': 'requirement=auth-token; resource-token="rt1"' }))
+        .mockResolvedValue(approval())
+      const pending = invokeAtResource(config(), l1(), 'x')
+      await vi.advanceTimersByTimeAsync(25_000)
+      expect(await pending).toEqual({ kind: 'pending', pollUrl: 'https://ps.example/pending/P' })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a pending connection poll stops as soon as the PS advertises an interaction', async () => {
+    mockPSWellKnown()
+    mockSignedFetch
+      .mockResolvedValueOnce(approval())
+      .mockResolvedValue(makeResponse(202, { status: 'pending' }, { 'aauth-requirement': 'requirement=interaction; code="C"', location: 'https://ps.example/pending/P' }))
+    const out = await pollConnection(config(), 'https://ps.example/pending/P', 60_000)
+    expect(out).toEqual({ kind: 'still_pending', pollUrl: 'https://ps.example/pending/P', interaction: { url: 'https://ps.example/auth', code: 'C', pollUrl: 'https://ps.example/pending/P' } })
+    expect(mockSignedFetch).toHaveBeenCalledTimes(2)
+  })
+})
+
 describe('listConnections / disconnectAll', () => {
   it('GETs the collection with the person token and returns the rows', async () => {
     mockPSWellKnown()
