@@ -966,6 +966,18 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
         )
       }
 
+      if (result.kind === 'pending') {
+        // The PS is reaching the person itself and had not answered in the
+        // in-call wait. Record the flight so the retry polls this pending —
+        // it delivers the token, and it re-advertises the interaction code
+        // if the PS falls back to one.
+        await inflight.set(host, { pollUrl: result.pollUrl, startedAt: Date.now() })
+        return text(
+          `Authorization for ${host} is in progress.\n\n` +
+            `The person server is asking the person directly (an open wallet tab or a device). Retry invoke now; if the person server falls back to a link, the retry returns the authorization URL to show them.`,
+        )
+      }
+
       if (result.kind === 'interaction') {
         // Record the flight FIRST: onInteraction may throw (cloud hosts raise
         // an MCP URL elicitation) and the retry must find it either way.
