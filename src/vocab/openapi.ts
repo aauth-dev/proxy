@@ -129,6 +129,51 @@ function getOps(doc: OpenAPIVocabDoc): Map<string, ResolvedOp> {
   return ops
 }
 
+// `$ref` inlining. get_operation_schemas is the only place an LLM sees a body
+// schema, and a bare `{"$ref": "#/components/schemas/Identifier"}` tells it
+// nothing — two testers onboarding to secret.agent.coop had to guess the
+// `mailto:` form from prose (2026-09-17, 2026-09-18). Resolve local refs
+// against the document's own components and inline what they point at.
+//
+// A ref already on the stack is a cycle (a tree node whose children are the
+// same schema): leave it as the `$ref` it was, so the shape stays finite and
+// the LLM still sees the name. Anything non-local (another file, a URL) or
+// unresolvable is left alone as well.
+const MAX_REF_DEPTH = 12
+
+function resolvePointer(doc: OpenAPIDoc, ref: string): unknown {
+  if (!ref.startsWith('#/')) return undefined
+  let node: unknown = doc
+  for (const raw of ref.slice(2).split('/')) {
+    const key = decodeURIComponent(raw.replace(/~1/g, '/').replace(/~0/g, '~'))
+    if (!node || typeof node !== 'object') return undefined
+    node = (node as Record<string, unknown>)[key]
+  }
+  return node
+}
+
+function inlineRefs(value: unknown, doc: OpenAPIDoc, stack: string[] = []): unknown {
+  if (Array.isArray(value)) return value.map((v) => inlineRefs(v, doc, stack))
+  if (!value || typeof value !== 'object') return value
+  const obj = value as Record<string, unknown>
+  const ref = obj.$ref
+  if (typeof ref === 'string') {
+    if (stack.includes(ref) || stack.length >= MAX_REF_DEPTH) return value
+    const target = resolvePointer(doc, ref)
+    if (target === undefined) return value
+    const inlined = inlineRefs(target, doc, [...stack, ref])
+    // A sibling of `$ref` (OpenAPI 3.1 allows `description`, `title`, …)
+    // overrides what the target says.
+    const { $ref: _dropped, ...siblings } = obj
+    return Object.keys(siblings).length > 0 && inlined && typeof inlined === 'object' && !Array.isArray(inlined)
+      ? { ...(inlined as Record<string, unknown>), ...inlineRefs(siblings, doc, stack) as Record<string, unknown> }
+      : inlined
+  }
+  const out: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(obj)) out[k] = inlineRefs(v, doc, stack)
+  return out
+}
+
 // Annotations are sparse: emit the field only when the operation carries one, so
 // unannotated documents cost nothing extra in the listing the LLM reads.
 function annotationsField(op: ResolvedOp): { annotations?: OperationAnnotations } {
@@ -189,9 +234,9 @@ export class OpenAPIAdapter implements VocabAdapter<OpenAPIVocabDoc> {
         path: op.path,
         tags: op.tags,
         ...annotationsField(op),
-        paramsSchema: op.parameters,
-        bodySchema: op.requestBody,
-        responseSchema: op.responses,
+        paramsSchema: inlineRefs(op.parameters, doc.raw),
+        bodySchema: inlineRefs(op.requestBody, doc.raw),
+        responseSchema: inlineRefs(op.responses, doc.raw),
       })
     }
     return out
