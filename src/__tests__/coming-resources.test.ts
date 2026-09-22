@@ -27,7 +27,7 @@ const INDEX: RegistryIndex = {
   resources: [
     {
       issuer: 'https://gmail-googleapis-com.proxy.aauth.dev',
-      name: 'Gmail AAuth Connector',
+      name: 'Gmail AAuth Proxy',
       description: 'Gmail fronted with AAuth.',
       access_mode: 'person-token',
       added: '2026-09-15T00:00:00.000Z',
@@ -37,7 +37,7 @@ const INDEX: RegistryIndex = {
     },
     {
       issuer: 'https://slack-com.proxy.aauth.dev',
-      name: 'Slack AAuth Connector',
+      name: 'Slack AAuth Proxy',
       description: 'Slack fronted with AAuth.',
       access_mode: 'person-token',
       added: '2026-09-15T00:00:00.000Z',
