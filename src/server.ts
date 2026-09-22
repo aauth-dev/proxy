@@ -115,7 +115,7 @@ setupFrameLog()
 // exchange pins one server instance from this factory to the connection and
 // serves both the 2026-07-28 revision and the 2025-era initialize handshake.
 serveStdio(async () => {
-  const server = new McpServer({ name: 'aauth-proxy', version: PKG_VERSION })
+  const server = new McpServer({ name: 'aauth-connector', title: 'AAuth Connector', version: PKG_VERSION })
   await buildProxyTools(server, {
     l1: createFsL1Store(),
     registryCache: createFsRegistryCache(),

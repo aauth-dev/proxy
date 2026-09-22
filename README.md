@@ -1,15 +1,15 @@
 # @aauth/proxy
 
-MCP stdio server that represents you as an agent in the [AAuth](https://github.com/DickHardt/AAuth) protocol. The LLM sees a fixed eight-tool surface; new resources and operations are surfaced through the same tools, regardless of how many you add.
+AAuth Connector: an MCP stdio server that represents you as an agent in the [AAuth](https://github.com/DickHardt/AAuth) protocol. The LLM sees a fixed eight-tool surface; new resources and operations are surfaced through the same tools, regardless of how many you add.
 
-Your AAuth signing key is bound to this machine via [`@aauth/local-keys`](https://www.npmjs.com/package/@aauth/local-keys) — non-extractable when a Secure Enclave, TPM, or YubiKey is available; software-backed otherwise. The agent proxy holds no upstream service credentials.
+Your AAuth signing key is bound to this machine via [`@aauth/local-keys`](https://www.npmjs.com/package/@aauth/local-keys) — non-extractable when a Secure Enclave, TPM, or YubiKey is available; software-backed otherwise. AAuth Connector holds no upstream service credentials.
 
 Design and protocol details: [`design.md`](./design.md).
 
 ## Prerequisites
 
 - Node ≥ 22.
-- An AAuth identity on this machine. If none exists, the agent proxy's MCP server still starts; the first tool call returns a bootstrap prompt that points the LLM at [`@aauth/bootstrap`](https://www.npmjs.com/package/@aauth/bootstrap). The agent proxy picks the identity up on the next call — no restart.
+- An AAuth identity on this machine. If none exists, AAuth Connector's MCP server still starts; the first tool call returns a bootstrap prompt that points the LLM at [`@aauth/bootstrap`](https://www.npmjs.com/package/@aauth/bootstrap). AAuth Connector picks the identity up on the next call — no restart.
 
 ```sh
 npx @aauth/bootstrap setup
@@ -22,7 +22,7 @@ npx @aauth/bootstrap setup
 ```json
 {
   "mcpServers": {
-    "aauth-proxy": { "command": "npx", "args": ["-y", "@aauth/proxy"] }
+    "aauth-connector": { "command": "npx", "args": ["-y", "@aauth/proxy"] }
   }
 }
 ```
@@ -34,7 +34,7 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) o
 ```json
 {
   "mcpServers": {
-    "aauth-proxy": { "command": "npx", "args": ["-y", "@aauth/proxy"] }
+    "aauth-connector": { "command": "npx", "args": ["-y", "@aauth/proxy"] }
   }
 }
 ```
@@ -45,7 +45,7 @@ Settings → MCP → Add new server, then add:
 
 ```json
 {
-  "aauth-proxy": { "command": "npx", "args": ["-y", "@aauth/proxy"] }
+  "aauth-connector": { "command": "npx", "args": ["-y", "@aauth/proxy"] }
 }
 ```
 
