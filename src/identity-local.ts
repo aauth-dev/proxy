@@ -13,6 +13,7 @@ import { readFileSync } from 'node:fs'
 import { createAgentToken, getAgentConfig, listAgentProviders } from '@aauth/local-keys'
 import type { AgentSigningKey, ProxyConfig } from './agent.js'
 import type { IdentityProvider } from './identity.js'
+import { REFRESH_MARGIN_SECS } from './tokens.js'
 
 // httpsig 2.0 (signature-key -08) takes the signing algorithm from the JWK's
 // `alg` member, which must be fully specified (RFC 9864) — the polymorphic
@@ -87,7 +88,10 @@ export async function buildConfigFromLocalKeys(
 }
 
 // Returns true if the JWT's exp claim is within bufferSecs of now (or missing).
-function isJwtExpired(jwt: string, bufferSecs = 60): boolean {
+// The default is the protocol's refresh margin (§Refresh Margin): every person
+// and auth token is capped at the agent token's exp, so an agent token kept to
+// its last minute makes every token obtained with it short.
+function isJwtExpired(jwt: string, bufferSecs = REFRESH_MARGIN_SECS): boolean {
   try {
     const payload = JSON.parse(Buffer.from(jwt.split('.')[1], 'base64url').toString('utf8'))
     return typeof payload.exp === 'number' && payload.exp - bufferSecs < Date.now() / 1000

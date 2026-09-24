@@ -102,8 +102,6 @@ Three layers, all file-backed, all per-machine.
 | `resources.json` | **L1** — added resources: `{ resource, name, description, access_mode, picked_vocabs[], last_used }[]` | written on `add_resource` / `remove_resource` / first successful auth |
 | `catalog/registry.json` | **L2** — cached `GET registry.aauth.dev/resources` result | refreshed on startup + 24h background; ETag-conditional |
 | `catalog/{host}/{vocab}.json` | **L3** — cached vocabulary docs (OpenAPI / AsyncAPI / …) per resource | fetched on first `list_operations`/`get_operation_schemas`; cached per the resource's `Cache-Control`, at most one hour; ETag-conditional on expiry |
-| `connections/{host}.json` | per-resource session state — stored auth-tokens, refresh state, last interaction | written by R3 flow |
-| `person-tokens.json` | PS-issued person tokens, keyed `(resource, mission_s256)`, plus the thumbprint of the agent key they all bind | written on person-token acquisition; flushed whole on key rotation |
 | `pending-interactions.json` | open interactions awaiting user resolution | written/cleared as interactions open and resolve |
 
 JSON files for v1; promote to SQLite if concurrent writes get painful. File-lock for concurrent writes (multiple host clients OK).
@@ -164,7 +162,35 @@ AAuth -11 makes the person token load-bearing: a resource MUST have verified one
 
 Acquisition is a signed POST to the PS's `person_token_endpoint` (published in `/.well-known/aauth-person.json` alongside `auth_token_endpoint`, renamed from `token_endpoint` in -11), presenting the agent token via `Signature-Key`, with `{ resource, mission_s256? }` as the body. Requests carrying a body to a PS or AS additionally cover `content-digest` and `content-type` in the signature. `200` returns `{ person_token, expires_in }`; `202` with `requirement=interaction` is the deferred path — the PS wants the user to approve this agent acting at this resource, and the agent proxy surfaces it like any other interaction rather than blocking.
 
-**Caching.** A person token is scoped to one resource and, when it carries `mission_s256`, to one mission, so the cache key is the pair. Every person token binds the same key through `cnf`, so a signing-key rotation invalidates the whole set at once — the store records the RFC 7638 thumbprint it was populated under and flushes everything the moment a different one is presented. There is no partial invalidation and no migration.
+**Caching.** A person token is scoped to one resource and, when it carries `mission_s256`, to one mission, so it is held under that pair in the token store (see "Tokens"). It is refreshed inside the refresh margin when the agent token lets a replacement live longer, because every auth token obtained with it is capped at its `exp`; if the refresh fails, the held one is presented until it expires.
+
+## Tokens
+
+One store holds every token the agent holds (`tokens.ts`, `ProxyConfig.tokens` / `ProxyDeps.tokens`). They are one chain — agent token → person token → auth token — whose `exp`s are capped downward (protocol §Refresh Margin), and all of them bind the agent key through `cnf`, so one store gives one expiry rule and one flush. Each record carries the RFC 7638 thumbprint of the key it binds; a record under another thumbprint means the key rotated, and the whole store is flushed.
+
+**One record per key.** `agent ()`, `person (resource, mission_s256)`, `auth (resource, account, mission_s256)`, `session (resource)`. `put` replaces what the key held, so the agent holds exactly one auth token per resource, account and mission.
+
+**The held auth token.** On an authorize-first call (`auth-token` / `per-call`):
+
+| State at use time | Action |
+|---|---|
+| Held, grants the operation | Present it. One request. Inside the refresh margin too (below). |
+| Held, does not grant the operation | Authorize for the union of what it grants and the operation. The new token replaces it. |
+| Lapsed while in use (used in the last `ACTIVE_WITHIN_SECS`, 5 min) | Authorize for everything it granted plus the operation — the work is still going on. |
+| None, or lapsed idle | Authorize for the operation (plus what the ScopePolicy adds). The activity that needed the old grant is over. |
+| The resource answers `requirement=auth-token` (budget spent, revoked, step-up) | Exchange that resource token with the presented token as `presented_token`, under the key's lease. The result replaces the held token when it grants at least as much, or when the held one's budget is spent; anything narrower is used for this call only. |
+| A `per-call` operation's proposal token | Presented once, never held. |
+| A token a settled pending delivered | Presented. Held only when its `account` and `mission_s256` match the call's key, it grants the operation, and it grants at least what the key holds — the pending is tracked per host, not per key. |
+
+"Grants" reads the token's own `r3_granted` / `r3_per_call`; a token that grants by `scope` alone is presented and the resource decides. Budgets are why this matters: an access server that meters a person's allowance reserves every auth token it issues in full until it expires, so an agent that obtains one per call exhausts the allowance on a handful of calls (senzing.aauth.dev, 2026-09-24). What the resource reports in `AAuth-Budget` is kept on the record and shown by `list_resources`, but never used to refuse a call — an exhausted token is presented so the resource answers with the step-up that carries its consumption record.
+
+**No refresh inside the margin for auth tokens.** An auth token's `exp` is capped by the agent token, and an access server may clip it to the end of its budget period (access.aauth.dev: the top of the UTC hour). Neither is moved by a refresh, and every refresh is another allocation — so a held auth token is presented until it lapses (30 s of skew), and renewal is driven by activity instead. Person tokens cost nothing to refresh and cap every auth token obtained with them, so they are refreshed inside the margin — when the agent token lets a new one live longer — and presented anyway if the refresh fails. Hosts re-mint the agent token inside the margin for the same reason.
+
+**ScopePolicy** (`scope.ts`) decides what to declare in `r3_operations` beyond what the call needs. It sees the reason (`initial` / `grow` / `refresh`), the held token, the lapsed one, and the resource's operations. It only adds: the agent always asks for the operation and, when growing or renewing, everything the held (or lapsed-in-use) token grants. The default adds nothing.
+
+**Where the stdio bin keeps them.** In memory, for the life of the process. Its signing key is a software key minted per process and bound by the enclave-signed agent token, so no token outlives the process that obtained it, and a file shared by two concurrent sessions would have each flush the other's tokens as a key rotation. `createFsTokenStore` (`tokens.json`, mode 0600) is there for a host whose key persists.
+
+**Concurrency.** `acquire` / `release` on the store serialize acquisition and step-ups per key, so concurrent calls that all miss — or all present the same spent token — obtain one token between them. A caller waits at most `LEASE_WAIT_MS` (30 s) and then goes ahead without the lease rather than outlive the MCP client's patience; a lease never released lapses after `LEASE_MS` (60 s). A host whose requests land in different processes runs the lease table where they meet (`createLeaseTable`).
 
 **Hints.** `psHints.login_hint`, `domain_hint`, `tenant`, `prompt` and `justification` are forwarded on the person token request as well as on the auth token exchange. The person token is where the PS first picks the account the agent acts for; a PS with more than one binding for the agent needs `login_hint` there, not only later.
 

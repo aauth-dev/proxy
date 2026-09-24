@@ -7,10 +7,12 @@
 export {
   connectAtResource,
   disconnectAll,
-  flushPersonTokens,
+  flushTokens,
+  forgetTokens,
   invokeAtResource,
   invokeAtResourceComplete,
   listConnections,
+  listTokens,
   makeAgentPoll,
   obtainPersonToken,
   pollConnection,
@@ -28,7 +30,6 @@ export type {
   InvokeResult,
   ProxyConfig,
   PSTokenHints,
-  SessionTokenStore,
 } from './agent.js'
 
 export { isKnownAccessMode, KNOWN_ACCESS_MODES, planAccessMode, planReason } from './access-mode.js'
@@ -69,11 +70,7 @@ export type {
 export { createFsRegistryCache, fetchRegistry, registryUrl } from './registry.js'
 export type { CachedIndex, RegistryCache, RegistryEntry, RegistryIndex } from './registry.js'
 
-export {
-  createFsL1Store,
-  createFsPersonTokenStore,
-  createMemoryPersonTokenStore,
-} from './store.js'
+export { createFsL1Store } from './store.js'
 export type {
   AccessMode,
   ConnectionMetadata,
@@ -81,8 +78,30 @@ export type {
   ConnectionScope,
   L1Entry,
   L1Store,
-  PersonTokenKey,
-  PersonTokenStore,
 } from './store.js'
+
+export {
+  createFsTokenStore,
+  createLeaseTable,
+  createMemoryTokenStore,
+  authTokenRecord,
+  grantsAtLeast,
+  grantsOperation,
+  isDueForRefresh,
+  isLive,
+  wasInUse,
+  operationName,
+  tokenKeyString,
+  ACTIVE_WITHIN_SECS,
+  EXPIRY_SKEW_SECS,
+  LEASE_MS,
+  LEASE_WAIT_MS,
+  NO_LEASE,
+  REFRESH_MARGIN_SECS,
+} from './tokens.js'
+export type { OperationSet, TokenBudget, TokenKey, TokenKind, TokenRecord, TokenStore } from './tokens.js'
+
+export { minimalScope } from './scope.js'
+export type { ScopePolicy, ScopeRequest } from './scope.js'
 
 export * from './vocab/index.js'

@@ -23,8 +23,22 @@
 //                       duration_ms, error? (fetch threw)
 //   resource.fetch    — the resource's /.well-known/aauth-resource.json.
 //                       host, status?, ok, duration_ms, error?
-//   person_token.hit  — a person token served from cache (no PS round trip).
-//                       resource
+//   token.hit         — a held token presented instead of obtaining one (no
+//                       PS round trip). kind (person | auth), resource, jti?
+//   token.put         — a token kept as the one held for its key, replacing
+//                       what the key held. kind, resource?, account? (boolean),
+//                       mission? (boolean), reason (initial | grow | refresh |
+//                       step-up | settled), jti?, expires_in?, operations?
+//                       (the identifiers it grants), budget? (amount)
+//   token.drop        — a held token let go. kind, resource?, reason
+//                       (refused | replaced | resource_deleted | key_rotated),
+//                       jti?, flushed? (the whole
+//                       store, on a key rotation)
+//   token.refresh_failed — refreshing a held person token failed; the held
+//                       token is presented until it expires. kind, resource,
+//                       outcome (result | interaction | pending), status?
+//   scope.policy_error — the ScopePolicy threw; the call asked for only what it
+//                       needs. resource, error
 //   invoke.resume     — invoke found an in-flight authorization for the host.
 //                       resource, op_id, outcome (still_pending | settled |
 //                       gone | abandoned), adopted? (settled: which of
