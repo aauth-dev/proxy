@@ -30,7 +30,7 @@ import { renderUnicodeCompact } from 'uqr'
 import { z } from 'zod'
 import { planAccessMode } from './access-mode.js'
 import type { AgentSetup } from './access-mode.js'
-import { adoptSettled, connectAtResource, deleteAtAdmin, disconnectAll, invokeAtResource, listConnections, pollConnection } from './agent.js'
+import { adoptSettled, connectAtResource, deleteAtAdmin, disconnectAll, forgetTokens, invokeAtResource, listConnections, listTokens, pollConnection } from './agent.js'
 import type { ConnectOutcome, Interaction, InvokeResult, ProxyConfig } from './agent.js'
 import { canonicalizeHost } from './host.js'
 import { agentTokenPs } from './jwt.js'
@@ -47,7 +47,10 @@ import {
   toL1Entry,
 } from './resource.js'
 import type { DocCache } from './resource.js'
+import type { ScopePolicy } from './scope.js'
 import type { L1Entry, L1Store } from './store.js'
+import { isLive, operationName } from './tokens.js'
+import type { TokenRecord, TokenStore } from './tokens.js'
 
 export interface ProxyDeps {
   l1: L1Store
@@ -96,6 +99,17 @@ export interface ProxyDeps {
     set(host: string, flight: ConnectFlight): Promise<void>
     clear(host: string): Promise<void>
   }
+  // Every token the agent holds (tokens.ts): person, auth and session tokens,
+  // one per key. A host that builds a fresh server per request (the hosted MCP)
+  // MUST back this with per-agent storage that outlives the request, or every
+  // call obtains its tokens again. Copied onto the resolved ProxyConfig when
+  // the identity provider left `cfg.tokens` unset; the default is an in-memory
+  // store per ProxyConfig.
+  tokens?: TokenStore
+  // Which operations to declare at an authorization endpoint beyond the ones a
+  // call needs (scope.ts). Copied onto the ProxyConfig like `tokens`. Default:
+  // none — start with the operation, grow on demand.
+  scopePolicy?: ScopePolicy
   // Event sink (log.ts): one `tool.call` per invocation of these tools, and the
   // AAuth exchange underneath — every signed request, resource metadata fetch,
   // person-token cache hit. The host logs the MCP boundary itself; this is the
@@ -176,6 +190,25 @@ function memoryFlights(cfg: ProxyConfig): FlightStore {
   }
 }
 
+// The auth tokens held at one resource, as list_resources shows them: what each
+// grants and how much of it is left. Never the token itself.
+function authorizationsAt(held: TokenRecord[], resource: string): { authorizations?: unknown[] } {
+  const now = Math.floor(Date.now() / 1000)
+  const rows = held
+    .filter((t) => t.kind === 'auth' && t.resource === resource && isLive(t, now))
+    .map((t) => ({
+      ...(t.account ? { account: t.account } : {}),
+      ...(t.granted ? { operations: t.granted.operations.map(operationName) } : {}),
+      ...(t.per_call ? { per_call: t.per_call.operations.map(operationName) } : {}),
+      ...(!t.granted && !t.per_call && t.scope ? { scope: t.scope } : {}),
+      ...(t.budget
+        ? { budget: { ...(t.budget.remaining !== undefined ? { remaining: t.budget.remaining } : {}), amount: t.budget.amount, unit: t.budget.unit } }
+        : {}),
+      ...(t.exp !== undefined ? { expires_in: t.exp - now } : {}),
+    }))
+  return rows.length ? { authorizations: rows } : {}
+}
+
 function interactionText(interaction: Interaction): string {
   const authUrl = `${interaction.url}?code=${interaction.code}`
   return (
@@ -200,6 +233,8 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     // In place, not a copy: the default token and in-flight stores are WeakMaps
     // keyed on the config object's identity, so a spread here would lose them.
     if (deps.log && !status.cfg.log) status.cfg.log = deps.log
+    if (deps.tokens && !status.cfg.tokens) status.cfg.tokens = deps.tokens
+    if (deps.scopePolicy && !status.cfg.scopePolicy) status.cfg.scopePolicy = deps.scopePolicy
     return { ok: true, cfg: status.cfg }
   }
 
@@ -752,11 +787,12 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     {
       inputSchema: z.object({}),
       description:
-        'Return your connected resources with name, description, access_mode, last_used, how many vocabularies the agent proxy picked, and — for resources that front an upstream account — the person\'s `connections` (account, effective scopes, connected_at, status) as the resource reports them, plus the `connection` hint (`upstream_name`, `account_description`). CHECK THIS BEFORE PLANNING: if it is empty, ask the person which services and accounts to connect. A resource carrying `skip_reason` declares an access_mode this agent cannot complete — invoke will refuse it without calling out.',
+        'Return your connected resources with name, description, access_mode, last_used, how many vocabularies the agent proxy picked, and — for resources that front an upstream account — the person\'s `connections` (account, effective scopes, connected_at, status) as the resource reports them, plus the `connection` hint (`upstream_name`, `account_description`). `authorizations` lists the auth tokens this agent holds at a resource: the operations each grants, what is left of its budget, and `expires_in` seconds. invoke reuses them; calling an operation none grants first authorizes for it. CHECK THIS BEFORE PLANNING: if it is empty, ask the person which services and accounts to connect. A resource carrying `skip_reason` declares an access_mode this agent cannot complete — invoke will refuse it without calling out.',
     },
     async (_args: Record<string, never>, ctx: ServerContext) => {
       const setup = peekSetup()
       const c = await getConfig(ctx).catch(() => ({ ok: false as const }))
+      const held = c.ok ? await listTokens(c.cfg).catch(() => [] as TokenRecord[]) : []
       const entries = await Promise.all(
         (await l1.list()).map(async (e) => {
           const fresh = c.ok ? await refreshConnections(c.cfg, e) : e
@@ -779,6 +815,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
                 }
               : {}),
             ...(reason ? { skip_reason: reason } : {}),
+            ...authorizationsAt(held, fresh.issuer),
           }
         }),
       )
@@ -811,6 +848,8 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
         }
       }
       await l1.remove(canonical.host)
+      const c = await getConfig(ctx).catch(() => ({ ok: false as const }))
+      if (c.ok) await forgetTokens(c.cfg, entry.issuer).catch(() => {})
       return json({ deleted: canonical.host, disconnected })
     },
   )

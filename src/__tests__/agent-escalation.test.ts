@@ -371,10 +371,10 @@ describe('person tokens', () => {
   it('flushes the whole cache when the agent signing key rotates', async () => {
     mockPSWellKnown()
     routeTo('person-token')
-    const store = (await import('../store.js')).createMemoryPersonTokenStore()
-    const first = config({ personTokens: store })
+    const store = (await import('../tokens.js')).createMemoryTokenStore()
+    const first = config({ tokens: store })
     const rotated = config({
-      personTokens: store,
+      tokens: store,
       agentPrivateJwk: { kty: 'OKP', crv: 'Ed25519', alg: 'Ed25519', x: 'ZZZZ', d: 'YYYY' } as never,
     })
 

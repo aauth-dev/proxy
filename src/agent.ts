@@ -20,13 +20,28 @@
 import { fetch as signedFetch } from '@hellocoop/httpsig'
 import { planAccessMode } from './access-mode.js'
 import type { AccessModePlan, KnownAccessMode } from './access-mode.js'
-import { agentTokenPs, jwkThumbprint } from './jwt.js'
+import { agentTokenPs, decodeJwtPayload, jwkThumbprint, jwtExp } from './jwt.js'
 import { loggedFetch, logUrl } from './log.js'
 import type { ProxyLog } from './log.js'
-import { routeOperation } from './resource.js'
+import { listOperationsForResource, routeOperation } from './resource.js'
+import type { RoutedOperation } from './resource.js'
+import { minimalScope } from './scope.js'
+import type { ScopePolicy } from './scope.js'
+import type { ConnectionRow, L1Entry } from './store.js'
+import {
+  authTokenRecord,
+  createMemoryTokenStore,
+  grantsOperation,
+  grantsAtLeast,
+  isDueForRefresh,
+  isLive,
+  jtiOf,
+  wasInUse,
+  operationName,
+  uniqueOperations,
+} from './tokens.js'
+import type { TokenKey, TokenRecord, TokenStore } from './tokens.js'
 import { jsonRpcFromSse } from './vocab/mcp.js'
-import { createMemoryPersonTokenStore } from './store.js'
-import type { ConnectionRow, L1Entry, PersonTokenStore } from './store.js'
 
 export type AgentSigningKey = Parameters<typeof signedFetch>[1]['signingKey']
 
@@ -67,12 +82,6 @@ function personTokenHints(cfg: ProxyConfig): Partial<PSTokenHints> {
   return out
 }
 
-/** Opaque per-resource session token from the AAuth-Access header. */
-export interface SessionTokenStore {
-  get(resource: string): Promise<string | undefined>
-  set(resource: string, token: string): Promise<void>
-}
-
 export interface ProxyConfig {
   psUrl: string
   agentPrivateJwk: AgentSigningKey // the agent's private JWK
@@ -88,12 +97,17 @@ export interface ProxyConfig {
   /** Extra parameters forwarded to every PS auth token endpoint request. */
   psHints?: PSTokenHints
   /**
-   * Person-token cache. Keyed (resource, mission_s256); flushed whole when the
-   * agent's signing key changes. Defaults to a per-config in-memory store.
+   * Every token the agent holds — person, auth, and session tokens, and the
+   * host's agent token if it keeps it here (tokens.ts). One record per key;
+   * flushed whole when the agent's signing key changes. Defaults to a
+   * per-config in-memory store.
    */
-  personTokens?: PersonTokenStore
-  /** Session-token store for `session-token` resources. Defaults to per-config memory. */
-  sessionTokens?: SessionTokenStore
+  tokens?: TokenStore
+  /**
+   * Which operations to declare at a resource's authorization endpoint beyond
+   * the ones the call needs (scope.ts). Defaults to `minimalScope`: none.
+   */
+  scopePolicy?: ScopePolicy
   /**
    * Called with each auth_token received from the PS before it is used.
    * Hosts can use this to record or validate the PS sub across exchanges.
@@ -416,41 +430,114 @@ async function psMetadata(psUrl: string): Promise<PSMetadata> {
   ).json()) as PSMetadata
 }
 
-// ── Per-config default stores ──
+// ── The token store ──
 //
 // Keyed on the ProxyConfig object, which the identity provider resolves
-// per-principal. A process-global cache would leak person and session tokens
-// across tenants in a multi-user host.
+// per-principal. A process-global store would leak tokens across tenants in a
+// multi-user host.
 
-const defaultPersonTokens = new WeakMap<ProxyConfig, PersonTokenStore>()
-const defaultSessionTokens = new WeakMap<ProxyConfig, SessionTokenStore>()
+const defaultTokens = new WeakMap<ProxyConfig, TokenStore>()
 
-function personTokenStore(cfg: ProxyConfig): PersonTokenStore {
-  if (cfg.personTokens) return cfg.personTokens
-  let store = defaultPersonTokens.get(cfg)
+function tokenStore(cfg: ProxyConfig): TokenStore {
+  if (cfg.tokens) return cfg.tokens
+  let store = defaultTokens.get(cfg)
   if (!store) {
-    store = createMemoryPersonTokenStore()
-    defaultPersonTokens.set(cfg, store)
+    store = createMemoryTokenStore()
+    defaultTokens.set(cfg, store)
   }
   return store
 }
 
-function sessionTokenStore(cfg: ProxyConfig): SessionTokenStore {
-  if (cfg.sessionTokens) return cfg.sessionTokens
-  let store = defaultSessionTokens.get(cfg)
-  if (!store) {
-    const m = new Map<string, string>()
-    store = {
-      async get(resource) {
-        return m.get(resource)
-      },
-      async set(resource, token) {
-        m.set(resource, token)
-      },
-    }
-    defaultSessionTokens.set(cfg, store)
+const jktByConfig = new WeakMap<ProxyConfig, Promise<string>>()
+
+/** Thumbprint of the key this config signs with — what every held token's `cnf` must bind. */
+function agentJkt(cfg: ProxyConfig): Promise<string> {
+  let jkt = jktByConfig.get(cfg)
+  if (!jkt) {
+    jkt = jwkThumbprint(cfg.agentPrivateJwk as { kty?: string })
+    jktByConfig.set(cfg, jkt)
   }
-  return store
+  return jkt
+}
+
+const tokenLogFields = (key: TokenKey) => ({
+  kind: key.kind,
+  ...(key.resource ? { resource: key.resource } : {}),
+  ...(key.account !== undefined ? { account: true } : {}),
+  ...(key.mission_s256 ? { mission: true } : {}),
+})
+
+/**
+ * The record held for `key` if it can still be presented. A record bound to
+ * another agent key means the key rotated: nothing held survives that, so the
+ * whole store is flushed.
+ */
+async function liveToken(cfg: ProxyConfig, key: TokenKey): Promise<TokenRecord | undefined> {
+  const store = tokenStore(cfg)
+  const rec = await store.get(key)
+  if (!rec) return undefined
+  if (rec.agent_jkt && rec.agent_jkt !== (await agentJkt(cfg))) {
+    await store.flush()
+    cfg.log?.('token.drop', { ...tokenLogFields(key), reason: 'key_rotated', flushed: true })
+    return undefined
+  }
+  return isLive(rec) ? rec : undefined
+}
+
+async function keepToken(cfg: ProxyConfig, rec: TokenRecord, reason: string): Promise<void> {
+  await tokenStore(cfg).put(rec)
+  cfg.log?.('token.put', {
+    ...tokenLogFields(rec),
+    reason,
+    ...(rec.jti ? { jti: rec.jti } : {}),
+    ...(rec.exp !== undefined ? { expires_in: rec.exp - rec.obtained_at } : {}),
+    ...(rec.granted ? { operations: rec.granted.operations.map(operationName) } : {}),
+    ...(rec.budget ? { budget: rec.budget.amount } : {}),
+  })
+}
+
+async function dropToken(cfg: ProxyConfig, key: TokenKey, jti: string | undefined, reason: string): Promise<void> {
+  await tokenStore(cfg).drop(key, jti)
+  cfg.log?.('token.drop', { ...tokenLogFields(key), reason, ...(jti ? { jti } : {}) })
+}
+
+/**
+ * Drop every token the agent holds. Call when the agent's signing key rotates —
+ * every token binds the key through `cnf`, so none of them survive. The store
+ * also detects a rotation on its own (`liveToken`); this is the explicit hook
+ * for a host that knows one happened.
+ */
+export async function flushTokens(cfg: ProxyConfig): Promise<void> {
+  await tokenStore(cfg).flush()
+}
+
+/** Drop every token held for one resource (its issuer URL) — the resource was deleted. */
+export async function forgetTokens(cfg: ProxyConfig, resource: string): Promise<void> {
+  const store = tokenStore(cfg)
+  for (const rec of await store.list()) {
+    if (rec.resource === resource) await dropToken(cfg, rec, rec.jti, 'resource_deleted')
+  }
+}
+
+/** Every token the agent holds, expired ones included. */
+export async function listTokens(cfg: ProxyConfig): Promise<TokenRecord[]> {
+  return tokenStore(cfg).list()
+}
+
+const personKey = (resource: string, missionS256?: string): TokenKey => ({
+  kind: 'person',
+  resource,
+  ...(missionS256 ? { mission_s256: missionS256 } : {}),
+})
+
+const sessionKey = (resource: string): TokenKey => ({ kind: 'session', resource })
+
+async function heldSession(cfg: ProxyConfig, l1: L1Entry): Promise<string | undefined> {
+  return (await liveToken(cfg, sessionKey(l1.issuer)))?.value
+}
+
+async function keepSession(cfg: ProxyConfig, l1: L1Entry, value: string): Promise<void> {
+  await tokenStore(cfg).put({ ...sessionKey(l1.issuer), value, obtained_at: Math.floor(Date.now() / 1000) })
 }
 
 // ── Person tokens ──
@@ -491,16 +578,34 @@ export async function obtainPersonToken(
     }
   }
 
-  const store = personTokenStore(cfg)
-  const jkt = await jwkThumbprint(cfg.agentPrivateJwk as { kty?: string })
-  const key = { resource, ...(missionS256 ? { mission_s256: missionS256 } : {}) }
+  const key = personKey(resource, missionS256)
 
-  const cached = await store.get(key, jkt)
-  if (cached) {
-    cfg.log?.('person_token.hit', { resource })
-    return { kind: 'token', personToken: cached }
+  // A held person token inside the refresh margin is replaced rather than
+  // presented when a replacement can live longer: every auth token obtained
+  // with it is capped at its `exp` (protocol §Refresh Margin), so refreshing
+  // from the top of the chain is what buys a full-length auth token. When the
+  // refresh fails, the held token is still good until it expires — and the
+  // person is not asked to act for a token the agent already has.
+  const held = await liveToken(cfg, key)
+  if (held && !isDueForRefresh(held, jwtExp(cfg.agentToken))) {
+    cfg.log?.('token.hit', { kind: 'person', resource })
+    return { kind: 'token', personToken: held.value }
   }
+  const outcome = await requestPersonToken(cfg, ps, ps.person_token_endpoint, key, missionS256, held ? 'refresh' : 'initial')
+  if (outcome.kind === 'token' || !held) return outcome
+  cfg.log?.('token.refresh_failed', { kind: 'person', resource, outcome: outcome.kind, ...(outcome.kind === 'result' ? { status: outcome.status } : {}) })
+  return { kind: 'token', personToken: held.value }
+}
 
+async function requestPersonToken(
+  cfg: ProxyConfig,
+  ps: PSMetadata,
+  endpoint: string,
+  key: TokenKey,
+  missionS256: string | undefined,
+  reason: 'initial' | 'refresh',
+): Promise<PersonTokenOutcome> {
+  const resource = key.resource!
   // `capabilities` tells the PS this agent can put a URL in front of the
   // person (§Person Token Request): without it a first binding at a PS that
   // cannot reach them another way (no open wallet tab, no push device) is
@@ -510,7 +615,7 @@ export async function obtainPersonToken(
   // the auth token exchange: the person token is where the PS first decides
   // WHICH account the agent acts for, and a PS bound to more than one has
   // nothing else to choose by.
-  const res = await signWith(cfg, { kind: 'agent' }, { psOrAs: true })(ps.person_token_endpoint, {
+  const res = await signWith(cfg, { kind: 'agent' }, { psOrAs: true })(endpoint, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({
@@ -542,19 +647,24 @@ export async function obtainPersonToken(
   if (!person_token) {
     return { kind: 'result', status: res.status, body: { error: 'ps_returned_no_person_token' } }
   }
-  const expiresAt = Math.floor(Date.now() / 1000) + (expires_in ?? 3600)
-  await store.set(key, jkt, person_token, expiresAt)
+  await keepToken(cfg, await personRecord(cfg, key, person_token, expires_in), reason)
   return { kind: 'token', personToken: person_token }
 }
 
-/**
- * Drop every cached person token. Call when the agent's signing key rotates —
- * every person token binds the same key through `cnf`, so none of them survive.
- * `obtainPersonToken` also detects rotation on its own via the key thumbprint;
- * this is the explicit hook for a host that knows a rotation happened.
- */
-export async function flushPersonTokens(cfg: ProxyConfig): Promise<void> {
-  await personTokenStore(cfg).flush()
+async function personRecord(cfg: ProxyConfig, key: TokenKey, token: string, expiresIn?: number): Promise<TokenRecord> {
+  const now = Math.floor(Date.now() / 1000)
+  const jti = jtiOf(token)
+  // The token's own `exp` when it is a JWT that carries one; the PS's
+  // `expires_in` otherwise.
+  const exp = jwtExp(token) ?? now + (expiresIn ?? 3600)
+  return {
+    ...key,
+    value: token,
+    agent_jkt: await agentJkt(cfg),
+    ...(jti ? { jti } : {}),
+    exp,
+    obtained_at: now,
+  }
 }
 
 type Poller = (url: string) => Promise<Response>
@@ -667,8 +777,8 @@ async function exchangeAtPSAndWait(cfg: ProxyConfig, ps: PSMetadata, resourceTok
 // ── Authorize-first ──
 
 /**
- * POST the resource's authorization endpoint, declaring the operation, and take
- * back a resource token. The request MUST present a person token via
+ * POST the resource's authorization endpoint, declaring the operations the
+ * token should grant, and take back a resource token. The request MUST present a person token via
  * Signature-Key (protocol §Authorization Endpoint Request) — an agent token gets
  * `requirement=person-token`.
  */
@@ -677,7 +787,7 @@ async function authorizeAtResource(
   endpoint: string,
   personToken: string,
   vocabulary: string,
-  operation: Record<string, string>,
+  operations: Array<Record<string, string>>,
   account?: string,
 ): Promise<{ kind: 'resourceToken'; resourceToken: string } | { kind: 'result'; status: number; body: unknown }> {
   const res = await signWith(cfg, { kind: 'person', jwt: personToken })(endpoint, {
@@ -690,7 +800,7 @@ async function authorizeAtResource(
         // advertises for this vocabulary (R3 -02 §Operation Identifier Scope),
         // in the vocabulary's own entry shape: `{ operationId }` for OpenAPI,
         // `{ tool }` for MCP.
-        operations: [operation],
+        operations,
       },
       // N2: bind the authorization to one of the person's connected accounts.
       ...(account ? { account } : {}),
@@ -703,6 +813,238 @@ async function authorizeAtResource(
     return { kind: 'result', status: res.status, body: await safeBody(res) }
   }
   return { kind: 'resourceToken', resourceToken: resource_token }
+}
+
+// ── The held auth token ──
+//
+// One auth token per (resource, account, mission) — tokens.ts. The opening
+// credential for an authorize-first call is the held token while it grants the
+// operation: one request, no PS round trip, and the budget it carries keeps
+// being spent instead of a fresh allocation being drawn per call. When it does
+// not grant the operation the agent authorizes for the union of what it holds
+// and what it needs (plus whatever the ScopePolicy adds), and the new token
+// takes the held one's place.
+//
+// It is presented until it lapses — not refreshed inside the margin. Its `exp`
+// is capped by the agent token and, at a budgeted resource, by the access
+// server's budget period, neither of which a refresh moves; a refresh would
+// only draw another allocation. When it lapses, what happens next depends on
+// whether the work was still going on: a token used within ACTIVE_WITHIN_SECS
+// is renewed with its whole grant; one that sat idle lapsed with the activity
+// that needed it, and the agent starts over from the one operation.
+
+type Opened = { kind: 'cred'; cred: Credential; held?: TokenRecord } | Exclude<InvokeResult, { kind: 'skipped' }>
+
+async function openWithAuthToken(
+  cfg: ProxyConfig,
+  l1: L1Entry,
+  route: RoutedOperation,
+  operationId: string,
+  key: TokenKey,
+  missionS256: string | undefined,
+  account: string | undefined,
+  needPS: () => Promise<PSMetadata>,
+): Promise<Opened> {
+  const vocabulary = route.adapter.vocabUri
+  const entry = route.adapter.operationEntry(operationId)
+  const presentable = (rec: TokenRecord | undefined): rec is TokenRecord =>
+    rec !== undefined && grantsOperation(rec, vocabulary, entry)
+  const present = (rec: TokenRecord): Opened => {
+    cfg.log?.('token.hit', { kind: 'auth', resource: l1.issuer, ...(rec.jti ? { jti: rec.jti } : {}) })
+    return { kind: 'cred', cred: { kind: 'auth', jwt: rec.value }, held: rec }
+  }
+
+  const held = await liveToken(cfg, key)
+  if (presentable(held)) return present(held)
+
+  // Without an authorization endpoint the resource issues resource tokens only
+  // in a 401 (protocol §Resource Access and Resource Tokens): open with the
+  // person token and let the requirement loop pick up the challenge.
+  if (!l1.authorization_endpoint) {
+    const pt = await obtainPersonToken(cfg, await needPS(), l1.issuer, missionS256)
+    if (pt.kind !== 'token') return pt
+    return { kind: 'cred', cred: { kind: 'person', jwt: pt.personToken } }
+  }
+
+  const store = tokenStore(cfg)
+  const lease = await store.acquire?.(key)
+  try {
+    // Another call may have obtained what this one needs while it waited.
+    const current = await liveToken(cfg, key)
+    if (presentable(current)) return present(current)
+
+    // Live but not granting this operation: grow it. Nothing live: renew what
+    // lapsed while in use, or start over.
+    const lapsed = current ? undefined : await store.get(key)
+    const reason = current ? 'grow' : lapsed && wasInUse(lapsed) ? 'refresh' : 'initial'
+    const operations = await requestedOperations(cfg, { l1, route, operationId, entry, key, reason, held: current, lapsed })
+
+    const pt = await obtainPersonToken(cfg, await needPS(), l1.issuer, missionS256)
+    if (pt.kind !== 'token') return pt
+    const authz = await authorizeAtResource(cfg, l1.authorization_endpoint, pt.personToken, vocabulary, operations, account)
+    if (authz.kind !== 'resourceToken') return authz
+    const ex = await exchangeAtPSAndWait(cfg, await needPS(), authz.resourceToken, pt.personToken)
+    if (ex.kind !== 'token') return ex
+    const rec = await adoptAuthToken(cfg, key, ex.authToken, reason, pt.personToken)
+    return { kind: 'cred', cred: { kind: 'auth', jwt: ex.authToken }, ...(rec ? { held: rec } : {}) }
+  } finally {
+    await releaseLease(cfg, key, lease)
+  }
+}
+
+async function releaseLease(cfg: ProxyConfig, key: TokenKey, lease: string | undefined): Promise<void> {
+  if (lease === undefined) return
+  try {
+    await tokenStore(cfg).release?.(key, lease)
+  } catch {
+    // The lease lapses on its own; a failed release must not fail the call.
+  }
+}
+
+// What to declare in `r3_operations`: everything the token being grown or
+// renewed grants (in the same vocabulary), the operation being invoked, and
+// whatever the ScopePolicy adds. The policy only ever adds.
+async function requestedOperations(
+  cfg: ProxyConfig,
+  r: {
+    l1: L1Entry
+    route: RoutedOperation
+    operationId: string
+    entry: Record<string, string>
+    key: TokenKey
+    reason: 'initial' | 'grow' | 'refresh'
+    held?: TokenRecord
+    lapsed?: TokenRecord
+  },
+): Promise<Array<Record<string, string>>> {
+  const vocabulary = r.route.adapter.vocabUri
+  const from = r.reason === 'grow' ? r.held : r.reason === 'refresh' ? r.lapsed : undefined
+  const carried = from?.granted?.vocabulary === vocabulary ? from.granted.operations : []
+  let extra: Array<Record<string, string>> = []
+  try {
+    const lapsed = r.lapsed
+    extra = await (cfg.scopePolicy ?? minimalScope)({
+      resource: r.l1,
+      vocabulary,
+      opId: r.operationId,
+      operation: r.entry,
+      reason: r.reason,
+      ...(r.held ? { held: r.held } : {}),
+      ...(lapsed ? { lapsed } : {}),
+      operations: () => listOperationsForResource(r.l1),
+      entryFor: (opId) => r.route.adapter.operationEntry(opId),
+    })
+  } catch (err) {
+    // A policy is a refinement: when it fails, ask for what the call needs.
+    cfg.log?.('scope.policy_error', { resource: r.l1.issuer, error: (err as Error)?.message ?? String(err) })
+  }
+  return uniqueOperations([...carried, r.entry, ...extra])
+}
+
+/** Keep an auth token as the one held for `key`. Undefined when it cannot be kept (not a JWT, no `exp`). */
+async function adoptAuthToken(
+  cfg: ProxyConfig,
+  key: TokenKey,
+  jwt: string,
+  reason: string,
+  presented?: string,
+): Promise<TokenRecord | undefined> {
+  const presentedJti = presented ? jtiOf(presented) : undefined
+  const rec = authTokenRecord(key, jwt, { agentJkt: await agentJkt(cfg), ...(presentedJti ? { presentedJti } : {}) })
+  if (!rec) return undefined
+  await keepToken(cfg, rec, reason)
+  return rec
+}
+
+// After a response to the held token: when it was used, and what the resource
+// says is left of its budget (draft-hardt-aauth-budgets §AAuth-Budget Response
+// Header). Advisory — shown to the model, never used to refuse a call.
+async function noteUse(cfg: ProxyConfig, key: TokenKey, held: TokenRecord, res: Response): Promise<void> {
+  const reported = parseBudget(res.headers.get('aauth-budget'))
+  const patch: Partial<TokenRecord> = { last_used: Math.floor(Date.now() / 1000) }
+  if (reported?.remaining !== undefined && held.budget) patch.budget = { ...held.budget, remaining: reported.remaining }
+  await tokenStore(cfg).update(key, held.jti, patch)
+}
+
+// Whether a token a settled pending delivered is this key's to hold: bound to
+// the same account and mission, granting the operation being invoked, and
+// taking nothing away from the token the key already holds.
+function resumeFits(
+  rec: TokenRecord,
+  key: TokenKey,
+  vocabulary: string,
+  entry: Record<string, string>,
+  current: TokenRecord | undefined,
+): boolean {
+  let claims: Record<string, unknown>
+  try {
+    claims = decodeJwtPayload(rec.value)
+  } catch {
+    return false
+  }
+  if ((claims.account ?? undefined) !== key.account) return false
+  if ((claims.mission_s256 ?? undefined) !== key.mission_s256) return false
+  if (!grantsOperation(rec, vocabulary, entry)) return false
+  return !current || grantsAtLeast(rec, current)
+}
+
+// A step-up: the resource answered the credential with `requirement=auth-token`
+// and a resource token — the held token's budget is spent, it was revoked, or
+// the call needs more than it grants. Serialized per key like acquisition, so
+// concurrent calls presenting the same spent token step it up once.
+//
+// The new token takes the held one's place when it grants at least as much, or
+// when the held one is spent. Anything narrower (a proposal for one call, a
+// grant for one operation) is presented for this call and the held token kept.
+async function stepUp(
+  cfg: ProxyConfig,
+  key: TokenKey,
+  route: RoutedOperation,
+  operationId: string,
+  req: ParsedRequirement,
+  presented: string | undefined,
+  presentedHeld: TokenRecord | undefined,
+  needPS: () => Promise<PSMetadata>,
+): Promise<{ kind: 'cred'; cred: Credential; held?: TokenRecord } | Exclude<InvokeResult, { kind: 'skipped' }>> {
+  const vocabulary = route.adapter.vocabUri
+  const entry = route.adapter.operationEntry(operationId)
+  const store = tokenStore(cfg)
+  const lease = await store.acquire?.(key)
+  try {
+    // Another call stepped the same token up while this one waited.
+    const current = await liveToken(cfg, key)
+    if (current && current.value !== presented && grantsOperation(current, vocabulary, entry)) {
+      cfg.log?.('token.hit', { kind: 'auth', resource: key.resource, ...(current.jti ? { jti: current.jti } : {}) })
+      return { kind: 'cred', cred: { kind: 'auth', jwt: current.value }, held: current }
+    }
+
+    const ex = await exchangeAtPSAndWait(cfg, await needPS(), req.resourceToken!, presented)
+    if (ex.kind !== 'token') return ex
+    const cred: Credential = { kind: 'auth', jwt: ex.authToken }
+
+    const presentedJti = presented ? jtiOf(presented) : undefined
+    const rec = authTokenRecord(key, ex.authToken, { agentJkt: await agentJkt(cfg), ...(presentedJti ? { presentedJti } : {}) })
+    const spent = req.reason === 'budget-exhausted' || req.reason === 'insufficient-budget'
+    if (rec && (!current || spent || grantsAtLeast(rec, current))) {
+      await keepToken(cfg, rec, 'step-up')
+      return { kind: 'cred', cred, held: rec }
+    }
+    // Not kept. A token the resource just refused as spent still goes.
+    if (!rec && presentedHeld && spent) await dropPresented(cfg, key, presentedHeld.value, 'replaced')
+    return { kind: 'cred', cred }
+  } finally {
+    await releaseLease(cfg, key, lease)
+  }
+}
+
+// Drop the record for `key` only while it is still the token presented, so a
+// refusal of an old token never removes the one a concurrent call just stored.
+async function dropPresented(cfg: ProxyConfig, key: TokenKey, value: string, reason: string): Promise<void> {
+  const store = tokenStore(cfg)
+  const cur = await store.get(key)
+  if (!cur || cur.value !== value) return
+  await store.drop(key, cur.jti)
+  cfg.log?.('token.drop', { ...tokenLogFields(key), reason, ...(cur.jti ? { jti: cur.jti } : {}) })
 }
 
 // ── invoke ──
@@ -758,7 +1100,22 @@ export async function invokeAtResource(
     ps ??= await psMetadata(cfg.psUrl)
     return ps
   }
-  const sessions = sessionTokenStore(cfg)
+
+  // The one auth token held for this resource, account and mission.
+  const authKey: TokenKey = {
+    kind: 'auth',
+    resource: l1.issuer,
+    ...(opts.account ? { account: opts.account } : {}),
+    ...(missionS256 ? { mission_s256: missionS256 } : {}),
+  }
+  // An operation authorized per call gets a single-use token bound to this
+  // call's parameters (R3 -02 §Per-Call Proposals). It is presented once and
+  // never takes the held token's place.
+  const perCall = route.accessMode === 'per-call'
+  // The held token, while it is what this call presents: its budget is tracked
+  // from the resource's AAuth-Budget, and a token the resource steps up
+  // replaces it.
+  let held: TokenRecord | undefined
 
   // ── Opening credential ──
   //
@@ -774,7 +1131,21 @@ export async function invokeAtResource(
   const mode = accessPlan.kind === 'satisfiable' && accessPlan.mode === 'person-token' && opts.account ? 'auth-token' : accessPlan.kind === 'satisfiable' ? accessPlan.mode : undefined
 
   if (opts.authToken) {
+    // A settled pending delivered the token a previous call went to get. The
+    // pending is tracked per host, so it may have been for another account,
+    // another operation, or one call's per-call approval: present it for this
+    // call, and hold it only when it is plainly this key's token (resumeFits).
     cred = { kind: 'auth', jwt: opts.authToken }
+    if (!perCall) {
+      const vocabulary = route.adapter.vocabUri
+      const entry = route.adapter.operationEntry(operationId)
+      const rec = authTokenRecord(authKey, opts.authToken, { agentJkt: await agentJkt(cfg) })
+      const current = await liveToken(cfg, authKey)
+      if (rec && resumeFits(rec, authKey, vocabulary, entry, current)) {
+        await keepToken(cfg, rec, 'settled')
+        held = rec
+      }
+    }
   } else if (accessPlan.kind === 'satisfiable') {
     switch (mode) {
       case 'agent-token':
@@ -784,8 +1155,8 @@ export async function invokeAtResource(
         // Resource-managed. Present the session token if we already hold one;
         // otherwise call with the agent token and let the resource start its own
         // consent flow with a 202 interaction.
-        const held = await sessions.get(l1.resource)
-        if (held) cred = { kind: 'session', token: held }
+        const session = await heldSession(cfg, l1)
+        if (session) cred = { kind: 'session', token: session }
         break
       }
 
@@ -799,28 +1170,14 @@ export async function invokeAtResource(
       case 'auth-token':
       case 'per-call': {
         // Authorize-first when the resource publishes an authorization_endpoint:
-        // declare the operation, take back a resource token, exchange it at the
+        // declare the operations, take back a resource token, exchange it at the
         // PS. Without one, the resource issues resource tokens via 401 instead
         // (protocol §Resource Access and Resource Tokens) — start with the
         // person token and let the requirement loop pick up the challenge.
-        const pt = await obtainPersonToken(cfg, await needPS(), l1.issuer, missionS256)
-        if (pt.kind !== 'token') return pt
-        cred = { kind: 'person', jwt: pt.personToken }
-
-        if (l1.authorization_endpoint) {
-          const authz = await authorizeAtResource(
-            cfg,
-            l1.authorization_endpoint,
-            pt.personToken,
-            route.adapter.vocabUri,
-            route.adapter.operationEntry(operationId),
-            opts.account,
-          )
-          if (authz.kind !== 'resourceToken') return authz
-          const ex = await exchangeAtPSAndWait(cfg, await needPS(), authz.resourceToken, pt.personToken)
-          if (ex.kind !== 'token') return ex
-          cred = { kind: 'auth', jwt: ex.authToken }
-        }
+        const opened = await openWithAuthToken(cfg, l1, route, operationId, authKey, missionS256, opts.account, needPS)
+        if (opened.kind !== 'cred') return opened
+        cred = opened.cred
+        held = opened.held
         break
       }
     }
@@ -840,9 +1197,12 @@ export async function invokeAtResource(
     // A resource MAY replace the agent's session token on any response.
     const access = res.headers.get('aauth-access')
     if (access) {
-      await sessions.set(l1.resource, access)
+      await keepSession(cfg, l1, access)
       if (cred.kind !== 'auth' && cred.kind !== 'person') cred = { kind: 'session', token: access }
     }
+
+    const presentedHeld = held !== undefined && cred.kind === 'auth' && cred.jwt === held.value ? held : undefined
+    if (presentedHeld) await noteUse(cfg, authKey, presentedHeld, res)
 
     const req = parseRequirement(res.headers.get('aauth-requirement'))
     if (!req) return { kind: 'result', status: res.status, body: await safeBody(res), ...withBudget(res) }
@@ -867,6 +1227,14 @@ export async function invokeAtResource(
       }
 
       case 'person-token': {
+        // The resource will not take the token presented. A held auth token it
+        // refuses this way is dead to it (expired, revoked); a person token it
+        // refuses is replaced rather than presented again.
+        if (presentedHeld) {
+          await dropPresented(cfg, authKey, presentedHeld.value, 'refused')
+          held = undefined
+        }
+        if (cred.kind === 'person') await dropPresented(cfg, personKey(l1.issuer, missionS256), cred.jwt, 'refused')
         const pt = await obtainPersonToken(cfg, await needPS(), l1.issuer, missionS256)
         if (pt.kind !== 'token') return pt
         cred = { kind: 'person', jwt: pt.personToken }
@@ -874,20 +1242,30 @@ export async function invokeAtResource(
       }
 
       case 'auth-token': {
-        // Also the per-call path: for an `r3_per_call` operation the resource
-        // builds a proposal from this call's concrete parameters, persists it
-        // under its hash, and returns a resource token carrying only the
-        // `r3_uri`/`r3_s256` reference. The agent exchanges it and retries the
-        // identical call (R3 -02 §Per-Call Proposals).
+        // A step-up: the held token's budget is spent, it was revoked, or the
+        // call needs more than it grants — and the per-call path: for an
+        // `r3_per_call` operation the resource builds a proposal from this
+        // call's concrete parameters, persists it under its hash, and returns a
+        // resource token carrying only the `r3_uri`/`r3_s256` reference. The
+        // agent exchanges it and retries the identical call (R3 -02 §Per-Call
+        // Proposals).
         if (!req.resourceToken) {
           return terminalChallenge(res, req)
         }
         // The credential that drew the challenge is what the resource copied
         // out of; the PS checks the exchange against it.
         const presented = cred.kind === 'person' || cred.kind === 'auth' ? cred.jwt : undefined
-        const ex = await exchangeAtPSAndWait(cfg, await needPS(), req.resourceToken, presented)
-        if (ex.kind !== 'token') return ex
-        cred = { kind: 'auth', jwt: ex.authToken }
+        if (perCall) {
+          // Good for this one call: never held.
+          const ex = await exchangeAtPSAndWait(cfg, await needPS(), req.resourceToken, presented)
+          if (ex.kind !== 'token') return ex
+          cred = { kind: 'auth', jwt: ex.authToken }
+          continue
+        }
+        const stepped = await stepUp(cfg, authKey, route, operationId, req, presented, presentedHeld, needPS)
+        if (stepped.kind !== 'cred') return stepped
+        cred = stepped.cred
+        held = stepped.held
         continue
       }
 
@@ -959,7 +1337,7 @@ export async function invokeAtResourceComplete(
     // A resource-managed consent settles with the session token on the poll
     // (AAuth-Access); keep it so the retry presents it.
     const settled = completed.headers.get('aauth-access')
-    if (settled) await sessionTokenStore(cfg).set(l1.resource, settled)
+    if (settled) await keepSession(cfg, l1, settled)
   }
   throw new Error('invoke did not complete after interactions')
 }
@@ -1101,14 +1479,13 @@ export async function adoptSettled(
     expires_in?: unknown
   }
   if (typeof body.person_token === 'string' && body.person_token) {
-    const jkt = await jwkThumbprint(cfg.agentPrivateJwk as { kty?: string })
-    const key = { resource: l1.issuer, ...(missionS256 ? { mission_s256: missionS256 } : {}) }
-    const expiresIn = typeof body.expires_in === 'number' ? body.expires_in : 3600
-    await personTokenStore(cfg).set(key, jkt, body.person_token, Math.floor(Date.now() / 1000) + expiresIn)
+    const key = personKey(l1.issuer, missionS256)
+    const expiresIn = typeof body.expires_in === 'number' ? body.expires_in : undefined
+    await keepToken(cfg, await personRecord(cfg, key, body.person_token, expiresIn), 'settled')
     adopted.push('person_token')
   }
   if (settled.access) {
-    await sessionTokenStore(cfg).set(l1.resource, settled.access)
+    await keepSession(cfg, l1, settled.access)
     adopted.push('session_token')
   }
   let authToken: string | undefined
