@@ -58,7 +58,7 @@ Each tool's description embeds a short literal snapshot of L1 ("currently added 
 ### v1 surface (eight tools)
 
 **Resource lifecycle (L1 / L2):**
-- `find_resources(query)` — search the registry (L2) by name, description, host and `upstream`. Returns `{ resource, name, description, access_mode, added, connected, upstream? }[]`, available entries first. A coming entry (registry `availability` set) is listed last with `connectable: false`, `availability` (the reason, verbatim) and `interest_count`; `connect_resources` refuses it with `not_available` before touching the host.
+- `find_resources(query)` — search the registry (L2) by name, description, host and `upstream`. Returns `{ resource, name, description, access_mode, added, connected, upstream? }[]`, available entries first. A coming entry (registry `availability` set) is listed last with `availability` (the reason, verbatim) and `interest_count`. `connect_resources` still tries it — the provider may already let this person in — and its row carries `availability`. Until 5.1.0 it was refused with `not_available` before the host was touched.
 - `add_resource(host_or_url)` — fetch `{host}/.well-known/aauth-resource.json`, validate, pick the resource's vocabularies, write to L1. Accepts bare host, `https://host`, or full URL; canonicalizes to bare lowercased host.
 - `list_resources()` — return L1 with `{ resource, name, description, access_mode, ops_count, last_used }`.
 - `remove_resource(resource)` — unregister from L1. Agent-proxy-local only; does not revoke PS-side grants.

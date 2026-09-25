@@ -1,6 +1,6 @@
 {
   "name": "@aauth/proxy",
-  "version": "5.0.0",
+  "version": "5.1.0",
   "description": "The user's AAuth agent in MCP form — discovery, identity, interaction relay",
   "type": "module",
   "exports": {

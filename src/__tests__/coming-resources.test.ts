@@ -1,8 +1,8 @@
 // Coming resources (registry `availability`): find_resources lists them after
 // the available ones, tagged `connectable: false` with the reason and the
-// interest count, searches them by `upstream`, and connect_resources refuses
-// one before touching the host — a gated resource serves valid metadata and
-// would otherwise be connected only to answer every call with an access error.
+// interest count, searches them by `upstream`, and connect_resources still
+// tries one — the provider may already let this person in — with the reason
+// on the row.
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
@@ -100,9 +100,9 @@ describe('coming resources', () => {
         'gmail-googleapis-com.proxy.aauth.dev',
       ])
       const [slack, gmail] = res.resources
-      expect(slack).not.toHaveProperty('connectable')
+      expect(slack).not.toHaveProperty('availability')
       expect(slack.upstream).toBe('slack.com')
-      expect(gmail.connectable).toBe(false)
+      expect(gmail).not.toHaveProperty('connectable')
       expect(gmail.availability).toMatch(/Google has not verified/)
       expect(gmail.interest_count).toBe(3)
       expect(gmail.upstream).toBe('gmail.googleapis.com')
@@ -122,7 +122,12 @@ describe('coming resources', () => {
     }
   })
 
-  it('connect_resources refuses a coming resource without touching the host', async () => {
+  it('connect_resources tries a coming resource and reports the host refusing it', async () => {
+    vi.mocked(globalThis.fetch).mockImplementation(async (input) => {
+      if (String(input) === 'https://gmail-googleapis-com.proxy.aauth.dev/.well-known/aauth-resource.json')
+        return makeResponse(403, { error: 'access_denied' })
+      throw new Error(`unexpected fetch: ${String(input)}`)
+    })
     const { client, close } = await clientFor(emptyL1())
     try {
       const res = JSON.parse(
@@ -130,13 +135,30 @@ describe('coming resources', () => {
       )
       const row = res.results[0]
       expect(row.outcome).toBe('error')
-      expect(row.detail).toMatch(/^not_available: Not yet public/)
-      expect(row.connectable).toBe(false)
-      expect(row.upstream).toBe('gmail.googleapis.com')
-      expect(row.interest_count).toBe(3)
-      // Only the registry was read — the host's well-known was never fetched.
-      expect(vi.mocked(globalThis.fetch)).not.toHaveBeenCalled()
-      expect(mockSignedFetch.mock.calls.map((c) => c[0])).toEqual(['https://registry.aauth.dev/resources'])
+      expect(row.detail).toBe('resource gmail-googleapis-com.proxy.aauth.dev: well-known 403')
+      expect(row.availability).toMatch(/^Not yet public/)
+      expect(row).not.toHaveProperty('connectable')
+      expect(vi.mocked(globalThis.fetch)).toHaveBeenCalledTimes(1)
+    } finally {
+      await close()
+    }
+  })
+
+  it('connect_resources connects a coming resource the host lets in, carrying the reason', async () => {
+    vi.mocked(globalThis.fetch).mockImplementation(async (input) => {
+      if (String(input) === 'https://gmail-googleapis-com.proxy.aauth.dev/.well-known/aauth-resource.json')
+        return makeResponse(200, { issuer: 'https://gmail-googleapis-com.proxy.aauth.dev', access_mode: 'agent-token' })
+      throw new Error(`unexpected fetch: ${String(input)}`)
+    })
+    const { client, close } = await clientFor(emptyL1())
+    try {
+      const res = JSON.parse(
+        textOf(await client.callTool({ name: 'connect_resources', arguments: { items: [{ resource: 'gmail-googleapis-com.proxy.aauth.dev' }] } })),
+      )
+      const row = res.results[0]
+      expect(row.outcome).toBe('ready')
+      expect(row.reason).toBe('no_connection_needed')
+      expect(row.availability).toMatch(/^Not yet public/)
     } finally {
       await close()
     }
