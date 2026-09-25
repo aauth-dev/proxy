@@ -31,7 +31,8 @@
 //                       step-up | settled), jti?, expires_in?, operations?
 //                       (the identifiers it grants), budget? (amount)
 //   token.drop        — a held token let go. kind, resource?, reason
-//                       (refused | replaced | resource_deleted | key_rotated),
+//                       (refused | replaced | exhausted | resource_deleted |
+//                       key_rotated),
 //                       jti?, flushed? (the whole
 //                       store, on a key rotation)
 //   token.refresh_failed — refreshing a held person token failed; the held
