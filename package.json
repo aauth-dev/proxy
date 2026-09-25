@@ -46,7 +46,7 @@
   },
   "dependencies": {
     "@aauth/local-keys": "^2.0.0",
-    "@hellocoop/httpsig": "^2.4.0",
+    "@hellocoop/httpsig": "^2.6.0",
     "@modelcontextprotocol/server": "^2.0.0",
     "uqr": "^0.1.3",
     "zod": "^4.2.0"
