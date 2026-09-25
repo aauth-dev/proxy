@@ -1019,7 +1019,17 @@ async function stepUp(
     }
 
     const ex = await exchangeAtPSAndWait(cfg, await needPS(), req.resourceToken!, presented)
-    if (ex.kind !== 'token') return ex
+    if (ex.kind !== 'token') {
+      // The PS refused to renew an exhausted token. Presented again it draws the
+      // same challenge and the same refusal on every call until it expires, so
+      // it goes: the next call starts over at the authorization endpoint with a
+      // person token. A token short only for this call (insufficient-budget)
+      // still serves cheaper ones and stays.
+      if (ex.kind === 'result' && presentedHeld && req.reason === 'budget-exhausted') {
+        await dropPresented(cfg, key, presentedHeld.value, 'exhausted')
+      }
+      return ex
+    }
     const cred: Credential = { kind: 'auth', jwt: ex.authToken }
 
     const presentedJti = presented ? jtiOf(presented) : undefined

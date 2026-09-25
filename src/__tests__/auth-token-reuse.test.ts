@@ -73,7 +73,7 @@ type Op = Record<string, string>
  * serves an operation only to an auth token whose r3_granted names it, and
  * answers every served call with an AAuth-Budget.
  */
-function world(opts: { ttl?: number; perCall?: string[]; exhausted?: Set<string>; authorizeStatus?: number } = {}) {
+function world(opts: { ttl?: number; perCall?: string[]; exhausted?: Set<string>; reason?: string; authorizeStatus?: number } = {}) {
   const ttl = opts.ttl ?? 3000
   const calls: Array<{ url: string; body?: Record<string, unknown>; jwt?: string }> = []
   const opsByResourceToken = new Map<string, Op[]>()
@@ -128,7 +128,7 @@ function world(opts: { ttl?: number; perCall?: string[]; exhausted?: Set<string>
       opsByResourceToken.set(rt, granted)
       return Response.json({ error: 'budget_exhausted' }, {
         status: 401,
-        headers: { 'aauth-requirement': `requirement=auth-token; resource-token="${rt}"; reason=budget-exhausted` },
+        headers: { 'aauth-requirement': `requirement=auth-token; resource-token="${rt}"; reason=${opts.reason ?? 'budget-exhausted'}` },
       })
     }
     if (opts.perCall?.includes(opId) && !(claims.proposal as boolean | undefined)) {
@@ -369,6 +369,54 @@ describe('step-up and per-call', () => {
     expect(second!.presented_jti).toBe(first!.jti)
     // No second authorize: the step-up's resource token was enough.
     expect(w.authorizes()).toHaveLength(1)
+  })
+
+  // senzing.aauth.dev, 2026-09-25: the resource's step-up token named the
+  // wrong presented_jti, the PS refused every renewal, and the spent token
+  // stayed held, so every later call drew the same refusal.
+  it('drops an exhausted token when the PS refuses its step-up, and the next call starts over', async () => {
+    const exhausted = new Set<string>()
+    const w = world({ exhausted })
+    const cfg = config()
+    await invokeAtResource(cfg, l1(), 'search_entities')
+    const [first] = await heldAuth(cfg)
+    exhausted.add(first!.jti!)
+    const base = mockSignedFetch.getMockImplementation()!
+    mockSignedFetch.mockImplementation(async (url: string, init: { body?: string }) => {
+      if (url === PS_METADATA.auth_token_endpoint && String(JSON.parse(init.body!).resource_token).startsWith('rt-step')) {
+        return Response.json({ error: 'invalid_resource_token' }, { status: 400 })
+      }
+      return base(url, init)
+    })
+
+    const refused = await invokeAtResource(cfg, l1(), 'search_entities')
+    expect(refused).toMatchObject({ kind: 'result', status: 400 })
+    expect(await heldAuth(cfg)).toEqual([])
+
+    const next = await invokeAtResource(cfg, l1(), 'search_entities')
+    expect(next).toMatchObject({ kind: 'result', status: 200 })
+    expect(w.authorizes()).toHaveLength(2)
+    expect(w.resourceCalls().at(-1)!.jwt).not.toBe(first!.value)
+  })
+
+  it('keeps a token short only for this call when the PS refuses its step-up', async () => {
+    const exhausted = new Set<string>()
+    world({ exhausted, reason: 'insufficient-budget' })
+    const cfg = config()
+    await invokeAtResource(cfg, l1(), 'search_entities')
+    const [first] = await heldAuth(cfg)
+    exhausted.add(first!.jti!)
+    const base = mockSignedFetch.getMockImplementation()!
+    mockSignedFetch.mockImplementation(async (url: string, init: { body?: string }) => {
+      if (url === PS_METADATA.auth_token_endpoint && String(JSON.parse(init.body!).resource_token).startsWith('rt-step')) {
+        return Response.json({ error: 'invalid_resource_token' }, { status: 400 })
+      }
+      return base(url, init)
+    })
+
+    const refused = await invokeAtResource(cfg, l1(), 'search_entities')
+    expect(refused).toMatchObject({ kind: 'result', status: 400 })
+    expect((await heldAuth(cfg)).map((t) => t.jti)).toEqual([first!.jti])
   })
 
   it('does not keep a per-call token in place of the held one', async () => {
