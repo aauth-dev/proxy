@@ -129,10 +129,14 @@ describe('proxy log sink', () => {
     const l1 = memoryL1([entry('gmail.example')])
     const { client, events, close } = await connectClient(l1)
     try {
-      await client.callTool({
-        name: 'connect_resources',
-        arguments: { items: [{ resource: 'gmail.example', account: 'person@example.com' }] },
-      })
+      // The first call hands the URL over at once; the second waits on it,
+      // which is where the poll happens.
+      for (let i = 0; i < 2; i++) {
+        await client.callTool({
+          name: 'connect_resources',
+          arguments: { items: [{ resource: 'gmail.example', account: 'person@example.com' }] },
+        })
+      }
 
       const call = events.find((e) => e.event === 'tool.call')
       expect(call?.fields).toMatchObject({ tool: 'connect_resources', items: 1, resources: ['gmail.example'] })

@@ -38,7 +38,7 @@ export type { AccessModePlan, AgentSetup, KnownAccessMode } from './access-mode.
 export { agentTokenPs, decodeJwtHeader, decodeJwtPayload, jwkThumbprint, jwtExp } from './jwt.js'
 
 export { buildProxyTools } from './tools.js'
-export type { ConnectFlight, ProxyDeps } from './tools.js'
+export type { ConnectDone, ConnectFlight, ProxyDeps } from './tools.js'
 
 export type { BootstrapStatus, IdentityProvider } from './identity.js'
 
