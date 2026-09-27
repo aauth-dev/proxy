@@ -789,7 +789,7 @@ async function authorizeAtResource(
   vocabulary: string,
   operations: Array<Record<string, string>>,
   account?: string,
-): Promise<{ kind: 'resourceToken'; resourceToken: string } | { kind: 'result'; status: number; body: unknown }> {
+): Promise<{ kind: 'resourceToken'; resourceToken: string } | { kind: 'result'; status: number; body: unknown; requirement?: string }> {
   const res = await signWith(cfg, { kind: 'person', jwt: personToken })(endpoint, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
@@ -806,7 +806,12 @@ async function authorizeAtResource(
       ...(account ? { account } : {}),
     }),
   })
-  if (!res.ok) return { kind: 'result', status: res.status, body: await safeBody(res) }
+  if (!res.ok) {
+    // What the resource asks for instead, when it says: `person-token` means
+    // the one presented is dead to it (revoked, or expired by its clock).
+    const requirement = parseRequirement(res.headers.get('aauth-requirement'))?.requirement
+    return { kind: 'result', status: res.status, body: await safeBody(res), ...(requirement ? { requirement } : {}) }
+  }
   const { resource_token } = (await res.json()) as { resource_token?: string }
   if (!resource_token) {
     // The resource handled authorization itself and issued no resource token.
@@ -879,10 +884,21 @@ async function openWithAuthToken(
     const reason = current ? 'grow' : lapsed && wasInUse(lapsed) ? 'refresh' : 'initial'
     const operations = await requestedOperations(cfg, { l1, route, operationId, entry, key, reason, held: current, lapsed })
 
-    const pt = await obtainPersonToken(cfg, await needPS(), l1.issuer, missionS256)
+    let pt = await obtainPersonToken(cfg, await needPS(), l1.issuer, missionS256)
     if (pt.kind !== 'token') return pt
-    const authz = await authorizeAtResource(cfg, l1.authorization_endpoint, pt.personToken, vocabulary, operations, account)
-    if (authz.kind !== 'resourceToken') return authz
+    let authz = await authorizeAtResource(cfg, l1.authorization_endpoint, pt.personToken, vocabulary, operations, account)
+    if (authz.kind === 'result' && authz.requirement === 'person-token') {
+      // The resource will not take the held person token — the person revoked
+      // the agent, or the token lapsed by the resource's clock. Replace it once,
+      // as the requirement loop does when an API call is refused this way
+      // (2026-09-27: after a binding removal the revoked token was presented on
+      // every call, and every call answered 401 revoked_jwt).
+      await dropPresented(cfg, personKey(l1.issuer, missionS256), pt.personToken, 'refused')
+      pt = await obtainPersonToken(cfg, await needPS(), l1.issuer, missionS256)
+      if (pt.kind !== 'token') return pt
+      authz = await authorizeAtResource(cfg, l1.authorization_endpoint, pt.personToken, vocabulary, operations, account)
+    }
+    if (authz.kind !== 'resourceToken') return { kind: 'result', status: authz.status, body: authz.body }
     const ex = await exchangeAtPSAndWait(cfg, await needPS(), authz.resourceToken, pt.personToken)
     if (ex.kind !== 'token') return ex
     const rec = await adoptAuthToken(cfg, key, ex.authToken, reason, pt.personToken)
