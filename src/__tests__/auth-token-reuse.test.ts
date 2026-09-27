@@ -455,6 +455,40 @@ describe('step-up and per-call', () => {
     expect((await heldAuth(cfg)).map((t) => t.jti)).not.toContain(held!.jti)
     expect(w.calls.length).toBeGreaterThan(0)
   })
+
+  it('replaces the person token when the authorization endpoint refuses it with requirement=person-token', async () => {
+    const w = world()
+    const cfg = config()
+    await invokeAtResource(cfg, l1(), 'search_entities')
+
+    // The person removed the agent at the PS: the resource now refuses the
+    // cached person token at /authorize. Growing the held token for add_record
+    // goes authorize-first and hits it.
+    const base = mockSignedFetch.getMockImplementation()!
+    let refused = 0
+    mockSignedFetch.mockImplementation(async (url: string, init: { signatureKey?: { jwt?: string } }) => {
+      if (url === AUTHORIZE && refused === 0) {
+        refused++
+        w.calls.push({ url, jwt: init.signatureKey?.jwt })
+        return Response.json({ error: 'revoked_jwt' }, {
+          status: 401,
+          headers: { 'aauth-requirement': 'requirement=person-token', 'signature-error': 'error=revoked_jwt' },
+        })
+      }
+      return base(url, init)
+    })
+
+    const result = await invokeAtResource(cfg, l1(), 'add_record')
+    expect(result).toMatchObject({ kind: 'result', status: 200 })
+    // /authorize: the first call, the refusal, the retry with a new token.
+    const authorizes = w.calls.filter((c) => c.url === AUTHORIZE)
+    expect(authorizes).toHaveLength(3)
+    expect(authorizes[2]!.jwt).not.toBe(authorizes[1]!.jwt)
+    // A fresh person token was obtained; the refused one is not held any more.
+    expect(w.personTokens()).toHaveLength(2)
+    const personHeld = (await listTokens(cfg)).filter((t) => t.kind === 'person')
+    expect(personHeld.map((t) => t.value)).toEqual([authorizes[2]!.jwt])
+  })
 })
 
 describe('step-up races and narrower tokens', () => {
