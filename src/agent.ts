@@ -21,7 +21,7 @@ import { fetch as signedFetch } from '@hellocoop/httpsig'
 import { planAccessMode } from './access-mode.js'
 import type { AccessModePlan, KnownAccessMode } from './access-mode.js'
 import { agentTokenPs, decodeJwtPayload, jwkThumbprint, jwtExp } from './jwt.js'
-import { loggedFetch, logUrl } from './log.js'
+import { callLogged } from './log.js'
 import type { ProxyLog } from './log.js'
 import { listOperationsForResource, routeOperation } from './resource.js'
 import type { RoutedOperation } from './resource.js'
@@ -119,6 +119,12 @@ export interface ProxyConfig {
    * the tools copy it here when the identity provider left it unset.
    */
   log?: ProxyLog
+  /**
+   * Keeps the writing of an `aauth.call` record alive past the response that
+   * ends the host's request: in a Worker, `(p) => ctx.waitUntil(p)`. Without
+   * it the record is written once the response body has been read, unawaited.
+   */
+  waitUntil?: (p: Promise<unknown>) => void
 }
 
 export interface InvokeArgs {
@@ -229,15 +235,13 @@ function signWith(cfg: ProxyConfig, cred: Credential, opts: { psOrAs?: boolean }
       authorization: cred.kind === 'session',
       psOrAs: opts.psOrAs,
     })
-    return loggedFetch(cfg.log, 'aauth.request', { credential: cred.kind, method: init.method ?? 'GET', url: logUrl(url) }, () =>
-      signedFetch(url, {
-        ...init,
-        headers,
-        signingKey: cfg.agentPrivateJwk,
-        signatureKey: { type: 'jwt', jwt },
-        ...(list ? { components: list } : {}),
-      }),
-    )
+    return callLogged(signedFetch, cfg, url)(url, {
+      ...init,
+      headers,
+      signingKey: cfg.agentPrivateJwk,
+      signatureKey: { type: 'jwt', jwt },
+      ...(list ? { components: list } : {}),
+    })
   }
 }
 

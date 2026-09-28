@@ -12,15 +12,18 @@
 //                       tool, resource?, op_id?, account? (boolean), items?
 //                       (count, connect_resources), resources? (their hosts),
 //                       ok, error?, duration_ms
-//   aauth.request     — one per signed request the agent makes: to the PS
+//   aauth.call        — one per signed request the agent makes: to the PS
 //                       (token endpoints, polls), the resource (authorization,
 //                       the operation itself, connections), or the registry.
-//                       credential (agent|person|auth|session), method, url
-//                       (origin + path, query stripped), status, ok,
-//                       requirement? (AAuth-Requirement on the response),
-//                       error_code? (non-2xx: the body's `error` string, or
-//                       `error.message` — the code only, never the body),
-//                       duration_ms, error? (fetch threw)
+//                       The @aauth/call-log record (aauth-dev/monitor
+//                       plan/CALL_RECORD.md), whole: side 'caller', call_id
+//                       (SHA-256 of the Signature header — the callee's own
+//                       record carries the same one), from (the agent), to,
+//                       to_role, agent, method, path, query, status,
+//                       started_at, duration_ms, signed, request/response
+//                       bodies up to 8 KB, response.params (AAuth-Requirement,
+//                       Signature-Error, AAuth-Budget parsed), error, level,
+//                       msg. Hosts forward it with its fields top-level.
 //   resource.fetch    — the resource's /.well-known/aauth-resource.json.
 //                       host, status?, ok, duration_ms, error?
 //   token.hit         — a held token presented instead of obtaining one (no
@@ -47,17 +50,62 @@
 //                       delivered — names only), status? (gone), age_ms?
 //                       (abandoned)
 //
-// Never carried: token values, request or response bodies, invoke's
-// path_params / query / body, or the connect `account` value. Those are the
-// person's data or credentials; the sink gets the shape of the call, not its
-// content. The one thing lifted out of a failure body is its error CODE
-// (`account_required`, `NO_SESSION`): without it a 400 from a resource is
-// indistinguishable from any other 400 (prod, 2026-09-15), and a code is the
-// shape of the failure, not the person's data. `detail` and the like stay
-// out — they can echo what was submitted.
+// `aauth.call` carries the call's content: bodies up to 8 KB and the query
+// (Dick, 2026-09-28: the call log sends bodies if small). A token in it is
+// `{ type, payload }` — the claims, never the JWT — and the opaque session
+// token rides only in the AAuth-Access and Authorization headers, which no
+// record carries. So no event holds a presentable credential.
+//
+// Every other event carries the shape of a call, not its content: never
+// token values, bodies, invoke's path_params / query / body, or the connect
+// `account` value. The one thing lifted out of a failure body is its error
+// CODE (`account_required`, `NO_SESSION`): without it a 400 from a resource
+// is indistinguishable from any other 400 (prod, 2026-09-15). `detail` and
+// the like stay out — they can echo what was submitted.
+
+import { loggedHttpsigFetch, type CallLogHost, type HttpsigFetchLike } from '@aauth/call-log'
+import { decodeJwtPayload } from './jwt.js'
 
 export type ProxyLogFields = Record<string, unknown>
 export type ProxyLog = (event: string, fields: ProxyLogFields) => void
+
+const originOf = (url: string): string | undefined => {
+  try {
+    return new URL(url).origin
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * A signed fetch for a request to `url` that writes its `aauth.call` record
+ * to the sink. Without a sink it is `signedFetch` itself. `to_role` is `ps`
+ * for the Person Server's origin and `resource` otherwise: the agent calls
+ * nothing else (the registry is a resource).
+ */
+export function callLogged<F>(
+  signedFetch: F,
+  cfg: { log?: ProxyLog; waitUntil?: (p: Promise<unknown>) => void; agentToken: string; psUrl: string },
+  url: string,
+): F {
+  const log = cfg.log
+  if (!log) return signedFetch
+  let agent: string | undefined
+  try {
+    const sub = decodeJwtPayload(cfg.agentToken).sub
+    if (typeof sub === 'string') agent = sub
+  } catch {
+    /* an unreadable agent token names no agent */
+  }
+  const host: CallLogHost = {
+    origin: agent ?? 'agent',
+    role: 'agent',
+    log: (record) => log('aauth.call', record as unknown as ProxyLogFields),
+    defer: cfg.waitUntil,
+  }
+  const to_role = originOf(url) !== undefined && originOf(url) === originOf(cfg.psUrl) ? 'ps' : 'resource'
+  return loggedHttpsigFetch(signedFetch as unknown as HttpsigFetchLike, host, { to_role, agent }) as unknown as F
+}
 
 /** origin + pathname only — a query string can carry the person's data. */
 export function logUrl(url: string): string {

@@ -12,7 +12,7 @@ import { dirname, join } from 'node:path'
 import { fetch as signedFetch } from '@hellocoop/httpsig'
 import type { ProxyConfig } from './agent.js'
 import type { AccessMode } from './store.js'
-import { loggedFetch, logUrl } from './log.js'
+import { callLogged } from './log.js'
 
 export interface RegistryEntry {
   issuer: string
@@ -113,14 +113,12 @@ export async function fetchRegistry(cfg: ProxyConfig, cache: RegistryCache): Pro
   const headers: Record<string, string> = { accept: 'application/json' }
   if (cached?.etag) headers['if-none-match'] = cached.etag
 
-  const res = await loggedFetch(cfg.log, 'aauth.request', { credential: 'agent', method: 'GET', url: logUrl(url) }, () =>
-    signedFetch(url, {
-      method: 'GET',
-      headers,
-      signingKey: cfg.agentPrivateJwk,
-      signatureKey: { type: 'jwt', jwt: cfg.agentToken },
-    }),
-  )
+  const res = await callLogged(signedFetch, cfg, url)(url, {
+    method: 'GET',
+    headers,
+    signingKey: cfg.agentPrivateJwk,
+    signatureKey: { type: 'jwt', jwt: cfg.agentToken },
+  })
 
   if (res.status === 304 && cached) return cached.index
   if (!res.ok) {

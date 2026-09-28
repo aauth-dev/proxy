@@ -1,10 +1,12 @@
 // The proxy's event sink (log.ts): a host wires ProxyDeps.log and gets one
 // `tool.call` per tool invocation plus the AAuth exchange underneath it —
-// `aauth.request` for every signed call, `resource.fetch` for metadata,
+// `aauth.call` for every signed call, `resource.fetch` for metadata,
 // `person_token.hit` for a cache hit. Driven through a real MCP server over an
 // in-memory transport so the wrapper around registerTool is what is under test.
 //
-// The privacy contract is asserted too: identifiers yes, values never.
+// The privacy contract is asserted too: `aauth.call` carries the call's
+// content with tokens as payload only; every other event carries identifiers,
+// never values.
 
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
@@ -28,7 +30,11 @@ const PS_METADATA = {
 }
 
 const b64 = (o: unknown) => Buffer.from(JSON.stringify(o)).toString('base64url')
-const AGENT_TOKEN = `${b64({ alg: 'Ed25519', typ: 'aa-agent+jwt' })}.${b64({ iss: 'https://agent.example', ps: 'https://ps.example' })}.sig`
+const AGENT = 'aauth:owl@agent.example'
+const AGENT_TOKEN = `${b64({ alg: 'Ed25519', typ: 'aa-agent+jwt' })}.${b64({ iss: 'https://agent.example', sub: AGENT, ps: 'https://ps.example' })}.sig`
+// Tokens as they are on the wire: a record holds their payload, never the JWT.
+const PERSON_TOKEN = `${b64({ alg: 'Ed25519', typ: 'aa-person+jwt' })}.${b64({ iss: 'https://ps.example', sub: 'pw_1', jti: 'ptk_1' })}.cHRfc2VjcmV0`
+const RESOURCE_TOKEN = `${b64({ alg: 'Ed25519', typ: 'aa-resource+jwt' })}.${b64({ iss: 'https://gmail.example', aud: 'https://ps.example' })}.cnRfY29ubg`
 
 const makeResponse = (status: number, body: unknown, headers: Record<string, string> = {}): Response =>
   new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json', ...headers } })
@@ -72,7 +78,9 @@ const makeCfg = (): ProxyConfig => ({
 async function connectClient(l1: L1Store) {
   const events: { event: string; fields: ProxyLogFields }[] = []
   const server = new McpServer({ name: 'test', version: '0.0.0' })
-  const cfg = makeCfg()
+  // A host's waitUntil: the test awaits every record the proxy deferred.
+  const deferred: Promise<unknown>[] = []
+  const cfg: ProxyConfig = { ...makeCfg(), waitUntil: (p) => void deferred.push(p) }
   await buildProxyTools(server, {
     l1,
     registryCache: { read: async () => undefined, write: async () => {} },
@@ -83,7 +91,8 @@ async function connectClient(l1: L1Store) {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
   const client = new Client({ name: 'test-client', version: '0.0.0' })
   await Promise.all([server.connect(serverTransport), client.connect(clientTransport)])
-  return { client, cfg, events, close: async () => void (await client.close()) }
+  const settled = async () => void (await Promise.all(deferred))
+  return { client, cfg, events, settled, close: async () => void (await client.close()) }
 }
 
 beforeEach(() => {
@@ -109,12 +118,12 @@ describe('proxy log sink', () => {
     }
   })
 
-  it('reports the signed AAuth requests underneath connect_resources — url without query, no token, no account value', async () => {
+  it('writes an aauth.call record for every signed request under connect_resources — the agent as caller, tokens as payload only', async () => {
     mockSignedFetch.mockImplementation(async (url: string, init?: { method?: string }) => {
-      if (url === 'https://ps.example/person') return makeResponse(200, { person_token: 'pt_secret', expires_in: 3600 })
+      if (url === 'https://ps.example/person') return makeResponse(200, { person_token: PERSON_TOKEN, expires_in: 3600 })
       if (url.endsWith('/connections')) {
         return (init?.method ?? 'GET') === 'POST'
-          ? makeResponse(200, { resource_token: 'rt_conn' })
+          ? makeResponse(200, { resource_token: RESOURCE_TOKEN })
           : makeResponse(200, { connections: [] })
       }
       if (url === 'https://ps.example/token') {
@@ -127,7 +136,7 @@ describe('proxy log sink', () => {
       throw new Error(`unexpected signed fetch: ${url}`)
     })
     const l1 = memoryL1([entry('gmail.example')])
-    const { client, events, close } = await connectClient(l1)
+    const { client, events, settled, close } = await connectClient(l1)
     try {
       // The first call hands the URL over at once; the second waits on it,
       // which is where the poll happens.
@@ -137,70 +146,84 @@ describe('proxy log sink', () => {
           arguments: { items: [{ resource: 'gmail.example', account: 'person@example.com' }] },
         })
       }
-
+      await settled()
       const call = events.find((e) => e.event === 'tool.call')
       expect(call?.fields).toMatchObject({ tool: 'connect_resources', items: 1, resources: ['gmail.example'] })
 
-      const reqs = events.filter((e) => e.event === 'aauth.request').map((e) => e.fields)
-      const urls = reqs.map((r) => r.url as string)
-      expect(urls).toContain('https://ps.example/person')
-      expect(urls).toContain('https://gmail.example/connections')
-      expect(urls).toContain('https://ps.example/token')
-      // The poll URL's query string is stripped.
-      expect(urls.some((u) => u.startsWith('https://ps.example/pending/CODE-1'))).toBe(true)
-      expect(urls.every((u) => !u.includes('?'))).toBe(true)
-      // Credential kinds are named; the person-token POST to the resource is signed with the person token.
-      expect(reqs.find((r) => r.url === 'https://gmail.example/connections' && r.method === 'POST')?.credential).toBe('person')
-      expect(reqs.find((r) => r.url === 'https://ps.example/token')).toMatchObject({ status: 202, requirement: 'interaction' })
+      expect(events.some((e) => e.event === 'aauth.request')).toBe(false)
+      const records = events.filter((e) => e.event === 'aauth.call').map((e) => e.fields)
+      for (const r of records) {
+        expect(r).toMatchObject({ event: 'aauth.call', side: 'caller', from: AGENT, from_role: 'agent', agent: AGENT })
+        expect(typeof r.call_id).toBe('string')
+        expect(typeof r.duration_ms).toBe('number')
+      }
+      const at = (to: string, path: string, method?: string) =>
+        records.find((r) => r.to === to && r.path === path && (!method || r.method === method))
+      // The PS: the person token comes back as its payload.
+      expect(at('https://ps.example', '/person')).toMatchObject({
+        to_role: 'ps',
+        status: 200,
+        response: { body: { person_token: { type: 'aa-person+jwt', payload: { iss: 'https://ps.example', jti: 'ptk_1' } } } },
+      })
+      // The resource: the connection request signed with the person token, its resource token as payload.
+      expect(at('https://gmail.example', '/connections', 'POST')).toMatchObject({
+        to_role: 'resource',
+        response: { body: { resource_token: { type: 'aa-resource+jwt', payload: { iss: 'https://gmail.example' } } } },
+      })
+      // The challenge: AAuth-Requirement parsed, a 202 at info level.
+      expect(at('https://ps.example', '/token')).toMatchObject({
+        to_role: 'ps',
+        status: 202,
+        level: 30,
+        response: { params: { 'AAuth-Requirement': { requirement: 'interaction', code: 'CODE-1' } } },
+      })
+      // The poll, with its query: the record is the whole call.
+      expect(records.find((r) => r.to === 'https://ps.example' && String(r.path).startsWith('/pending/CODE-1'))).toMatchObject({ query: 'secret=1' })
 
-      // Nothing sensitive anywhere in the stream.
+      // No JWT anywhere, so nothing presentable: not a token, not its signature.
       const serialized = JSON.stringify(events)
-      expect(serialized).not.toContain('pt_secret')
-      expect(serialized).not.toContain('rt_conn')
-      expect(serialized).not.toContain('person@example.com')
-      expect(serialized).not.toContain('secret=1')
+      expect(serialized).not.toMatch(/eyJ[A-Za-z0-9_-]{20,}\.eyJ/)
+      expect(serialized).not.toContain('cHRfc2VjcmV0')
+      expect(serialized).not.toContain('cnRfY29ubg')
+      // Every other event keeps to identifiers.
+      const others = JSON.stringify(events.filter((e) => e.event !== 'aauth.call'))
+      expect(others).not.toContain('person@example.com')
+      expect(others).not.toContain('secret=1')
     } finally {
       await close()
     }
   })
 
-  it('a non-2xx aauth.request carries the error CODE and nothing else from the body', async () => {
-    // The two shapes seen in production: a resource's OAuth-style
-    // `{"error":"account_required", …}` and the wallet's
-    // `{"error":{"message":"NO_SESSION"}}`. Without the code a 400 was
-    // indistinguishable from any other 400 (2026-09-15); the rest of the body
-    // (`detail`, `account_description`) stays out — it can echo what was sent.
-    mockSignedFetch.mockImplementation(async (url: string, init?: { method?: string }) => {
+  it('a non-2xx call is recorded with its error code at warn level, and the caller still reads the body', async () => {
+    // The two shapes seen in production: the wallet's
+    // `{"error":{"message":"NO_SESSION"}}` and a resource's OAuth-style
+    // `{"error":"account_required", …}`.
+    mockSignedFetch.mockImplementation(async (url: string) => {
       if (url === 'https://ps.example/person') {
         return makeResponse(403, { error: { message: 'NO_SESSION' }, detail: 'session for person@example.com' })
       }
       throw new Error(`unexpected signed fetch: ${url}`)
     })
     const l1 = memoryL1([entry('github.example')])
-    const { client, events, close } = await connectClient(l1)
+    const { client, events, settled, close } = await connectClient(l1)
     try {
       const result = await client.callTool({
         name: 'connect_resources',
         arguments: { items: [{ resource: 'github.example', account: 'octocat' }] },
       })
-      const req = events.find((e) => e.event === 'aauth.request' && e.fields.url === 'https://ps.example/person')
-      expect(req?.fields).toMatchObject({ status: 403, ok: false, error_code: 'NO_SESSION' })
-      expect(req?.fields.error).toBeUndefined() // `error` means the fetch threw; it did not
+      await settled()
+      const record = events.find((e) => e.event === 'aauth.call' && e.fields.path === '/person')
+      expect(record?.fields).toMatchObject({ status: 403, level: 40, error: 'NO_SESSION', to_role: 'ps' })
 
-      // The caller still reads the body itself (logging reads a clone).
+      // The caller still reads the body itself (the record reads a clone).
       const text = (result as { content: { text?: string }[] }).content.map((c) => c.text ?? '').join('')
       expect(text).toContain('NO_SESSION')
-
-      const serialized = JSON.stringify(events)
-      expect(serialized).not.toContain('person@example.com')
-      expect(serialized).not.toContain('detail')
     } finally {
       await close()
     }
 
-    // A string `error` (resource proxies): the code is lifted, its neighbours are not.
     mockSignedFetch.mockImplementation(async (url: string, init?: { method?: string }) => {
-      if (url === 'https://ps.example/person') return makeResponse(200, { person_token: 'pt_secret', expires_in: 3600 })
+      if (url === 'https://ps.example/person') return makeResponse(200, { person_token: PERSON_TOKEN, expires_in: 3600 })
       if (url === 'https://github.example/connections' && init?.method === 'POST') {
         return makeResponse(400, { error: 'account_required', account_description: 'GitHub username', detail: 'octocat' })
       }
@@ -212,11 +235,13 @@ describe('proxy log sink', () => {
         name: 'connect_resources',
         arguments: { items: [{ resource: 'github.example', account: 'octocat' }] },
       })
-      const req = second.events.find((e) => e.event === 'aauth.request' && e.fields.url === 'https://github.example/connections')
-      expect(req?.fields).toMatchObject({ status: 400, ok: false, error_code: 'account_required' })
-      const serialized = JSON.stringify(second.events)
-      expect(serialized).not.toContain('GitHub username')
-      expect(serialized).not.toContain('octocat')
+      await second.settled()
+      const record = second.events.find((e) => e.event === 'aauth.call' && e.fields.to === 'https://github.example' && e.fields.path === '/connections')
+      expect(record?.fields).toMatchObject({ status: 400, level: 40, error: 'account_required', to_role: 'resource' })
+      // tool.call and the rest keep to identifiers.
+      const others = JSON.stringify(second.events.filter((e) => e.event !== 'aauth.call'))
+      expect(others).not.toContain('octocat')
+      expect(others).not.toContain('GitHub username')
     } finally {
       await second.close()
     }
