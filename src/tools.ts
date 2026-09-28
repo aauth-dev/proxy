@@ -405,8 +405,8 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
   // a resource that does not exist yet, or is built but gated by its provider
   // — with the reason verbatim and how many people have registered interest.
   // Its access_mode is not planned against, so it carries no skip_reason.
-  function catalogRow(r: RegistryEntry, added: Set<string>, setup: AgentSetup) {
-    const host = canonicalizeHost(r.issuer)?.host ?? r.issuer
+  function catalogRow(r: RegistryEntry, setup: AgentSetup) {
+    const host = catalogHost(r)
     const coming = isComing(r)
     const reason = coming ? undefined : skipReason(r.access_mode, setup)
     return {
@@ -415,7 +415,6 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       description: r.description,
       access_mode: r.access_mode,
       added: r.added,
-      connected: added.has(host),
       // So the first connect names the account instead of learning it from an
       // `account_required` 400 (2026-09-25: 13 Google connects, all refused).
       ...(r.account_description ? { account_description: r.account_description } : {}),
@@ -426,6 +425,24 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       ...(reason ? { skip_reason: reason } : {}),
       ...(r.logo_uri ? { logo_uri: r.logo_uri } : {}),
     }
+  }
+
+  const catalogHost = (r: RegistryEntry): string => canonicalizeHost(r.issuer)?.host ?? r.issuer
+
+  // Connected: in this agent's set and callable. A resource that needs no
+  // upstream link is callable once added; one that needs a link is callable
+  // once the person has one on record. A resource added by a connect that did
+  // not finish is not connected, so find_resources still offers it.
+  const isConnected = (e: L1Entry): boolean => !e.connection || (e.connections?.length ?? 0) > 0
+
+  // A resource's `{"error":"account_required"}` refusal: what the account
+  // must be, from the body or else the resource's metadata. Undefined when
+  // neither says, and the refusal stays an `error` with its body.
+  const accountRequired = (body: unknown, e: L1Entry): string | undefined => {
+    const b = body as { error?: unknown; account_description?: unknown } | undefined
+    if (!b || typeof b !== 'object' || b.error !== 'account_required') return undefined
+    if (typeof b.account_description === 'string') return b.account_description
+    return e.connection?.account_description
   }
 
   // Re-read this person's connections from the resource and cache them on L1.
@@ -485,7 +502,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     'find_resources',
     {
       description: describeWithL1(
-        'Search the AAuth registry for discoverable resources by free-text query against name, description, host and `upstream` (the API a resource fronts, e.g. api.github.com). With no query, returns the whole catalog plus `new_since_last_seen` — resources added since you last looked. Each result is tagged `connected: true` if already in your set. A result carrying `account_description` needs an account named on connect: ask the person for it (a Google email, a GitHub username) and pass it as `account` in connect_resources. A result carrying `skip_reason` declares an access_mode this agent cannot complete — do not connect or plan against it.\n\nAvailable resources come first. A result carrying `availability` is COMING: not yet public — unbuilt, or built but gated by its provider — and `availability` says why, verbatim. Read this freely — before telling the person a service is impossible, check whether it is listed as coming, including by `upstream`. Do not register interest or send feedback on the person\'s behalf unless they actually asked for that resource.',
+        'Search the AAuth registry for resources you are not connected to yet, by free-text query against name, description, host and `upstream` (the API a resource fronts, e.g. api.github.com). With no query, returns the whole catalog plus `new_since_last_seen` — resources added since you last looked. Resources you are connected to (in your set and callable) are left out: list_resources shows those. A result carrying `account_description` needs an account named on connect: ask the person for it (a Google email, a GitHub username) and pass it as `account` in connect_resources. A result carrying `skip_reason` declares an access_mode this agent cannot complete — do not connect or plan against it.\n\nAvailable resources come first. A result carrying `availability` is COMING: not yet public — unbuilt, or built but gated by its provider — and `availability` says why, verbatim. Read this freely — before telling the person a service is impossible, check whether it is listed as coming, including by `upstream`. Do not register interest or send feedback on the person\'s behalf unless they actually asked for that resource.',
       ),
       inputSchema: z.object({ query: z.string().optional() }),
     },
@@ -496,8 +513,8 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       try {
         const index = await fetchRegistry(c.cfg, registryCache)
         const q = (query ?? '').trim().toLowerCase()
-        const added = new Set((await l1.list()).map((e) => e.resource))
-        const ordered = orderCatalog(index.resources)
+        const connected = new Set((await l1.list()).filter(isConnected).map((e) => e.resource))
+        const ordered = orderCatalog(index.resources).filter((r) => !connected.has(catalogHost(r)))
         if (q) {
           const resources = ordered
             .filter(
@@ -507,14 +524,14 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
                 r.issuer.toLowerCase().includes(q) ||
                 (r.upstream?.toLowerCase().includes(q) ?? false),
             )
-            .map((r) => catalogRow(r, added, setup))
+            .map((r) => catalogRow(r, setup))
           return json({ resources })
         }
         // The catalog, and what is new since this person last looked (N5/H2):
         // the watermark is the index's own `updated` stamp, kept by the host.
         const lastSeen = await deps.lastSeen?.get()
-        const resources = ordered.map((r) => catalogRow(r, added, setup))
-        const fresh = lastSeen ? ordered.filter((r) => r.added > lastSeen).map((r) => catalogRow(r, added, setup)) : undefined
+        const resources = ordered.map((r) => catalogRow(r, setup))
+        const fresh = lastSeen ? ordered.filter((r) => r.added > lastSeen).map((r) => catalogRow(r, setup)) : undefined
         if (deps.lastSeen && index.updated) await deps.lastSeen.set(index.updated)
         return json({ resources, ...(fresh ? { new_since_last_seen: fresh } : {}) })
       } catch (err) {
@@ -528,8 +545,8 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     {
       description: describeWithL1(
         'Connect one or more AAuth resources for this person in ONE call. Pass `items`, each `{resource, account?, scopes?}` — a bare host, host:port, or full URL; the agent proxy canonicalizes.\n\n' +
-          'ONE CALL, ONE RESULT (D14): the call waits until every item has finished, reporting progress as each lands. The person works through connections one at a time in their wallet, so the proxy keeps two live at once and starts the next as each finishes — a long list does not mint many short-lived codes that expire before the person reaches them. Each item answers `connected`, `ready`, `still_pending`, `queued` (accepted, waiting for a live slot), `timed_out` or `error`. The call returns early in two cases: the person must open a URL (show it, then call again with the SAME items), or the wait ran out (the result carries `next`: call again with the SAME items). A repeat call resumes live items, starts queued ones, and answers finished ones without asking the resource again. Do not invoke these resources until the call has returned; if your client moves a long call to the background, wait for its result.\n\n' +
-          'Before calling: ask the person which services and which accounts. When a resource declares `account_description` (find_resources shows it), you MUST pass `account` for that item (the identifier it describes — a Google email, a GitHub username); when it does not, you MUST NOT (the account is chosen in the provider\'s own UI). One item per (resource × account); an already-linked account answers `ready`. `scopes` optionally narrows or widens within the resource\'s declared `connection.scopes[]` (defaults are the read set; write scopes ride the first write). Agent-token resources need no link and answer `ready`. A resource the registry lists as coming (`availability` in find_resources) is still tried; its row carries `availability`, the likely reason if it fails or if calls are later refused.',
+          'ONE CALL, ONE RESULT (D14): the call waits until every item has finished, reporting progress as each lands. The person works through connections one at a time in their wallet, so the proxy keeps two live at once and starts the next as each finishes — a long list does not mint many short-lived codes that expire before the person reaches them. Each item answers `connected`, `ready`, `account_required`, `still_pending`, `queued` (accepted, waiting for a live slot), `timed_out` or `error`. The call returns early in two cases: the person must open a URL (show it, then call again with the SAME items), or the wait ran out (the result carries `next`: call again with the SAME items). A repeat call resumes live items, starts queued ones, and answers finished ones without asking the resource again. Do not invoke these resources until the call has returned; if your client moves a long call to the background, wait for its result.\n\n' +
+          'Before calling: ask the person which services and which accounts. When a resource declares `account_description` (find_resources shows it), you MUST pass `account` for that item (the identifier it describes — a Google email, a GitHub username); when it does not, you MUST NOT (the account is chosen in the provider\'s own UI). An item without `account` at a resource that needs one answers `account_required` with its `account_description`, and nothing is started: call again with `account` on that item — the account the person named, or ask them which. One item per (resource × account); an already-linked account answers `ready`. `scopes` optionally narrows or widens within the resource\'s declared `connection.scopes[]` (defaults are the read set; write scopes ride the first write). Agent-token resources need no link and answer `ready`. A resource the registry lists as coming (`availability` in find_resources) is still tried; its row carries `availability`, the likely reason if it fails or if calls are later refused.',
       ),
       inputSchema: z.object({
         items: z
@@ -657,12 +674,19 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
             }
             return
           }
-          case 'error':
+          case 'error': {
             await inflight.clear(host)
+            const needed = item.account ? undefined : accountRequired(outcome.body, entry)
+            if (needed) {
+              row.outcome = 'account_required'
+              row.account_description = needed
+              return
+            }
             row.outcome = 'error'
             row.status = outcome.status
             row.body = outcome.body
             return
+          }
           case 'interaction':
             // Never settled here: the caller converts it to a flight first.
             row.outcome = 'still_pending'
@@ -779,6 +803,17 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
         if (!entry.connection) {
           row.outcome = 'ready'
           row.reason = 'no_connection_needed'
+          continue
+        }
+
+        // The resource's own metadata says a connect must name an account, and
+        // this item names none: answer that here instead of starting a connect
+        // the resource can only refuse. The registry copy of
+        // account_description can lag the resource's (2026-09-28: 13 Google
+        // items sent without one, all refused with account_required).
+        if (!item.account && entry.connection.account_description) {
+          row.outcome = 'account_required'
+          row.account_description = entry.connection.account_description
           continue
         }
 
@@ -980,7 +1015,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     'delete_resource',
     {
       description: describeWithL1(
-        'Delete a resource from your set: disconnects every upstream account the resource holds for this person (revoking the grant at the provider where the resource can — the result says what happened at each, and when the person must revoke at the provider themselves), then forgets the resource locally. Consents recorded at the Person Server are not touched.',
+        'Delete a resource from your set: asks the resource to disconnect every upstream account it holds for this person, then forgets the resource locally. The proxy revokes nothing at the provider. Each row in `disconnected` carries the resource\'s own `detail` — relay it to the person: it says whether the grant is still active at the provider and where to revoke it. Consents recorded at the Person Server are not touched.',
       ),
       inputSchema: z.object({ resource: z.string() }),
     },
