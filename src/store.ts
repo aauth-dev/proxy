@@ -73,6 +73,10 @@ export interface L1Entry {
   interaction_endpoint?: string
   // The whole `connection` object, when the resource publishes one (N1).
   connection?: ConnectionMetadata
+  // The resource's `documentation_uri` (protocol §Resource Metadata). When it
+  // serves text or markdown, get_operation_schemas returns it as `context`
+  // (resource.ts loadResourceContext).
+  documentation_uri?: string
   // Known connections for this person, as last read from
   // `GET {connection.endpoint}` (N2/N5). A cache: list_resources refreshes it,
   // connect_resources refreshes it after a flow completes.

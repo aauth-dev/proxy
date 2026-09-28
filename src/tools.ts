@@ -49,6 +49,7 @@ import {
   refreshResourceEntry,
   getOperationsForResource,
   listOperationsForResource,
+  loadResourceContext,
   toL1Entry,
 } from './resource.js'
 import type { DocCache } from './resource.js'
@@ -1041,7 +1042,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     'get_operation_schemas',
     {
       description: describeWithL1(
-        'Batch fetch full schemas (params, request body, response) for one or more operations on a resource. Separate from list_operations because schemas dominate token cost. Each detail also carries the operation\'s `access_mode` and `budget`, as list_operations returns them.',
+        'Batch fetch full schemas (params, request body, response) for one or more operations on a resource. Separate from list_operations because schemas dominate token cost. Returns `{ context?, context_url?, operations }`. `context`, when present, is the resource\'s own guide to using it (from its `documentation_uri`): read it before you invoke. It comes once per response, not per operation. Each entry in `operations` also carries the operation\'s `access_mode` and `budget`, as list_operations returns them.',
       ),
       inputSchema: z.object({ resource: z.string(), op_ids: z.array(z.string()) }),
     },
@@ -1049,8 +1050,11 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       const found = await requireL1(resource)
       if (!found.ok) return text(found.msg)
       try {
-        const details = await getOperationsForResource(found.l1, op_ids, docCache)
-        return json(details)
+        const [operations, context] = await Promise.all([
+          getOperationsForResource(found.l1, op_ids, docCache),
+          loadResourceContext(found.l1, docCache),
+        ])
+        return json({ ...context, operations })
       } catch (err) {
         return text(`get_operation_schemas error: ${(err as Error).message}`)
       }
