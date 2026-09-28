@@ -27,6 +27,10 @@ export interface RegistryEntry {
   // entry with `availability` keeps its issuer — the host is its id. A connect
   // to it is still tried: the person may be one the provider lets in.
   availability?: string
+  // What a connect must name as `account` (a Google email, a GitHub
+  // username), from the resource's `connection.account_description`. Absent
+  // when the provider's own UI picks the account.
+  account_description?: string
   // Host of the API this resource proxies (e.g. api.github.com). Not unique:
   // several resources can front one API. Lets an agent find what fronts an
   // API it knows by name.
