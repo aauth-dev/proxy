@@ -37,6 +37,7 @@ export interface AAuthResourceMeta {
   jwks_uri?: string
   interaction_endpoint?: string
   connection?: ConnectionMetadata
+  documentation_uri?: string
 }
 
 export interface PickedVocab {
@@ -242,7 +243,26 @@ function expiresAtOf(cached: CachedDoc): number {
 }
 
 export async function loadDoc(host: string, vocab: PickedVocab, cache: DocCache, now = Date.now()): Promise<unknown> {
-  const key = cacheKey(host, vocab.vocabUri)
+  const { adapter, docUrl } = vocab
+  return loadCachedDoc(
+    cacheKey(host, vocab.vocabUri),
+    {
+      load: () => adapter.load(docUrl),
+      ...(adapter.loadCached ? { loadCached: (opts: { ifNoneMatch?: string }) => adapter.loadCached!(docUrl, opts) } : {}),
+    },
+    cache,
+    now,
+  )
+}
+
+// Where a cached document comes from: a plain load, and optionally one that
+// returns the response's Cache-Control and ETag and honors If-None-Match.
+interface DocSource {
+  load(): Promise<unknown>
+  loadCached?(opts: { ifNoneMatch?: string }): Promise<LoadedDoc>
+}
+
+async function loadCachedDoc(key: string, source: DocSource, cache: DocCache, now: number): Promise<unknown> {
   const cached = await cache.get(key)
   // An entry emptied by no-store (below) holds nothing to serve.
   const held = isCachedDoc(cached) && cached.doc !== undefined ? cached : undefined
@@ -251,9 +271,9 @@ export async function loadDoc(host: string, vocab: PickedVocab, cache: DocCache,
   let loaded: LoadedDoc
   try {
     // Expired with an ETag: revalidate, so an unchanged doc costs a 304.
-    loaded = vocab.adapter.loadCached
-      ? await vocab.adapter.loadCached(vocab.docUrl, held?.etag ? { ifNoneMatch: held.etag } : {})
-      : { doc: await vocab.adapter.load(vocab.docUrl) }
+    loaded = source.loadCached
+      ? await source.loadCached(held?.etag ? { ifNoneMatch: held.etag } : {})
+      : { doc: await source.load() }
   } catch (e) {
     // The resource is unreachable right now: a stale copy beats no operations.
     if (held) return held.doc
@@ -264,7 +284,7 @@ export async function loadDoc(host: string, vocab: PickedVocab, cache: DocCache,
 
   if (loaded.notModified) {
     // Nothing held to renew: a 304 to a request that carried no ETag. Ask plainly.
-    if (!held) return vocab.adapter.load(vocab.docUrl)
+    if (!held) return source.load()
     // A 304 renews the copy without a new body. Its Cache-Control replaces the
     // stored one; without one the lifetime the copy came with stands.
     const lifetime = loaded.cacheControl === undefined ? (held.maxAgeMs ?? DOC_TTL_MS) : docLifetimeMs(loaded.cacheControl)
@@ -286,6 +306,121 @@ export async function loadDoc(host: string, vocab: PickedVocab, cache: DocCache,
     aauth_doc_cache: 1, fetchedAt: now, expiresAt: now + lifetime, maxAgeMs: lifetime, ...(loaded.etag ? { etag: loaded.etag } : {}), doc: loaded.doc,
   } satisfies CachedDoc)
   return loaded.doc
+}
+
+// ── The resource's own guide ──
+//
+// A resource's `documentation_uri` (protocol §Resource Metadata) says where its
+// documentation is. When that URL serves text or markdown — an llms.txt, say —
+// get_operation_schemas returns it once per response as `context`, so the agent
+// reads how to use the resource while it plans, before its first invoke. An
+// HTML page is skipped: it is for people. The copy is cached in the DocCache
+// under the same Cache-Control / ETag rules as a vocabulary doc, and nothing
+// about it can fail get_operation_schemas.
+
+/** The most of a guide returned as `context`; the rest is cut, with a note naming the URL. */
+export const CONTEXT_MAX_BYTES = 32 * 1024
+
+const CONTEXT_TYPE = /^text\/(plain|markdown|x-markdown)\s*(;|$)/i
+
+/**
+ * `documentation_uri` when it is on the resource's own origin. The guide goes
+ * in front of the agent as the resource's own words, so a resource cannot
+ * point it at a third party's text. Same origin also means same scheme: http
+ * only for a resource whose origin is http (a local resource under
+ * development).
+ */
+function documentationUri(value: unknown, origin: string): string | undefined {
+  if (typeof value !== 'string' || !value) return undefined
+  try {
+    if (new URL(value).origin === new URL(origin).origin) return value
+  } catch {
+    /* not a URL */
+  }
+  return undefined
+}
+
+/** A body read to at most `max` bytes; `cut` when there was more. */
+async function readCapped(res: Response, max: number): Promise<{ text: string; cut: boolean }> {
+  if (!res.body) return { text: '', cut: false }
+  const reader = res.body.getReader()
+  const chunks: Uint8Array[] = []
+  let size = 0
+  let cut = false
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    if (size + value.byteLength > max) {
+      chunks.push(value.subarray(0, max - size))
+      cut = true
+      await reader.cancel().catch(() => {})
+      break
+    }
+    chunks.push(value)
+    size += value.byteLength
+  }
+  const bytes = new Uint8Array(chunks.reduce((n, c) => n + c.byteLength, 0))
+  let at = 0
+  for (const c of chunks) {
+    bytes.set(c, at)
+    at += c.byteLength
+  }
+  // A cut can land inside a multi-byte character; drop the partial one.
+  const text = new TextDecoder().decode(bytes)
+  return { text: cut ? text.replace(/�$/, '') : text, cut }
+}
+
+// What the context cache holds: the guide's text, or null when the URL serves
+// something other than text or markdown. A null is kept for the default hour
+// whatever the page's own Cache-Control, so an HTML docs page is not fetched on
+// every get_operation_schemas.
+async function fetchContext(url: string, opts: { ifNoneMatch?: string } = {}): Promise<LoadedDoc<string | null>> {
+  const res = await fetch(url, {
+    headers: { accept: 'text/markdown, text/plain;q=0.9', ...(opts.ifNoneMatch ? { 'if-none-match': opts.ifNoneMatch } : {}) },
+  })
+  const cacheControl = res.headers.get('cache-control') ?? undefined
+  const etag = res.headers.get('etag') ?? undefined
+  if (res.status === 304 && opts.ifNoneMatch) return { notModified: true, cacheControl, etag }
+  if (!res.ok) throw new Error(`documentation ${url}: ${res.status}`)
+  if (!CONTEXT_TYPE.test(res.headers.get('content-type') ?? '')) {
+    await res.body?.cancel().catch(() => {})
+    return { doc: null }
+  }
+  const { text, cut } = await readCapped(res, CONTEXT_MAX_BYTES)
+  const doc = cut ? `${text}\n\n[Cut at ${CONTEXT_MAX_BYTES / 1024} KB. The whole guide is at ${url}.]` : text
+  return { doc, cacheControl, etag }
+}
+
+/**
+ * The resource's guide for get_operation_schemas: `{ context, context_url }`
+ * when its documentation_uri serves text or markdown, `{}` otherwise. Never
+ * throws.
+ */
+export async function loadResourceContext(
+  l1: L1Entry,
+  docCache: DocCache = defaultDocCache,
+  now = Date.now(),
+): Promise<{ context?: string; context_url?: string }> {
+  const url = documentationUri(l1.documentation_uri, l1.origin)
+  if (!url) return {}
+  try {
+    const doc = await loadCachedDoc(
+      `${l1.resource}|context|${url}`,
+      {
+        load: async () => {
+          const loaded = await fetchContext(url)
+          if (loaded.notModified) throw new Error(`documentation ${url}: 304 to an unconditional request`)
+          return loaded.doc
+        },
+        loadCached: (opts) => fetchContext(url, opts),
+      },
+      docCache,
+      now,
+    )
+    return typeof doc === 'string' && doc.trim() ? { context: doc, context_url: url } : {}
+  } catch {
+    return {}
+  }
 }
 
 function rehydrate(picked: L1Entry['picked_vocabs']): PickedVocab[] {
@@ -403,6 +538,7 @@ export function toL1Entry(r: FetchedResource, now = Date.now()): L1Entry {
     // related could work until this line.
     ...(typeof r.meta.interaction_endpoint === 'string' ? { interaction_endpoint: r.meta.interaction_endpoint } : {}),
     ...(r.meta.connection && typeof r.meta.connection.endpoint === 'string' ? { connection: r.meta.connection } : {}),
+    ...(documentationUri(r.meta.documentation_uri, r.origin) ? { documentation_uri: r.meta.documentation_uri } : {}),
     picked_vocabs: r.pickedVocabs.map((v) => ({ vocabUri: v.vocabUri, docUrl: v.docUrl })),
     added: new Date(now).toISOString(),
     ...metaLifetime(r.cacheControl, r.etag, now),
