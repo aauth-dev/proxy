@@ -445,6 +445,56 @@ describe('connect_resources', () => {
     }
   })
 
+  it('an item without account at a resource that needs one answers account_required and starts nothing', async () => {
+    const { posted } = routeSignedFetch()
+    const l1 = memoryL1([entry('gmail.example')])
+    const { client, close } = await connectClient(l1)
+    try {
+      const result = await client.callTool({
+        name: 'connect_resources',
+        arguments: { items: [{ resource: 'gmail.example' }] },
+      })
+      const summary = JSON.parse(textOf(result)) as { results: Record<string, unknown>[]; pending: number }
+      expect(summary.results[0]).toMatchObject({
+        outcome: 'account_required',
+        account_description: 'Google account email address',
+      })
+      expect(summary.pending).toBe(0)
+      expect(posted).toEqual([])
+      // Only the registry lookup every item makes; no PS, no resource.
+      const called = mockSignedFetch.mock.calls.map(([url]) => String(url))
+      expect(called.filter((u) => u !== 'https://registry.aauth.dev/resources')).toEqual([])
+    } finally {
+      await close()
+    }
+  })
+
+  it('a resource refusing with account_required answers account_required, not error', async () => {
+    // The resource's metadata as cached names no account_description, but the
+    // resource itself asks for one: its refusal is what the agent acts on.
+    mockSignedFetch.mockImplementation(async (url: string, init?: { method?: string }) => {
+      if (url === 'https://ps.example/person') return makeResponse(200, { person_token: 'pt_abc', expires_in: 3600 })
+      if (url === 'https://github.example/connections' && init?.method === 'POST') {
+        return makeResponse(400, { error: 'account_required', account_description: 'GitHub username' })
+      }
+      throw new Error(`unexpected signed fetch: ${url}`)
+    })
+    const e = entry('github.example')
+    const bare = { ...e, connection: { endpoint: e.connection!.endpoint, upstream_name: 'GitHub' } }
+    const { client, close } = await connectClient(memoryL1([bare]))
+    try {
+      const result = await client.callTool({
+        name: 'connect_resources',
+        arguments: { items: [{ resource: 'github.example' }] },
+      })
+      const summary = JSON.parse(textOf(result)) as { results: Record<string, unknown>[] }
+      expect(summary.results[0]).toMatchObject({ outcome: 'account_required', account_description: 'GitHub username' })
+      expect(summary.results[0]).not.toHaveProperty('body')
+    } finally {
+      await close()
+    }
+  })
+
   it('an item needing no connection answers ready without calling the PS', async () => {
     const { posted } = routeSignedFetch()
     const bare = { ...entry('whoami.example'), connection: undefined, access_mode: 'agent-token' as const }

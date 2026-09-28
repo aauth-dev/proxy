@@ -12,7 +12,7 @@ vi.mock('@hellocoop/httpsig', () => ({ fetch: mockSignedFetch }))
 const { McpServer, InMemoryTransport } = await import('@modelcontextprotocol/server')
 const { Client } = await import('@modelcontextprotocol/client')
 const { buildProxyTools } = await import('../tools.js')
-import type { L1Store } from '../store.js'
+import type { L1Entry, L1Store } from '../store.js'
 import type { ProxyConfig } from '../agent.js'
 import type { RegistryIndex } from '../registry.js'
 
@@ -116,6 +116,51 @@ describe('coming resources', () => {
     } finally {
       await close()
     }
+  })
+
+  it('find_resources leaves out resources this agent is connected to', async () => {
+    const added = (host: string, extra: Partial<L1Entry> = {}): L1Entry => ({
+      resource: host,
+      origin: `https://${host}`,
+      issuer: `https://${host}`,
+      name: host,
+      description: 'test',
+      access_mode: 'person-token',
+      picked_vocabs: [],
+      added: '2026-09-28T00:00:00.000Z',
+      ...extra,
+    })
+    const gmailConnection = {
+      endpoint: 'https://gmail-googleapis-com.proxy.aauth.dev/connections',
+      upstream_name: 'Google',
+      account_description: 'Google account email address',
+    }
+    const l1For = (entries: L1Entry[]): L1Store => ({ ...emptyL1(), list: async () => entries })
+    const hostsOf = async (entries: L1Entry[]) => {
+      const { client, close } = await clientFor(l1For(entries))
+      try {
+        const res = JSON.parse(textOf(await client.callTool({ name: 'find_resources', arguments: {} })))
+        return res.resources.map((r: { resource: string }) => r.resource)
+      } finally {
+        await close()
+      }
+    }
+    // Slack needs no upstream link here, so added is connected. Gmail was
+    // added by a connect that never finished: no account on record, so it is
+    // still offered.
+    expect(
+      await hostsOf([added('slack-com.proxy.aauth.dev'), added('gmail-googleapis-com.proxy.aauth.dev', { connection: gmailConnection, connections: [] })]),
+    ).toEqual(['gmail-googleapis-com.proxy.aauth.dev'])
+    // With an account on record Gmail is connected, and nothing is left.
+    expect(
+      await hostsOf([
+        added('slack-com.proxy.aauth.dev'),
+        added('gmail-googleapis-com.proxy.aauth.dev', {
+          connection: gmailConnection,
+          connections: [{ account: 'a@b.co', scopes: [], status: 'ok' }],
+        }),
+      ]),
+    ).toEqual([])
   })
 
   it('find_resources matches on upstream', async () => {
