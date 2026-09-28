@@ -34,6 +34,7 @@ const INDEX: RegistryIndex = {
       availability: 'Not yet public — Google has not verified the app.',
       upstream: 'gmail.googleapis.com',
       interest_count: 3,
+      account_description: 'Google account email address',
     },
     {
       issuer: 'https://slack-com.proxy.aauth.dev',
@@ -107,6 +108,11 @@ describe('coming resources', () => {
       expect(gmail.interest_count).toBe(3)
       expect(gmail.upstream).toBe('gmail.googleapis.com')
       expect(gmail).not.toHaveProperty('skip_reason')
+      // The account a connect must name is shown before the connect, not
+      // learned from an account_required 400; a resource that publishes none
+      // shows none.
+      expect(gmail.account_description).toBe('Google account email address')
+      expect(slack).not.toHaveProperty('account_description')
     } finally {
       await close()
     }
