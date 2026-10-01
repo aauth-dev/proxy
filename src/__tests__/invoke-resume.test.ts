@@ -22,6 +22,7 @@ vi.mock('../resource.js', async (importOriginal) => {
 })
 
 const { McpServer, InMemoryTransport } = await import('@modelcontextprotocol/server')
+const { serveStdio } = await import('@modelcontextprotocol/server/stdio')
 const { Client } = await import('@modelcontextprotocol/client')
 const { buildProxyTools } = await import('../tools.js')
 import type { L1Entry, L1Store } from '../store.js'
@@ -219,6 +220,48 @@ describe('invoke resumes a pending authorization', () => {
       expect(state.presented).toEqual(['pt_ok', 'at_ok'])
     } finally {
       await close()
+    }
+  })
+
+  it('hands the URL over itself when the host hook returns (5.7.0): one elicitation, then the same code', async () => {
+    // Before 5.7.0 mcp.aauth.dev threw the elicitation from onInteraction.
+    // The hook now returns, and invoke elicits natively on a client that
+    // declared elicitation.url — 2026-07-28 here, as the stdio bin serves it.
+    const ps = fakePS()
+    const handedOver: string[] = []
+    const cfg = makeCfg()
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+    serveStdio(async () => {
+      const server = new McpServer({ name: 'test', version: '0.0.0' })
+      await buildProxyTools(server, {
+        l1: memoryL1([entry('gmail.example')]),
+        registryCache: { read: async () => undefined, write: async () => {} },
+        identity: { resolve: async () => ({ kind: 'ready', cfg }), peek: () => cfg },
+        connectBudgetMs: 30,
+        onInteraction: (_url, code) => void handedOver.push(code),
+      })
+      return server
+    }, { transport: serverTransport as never })
+    const client = new Client(
+      { name: 'test-client', version: '0.0.0' },
+      { capabilities: { elicitation: { url: {} } }, versionNegotiation: { mode: 'auto' } } as never,
+    )
+    const opened: string[] = []
+    client.setRequestHandler('elicitation/create' as never, (async (req: { params: { url?: string } }) => {
+      opened.push(req.params.url ?? '')
+      return { action: 'accept' }
+    }) as never)
+    await client.connect(clientTransport)
+    try {
+      // The driver fulfils the elicitation and retries; the retry resumes the
+      // same pending (still 202) and says so, without a second elicitation.
+      const result = textOf(await client.callTool({ name: 'invoke', arguments: { resource: 'gmail.example', op_id: 'whoami' } }))
+      expect(opened).toEqual(['https://ps.example/auth?code=CODE-1'])
+      expect(handedOver).toEqual(['CODE-1'])
+      expect(result).toContain('still in progress')
+      expect(ps.codes).toBe(1)
+    } finally {
+      await client.close()
     }
   })
 })

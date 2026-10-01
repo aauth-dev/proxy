@@ -184,6 +184,9 @@ describe('pollConnection (B2 slice)', () => {
       kind: 'still_pending',
       pollUrl: 'https://ps.example/pending/QQQQ-1111',
       interaction: { url: 'https://ps.example/auth', code: 'QQQQ-1111', pollUrl: 'https://ps.example/pending/QQQQ-1111' },
+      // This poll is the one that advertised it, and the deferred-response status rides along.
+      advertised: true,
+      status: 'pending',
     })
   })
 
@@ -258,8 +261,59 @@ describe('invoke on the approval → interaction fallback (issue #21)', () => {
       .mockResolvedValueOnce(approval())
       .mockResolvedValue(makeResponse(202, { status: 'pending' }, { 'aauth-requirement': 'requirement=interaction; code="C"', location: 'https://ps.example/pending/P' }))
     const out = await pollConnection(config(), 'https://ps.example/pending/P', 60_000)
-    expect(out).toEqual({ kind: 'still_pending', pollUrl: 'https://ps.example/pending/P', interaction: { url: 'https://ps.example/auth', code: 'C', pollUrl: 'https://ps.example/pending/P' } })
+    expect(out).toEqual({
+      kind: 'still_pending',
+      pollUrl: 'https://ps.example/pending/P',
+      interaction: { url: 'https://ps.example/auth', code: 'C', pollUrl: 'https://ps.example/pending/P' },
+      advertised: true,
+      status: 'pending',
+    })
     expect(mockSignedFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('a poll reports the deferred-response status and queue, and a known code re-advertised is not new', async () => {
+    // The wallet answers `interacting` once a browser holds the code, with the
+    // person's queue. A poll that carries no AAuth-Requirement keeps the prior
+    // interaction but does not mark it advertised.
+    mockPSWellKnown()
+    const prior = { url: 'https://ps.example/auth', code: 'C', pollUrl: 'https://ps.example/pending/P' }
+    mockSignedFetch.mockResolvedValue(makeResponse(202, { status: 'interacting', queue_position: 2, queue_depth: 3 }, { location: 'https://ps.example/pending/P' }))
+    expect(await pollConnection(config(), prior, 10)).toEqual({
+      kind: 'still_pending',
+      pollUrl: 'https://ps.example/pending/P',
+      interaction: prior,
+      status: 'interacting',
+      queuePosition: 2,
+      queueDepth: 3,
+    })
+
+    // stopOnAdvertise: a code the caller has not handed over ends the slice at once.
+    mockSignedFetch.mockReset()
+    mockSignedFetch.mockResolvedValue(makeResponse(202, { status: 'pending' }, { 'aauth-requirement': 'requirement=interaction; code="C"', location: 'https://ps.example/pending/P' }))
+    const start = Date.now()
+    const out = await pollConnection(config(), prior, 60_000, undefined, { stopOnAdvertise: true })
+    expect(out).toMatchObject({ kind: 'still_pending', advertised: true, interaction: prior })
+    expect(mockSignedFetch).toHaveBeenCalledTimes(1)
+    expect(Date.now() - start).toBeLessThan(1_000)
+  })
+
+  it('a re-advertisement without Location is still recognised: the pending is the one polled', async () => {
+    // Wallet poll.js re-advertises with AAuth-Requirement and Retry-After only.
+    // Requiring Location here dropped every re-advertised code on the floor.
+    mockPSWellKnown()
+    mockSignedFetch.mockResolvedValue(
+      makeResponse(202, { status: 'pending', requirement: 'interaction', code: 'R', queue_position: 1, queue_depth: 1 }, { 'aauth-requirement': 'requirement=interaction; code="R"' }),
+    )
+    expect(await pollConnection(config(), 'https://ps.example/pending/R', 60_000)).toEqual({
+      kind: 'still_pending',
+      pollUrl: 'https://ps.example/pending/R',
+      interaction: { url: 'https://ps.example/auth', code: 'R', pollUrl: 'https://ps.example/pending/R' },
+      advertised: true,
+      status: 'pending',
+      queuePosition: 1,
+      queueDepth: 1,
+    })
+    expect(mockSignedFetch).toHaveBeenCalledTimes(1)
   })
 })
 
