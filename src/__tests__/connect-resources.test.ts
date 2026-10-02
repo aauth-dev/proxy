@@ -24,7 +24,8 @@ const mockSignedFetch = vi.fn()
 vi.mock('@hellocoop/httpsig', () => ({ fetch: mockSignedFetch }))
 
 const { McpServer, InMemoryTransport } = await import('@modelcontextprotocol/server')
-const { Client } = await import('@modelcontextprotocol/client')
+const { serveStdio } = await import('@modelcontextprotocol/server/stdio')
+const { Client, UrlElicitationRequiredError } = await import('@modelcontextprotocol/client')
 const { buildProxyTools } = await import('../tools.js')
 import type { L1Entry, L1Store } from '../store.js'
 import type { ProxyConfig } from '../agent.js'
@@ -130,6 +131,7 @@ async function connectClient(
   connectBudgetMs = 30,
   connectProgressBudgetMs?: number,
   onInteraction?: (url: string, code: string) => void | Promise<void>,
+  connectDrainMs?: number,
 ) {
   const server = new McpServer({ name: 'test', version: '0.0.0' })
   const cfg = makeCfg()
@@ -141,6 +143,7 @@ async function connectClient(
     // A short slice keeps the test fast: only the waiting is cut short.
     connectBudgetMs,
     ...(connectProgressBudgetMs !== undefined ? { connectProgressBudgetMs } : {}),
+    ...(connectDrainMs !== undefined ? { connectDrainMs } : {}),
   })
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
   const client = new Client({ name: 'test-client', version: '0.0.0' })
@@ -513,4 +516,268 @@ describe('connect_resources', () => {
       await close()
     }
   })
+
+  // ── One URL per person server per connect (5.7.0) ──
+  //
+  // Prod, 2026-09-28: four Google items, the first two both answered
+  // `requirement=interaction`. The first call threw a URL elicitation from
+  // onInteraction before the second item started; the retry started it and
+  // threw a second elicitation — for a code the person's wallet tab already
+  // held, since the PS queues every pending interaction per person and drains
+  // the queue into the open tab.
+
+  /**
+   * A PS as the wallet behaves: the first `interactions` token requests answer
+   * `requirement=interaction`, later ones a bare 202 (an open tab is
+   * reachable). Each pending URL answers per `poll(code, n)` on its nth poll.
+   */
+  function scriptedPS(opts: { interactions: number; poll: (code: string, n: number) => Response }) {
+    const posted: string[] = []
+    const polls = new Map<string, number>()
+    let codeSeq = 0
+    mockSignedFetch.mockImplementation(async (url: string, init?: { method?: string }) => {
+      if (url === 'https://ps.example/person') return makeResponse(200, { person_token: 'pt_abc', expires_in: 3600 })
+      if (url.endsWith('/connections')) {
+        if ((init?.method ?? 'GET') === 'POST') {
+          posted.push(url)
+          return makeResponse(200, { resource_token: 'rt_conn' })
+        }
+        return makeResponse(200, { connections: [] })
+      }
+      if (url === 'https://ps.example/token') {
+        codeSeq += 1
+        const code = `CODE-${String(codeSeq).padStart(4, '0')}`
+        return makeResponse(202, {}, {
+          ...(codeSeq <= opts.interactions ? { 'aauth-requirement': `requirement=interaction; code="${code}"` } : {}),
+          location: `https://ps.example/pending/${code}`,
+        })
+      }
+      if (url.startsWith('https://ps.example/pending/')) {
+        const n = (polls.get(url) ?? 0) + 1
+        polls.set(url, n)
+        return opts.poll(url.slice('https://ps.example/pending/'.length), n)
+      }
+      throw new Error(`unexpected signed fetch: ${url}`)
+    })
+    return { posted }
+  }
+
+  const deferred = (status: 'pending' | 'interacting', position: number) =>
+    makeResponse(202, { status, queue_position: position, queue_depth: 2 })
+
+  /**
+   * A client that declares `elicitation.url` and opens every URL it is handed
+   * (records it), on either protocol era. `modern` serves the connection the
+   * way the stdio bin does (serveStdio picks the era from the opening
+   * exchange) and lets the SDK's driver fulfil `input_required` and retry —
+   * what Claude Code does.
+   */
+  async function elicitingClient(
+    l1: L1Store,
+    era: 'modern' | 'legacy',
+    opts: { drainMs?: number; onInteraction?: (url: string, code: string) => void } = {},
+  ) {
+    const cfg = makeCfg()
+    const build = async () => {
+      const server = new McpServer({ name: 'test', version: '0.0.0' })
+      await buildProxyTools(server, {
+        ...(opts.onInteraction ? { onInteraction: opts.onInteraction } : {}),
+        l1,
+        registryCache: { read: async () => undefined, write: async () => {} },
+        identity: { resolve: async () => ({ kind: 'ready', cfg }), peek: () => cfg },
+        connectBudgetMs: 30,
+        connectProgressBudgetMs: 20_000,
+        ...(opts.drainMs !== undefined ? { connectDrainMs: opts.drainMs } : {}),
+      })
+      return server
+    }
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
+    if (era === 'modern') serveStdio(build, { transport: serverTransport as never })
+    else await (await build()).connect(serverTransport)
+    const client = new Client(
+      { name: 'test-client', version: '0.0.0' },
+      { capabilities: { elicitation: { url: {} } }, versionNegotiation: { mode: era === 'modern' ? 'auto' : 'legacy' } } as never,
+    )
+    const opened: string[] = []
+    client.setRequestHandler('elicitation/create' as never, (async (req: { params: { url?: string } }) => {
+      opened.push(req.params.url ?? '')
+      return { action: 'accept' }
+    }) as never)
+    await client.connect(clientTransport)
+    return { client, opened, close: async () => void (await client.close()) }
+  }
+
+  const FOUR = ['gmail.example', 'calendar.example', 'chat.example', 'meet.example']
+
+  it('2026-07-28: four items, the first two interaction — one input_required with one URL, and the retry lands all four', async () => {
+    // Gmail and Calendar both need a URL; the person opens Gmail's, the tab
+    // holds both codes (`interacting`), and the person approves each in turn.
+    // Chat and Meet start as slots free and the PS reaches the open tab.
+    const { posted } = scriptedPS({
+      interactions: 2,
+      poll: (code, n) => {
+        if (code === 'CODE-0001') return n < 2 ? deferred('interacting', 1) : makeResponse(200, {})
+        if (code === 'CODE-0002') return n < 3 ? deferred('interacting', n < 2 ? 2 : 1) : makeResponse(200, {})
+        return makeResponse(200, {})
+      },
+    })
+    const handedOver: string[] = []
+    const { client, opened, close } = await elicitingClient(memoryL1(FOUR.map((h) => entry(h))), 'modern', {
+      onInteraction: (_url, code) => void handedOver.push(code),
+    })
+    try {
+      const result = await client.callTool(
+        { name: 'connect_resources', arguments: { items: FOUR.map((h) => ({ resource: h, account: 'a@b.co' })) } },
+        { onprogress: () => {}, timeout: 20_000 },
+      )
+      // One URL, the head's — Calendar's code rode in the same tab.
+      expect(opened).toEqual(['https://ps.example/auth?code=CODE-0001'])
+      expect(handedOver).toEqual(['CODE-0001'])
+      // Both live slots were filled before the URL went out: two codes in the
+      // first call, then one start per item as slots freed.
+      expect(posted).toEqual(FOUR.map((h) => `https://${h}/connections`))
+      const summary = summaryOf(result)
+      expect(summary.results.map((r) => r.outcome)).toEqual(['connected', 'connected', 'connected', 'connected'])
+      expect(summary.next).toBeUndefined()
+    } finally {
+      await close()
+    }
+  }, 20_000)
+
+  it('2025-era: the same list throws one -32042 with one URL; the retry lands all four', async () => {
+    const { posted } = scriptedPS({
+      interactions: 2,
+      poll: (code, n) => {
+        if (code === 'CODE-0001' || code === 'CODE-0002') return n < 2 ? deferred('interacting', 1) : makeResponse(200, {})
+        return makeResponse(200, {})
+      },
+    })
+    const { client, close } = await elicitingClient(memoryL1(FOUR.map((h) => entry(h))), 'legacy')
+    try {
+      const args = { items: FOUR.map((h) => ({ resource: h, account: 'a@b.co' })) }
+      const thrown = await client.callTool({ name: 'connect_resources', arguments: args }).catch((e: unknown) => e)
+      expect(thrown).toBeInstanceOf(UrlElicitationRequiredError)
+      expect((thrown as InstanceType<typeof UrlElicitationRequiredError>).elicitations.map((e) => e.url)).toEqual([
+        'https://ps.example/auth?code=CODE-0001',
+      ])
+      expect(posted).toHaveLength(2)
+
+      const result = await client.callTool({ name: 'connect_resources', arguments: args }, { onprogress: () => {}, timeout: 20_000 })
+      expect(summaryOf(result).results.map((r) => r.outcome)).toEqual(['connected', 'connected', 'connected', 'connected'])
+    } finally {
+      await close()
+    }
+  }, 20_000)
+
+  // Two items, both `interaction`; the client has no elicitation, so each URL
+  // comes back as text and each call is the model's. The first call hands over
+  // Gmail's URL and covers Calendar's code.
+  const TWO = FOUR.slice(0, 2)
+  const twoArgs = { items: TWO.map((h) => ({ resource: h, account: 'a@b.co' })) }
+
+  it('a covered item still `pending` at the head past the drain bound gets its own URL', async () => {
+    // The person approved Gmail, but no browser ever took Calendar's code (a
+    // record created without presence, a tab that never connected): the PS
+    // will not re-advertise it, so the proxy hands its URL over.
+    scriptedPS({
+      interactions: 2,
+      poll: (code, n) => {
+        if (code === 'CODE-0001') return n < 2 ? deferred('interacting', 1) : makeResponse(200, {})
+        return deferred('pending', 1)
+      },
+    })
+    const { client, close } = await connectClient(memoryL1(TWO.map((h) => entry(h))), 30, 20_000, undefined, 1_500)
+    try {
+      const first = textOf(await client.callTool({ name: 'connect_resources', arguments: twoArgs }))
+      expect(first).toContain('CODE-0001')
+      expect(first).not.toContain('CODE-0002')
+
+      const started = Date.now()
+      const second = await client.callTool({ name: 'connect_resources', arguments: twoArgs }, { onprogress: () => {}, timeout: 20_000 })
+      const body = textOf(second)
+      expect(body).toContain('IMPORTANT')
+      expect(body).toContain('https://ps.example/auth?code=CODE-0002')
+      expect(summaryOf(second).results.map((r) => r.outcome)).toEqual(['connected', 'still_pending'])
+      // Not before the bound.
+      expect(Date.now() - started).toBeGreaterThanOrEqual(1_500)
+    } finally {
+      await close()
+    }
+  }, 20_000)
+
+  it('a covered item a browser holds (`interacting`) gets no URL of its own, however long it waits', async () => {
+    scriptedPS({
+      interactions: 2,
+      poll: (code, n) => {
+        if (code === 'CODE-0001') return n < 2 ? deferred('interacting', 1) : makeResponse(200, {})
+        return deferred('interacting', 1)
+      },
+    })
+    const { client, close } = await connectClient(memoryL1(TWO.map((h) => entry(h))), 30, 4_000, undefined, 500)
+    try {
+      await client.callTool({ name: 'connect_resources', arguments: twoArgs })
+      const second = await client.callTool({ name: 'connect_resources', arguments: twoArgs }, { onprogress: () => {}, timeout: 20_000 })
+      expect(textOf(second)).not.toContain('IMPORTANT')
+      const summary = summaryOf(second)
+      expect(summary.results.map((r) => r.outcome)).toEqual(['connected', 'still_pending'])
+      expect(summary.next).toBeTruthy()
+    } finally {
+      await close()
+    }
+  }, 20_000)
+
+  it('a covered code the PS re-advertises gets its own URL at once', async () => {
+    // The PS says it cannot reach the person with Calendar's code. That ends
+    // Calendar's poll the moment it arrives, bound or no bound.
+    scriptedPS({
+      interactions: 2,
+      poll: (code, n) =>
+        code === 'CODE-0001'
+          ? n < 2 ? deferred('interacting', 1) : makeResponse(200, {})
+          : makeResponse(202, { status: 'pending', requirement: 'interaction', code }, { 'aauth-requirement': `requirement=interaction; code="${code}"` }),
+    })
+    const { client, close } = await connectClient(memoryL1(TWO.map((h) => entry(h))), 30, 20_000)
+    try {
+      await client.callTool({ name: 'connect_resources', arguments: twoArgs })
+      const second = textOf(await client.callTool({ name: 'connect_resources', arguments: twoArgs }, { onprogress: () => {}, timeout: 20_000 }))
+      expect(second).toContain('IMPORTANT')
+      expect(second).toContain('https://ps.example/auth?code=CODE-0002')
+
+      // Handed over once: a third call waits on it instead of returning it
+      // again, though every poll still advertises it.
+      const third = await client.callTool({ name: 'connect_resources', arguments: twoArgs })
+      expect(textOf(third)).not.toContain('IMPORTANT')
+      expect(summaryOf(third).awaiting?.url).toBe('https://ps.example/auth?code=CODE-0002')
+    } finally {
+      await close()
+    }
+  }, 30_000)
+
+  it('an item started while a URL is out is covered by it', async () => {
+    // Three items, all `interaction`: Gmail's URL goes out with Calendar
+    // covered; when Gmail lands, Chat starts in its slot and is covered by the
+    // same URL — the wallet tab takes it from the queue.
+    const { posted } = scriptedPS({
+      interactions: 3,
+      poll: (code, n) => {
+        if (code === 'CODE-0001') return n < 2 ? deferred('interacting', 1) : makeResponse(200, {})
+        if (code === 'CODE-0002') return n < 3 ? deferred('interacting', 1) : makeResponse(200, {})
+        return n < 2 ? deferred('interacting', 1) : makeResponse(200, {})
+      },
+    })
+    const handedOver: string[] = []
+    const three = FOUR.slice(0, 3)
+    const args = { items: three.map((h) => ({ resource: h, account: 'a@b.co' })) }
+    const { client, close } = await connectClient(memoryL1(three.map((h) => entry(h))), 30, 20_000, (_u, code) => void handedOver.push(code))
+    try {
+      await client.callTool({ name: 'connect_resources', arguments: args })
+      const second = await client.callTool({ name: 'connect_resources', arguments: args }, { onprogress: () => {}, timeout: 20_000 })
+      expect(textOf(second)).not.toContain('IMPORTANT')
+      expect(summaryOf(second).results.map((r) => r.outcome)).toEqual(['connected', 'connected', 'connected'])
+      expect(posted).toHaveLength(3)
+      expect(handedOver).toEqual(['CODE-0001'])
+    } finally {
+      await close()
+    }
+  }, 20_000)
 })

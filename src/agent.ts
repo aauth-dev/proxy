@@ -345,9 +345,12 @@ async function terminalChallenge(res: Response, req: ParsedRequirement): Promise
 // header carries the code only and the agent composes
 // `{interaction_endpoint}?code=`. A `url=` parameter is still honoured when a
 // 2.x-era issuer sends one. Neither → not an interaction this agent can drive.
-function interactionFrom(res: Response, publishedUrl?: string): Interaction | undefined {
+// `polledUrl` is the pending URL a poll answer came from: the PS re-advertises
+// a code on the poll without repeating Location (Wallet poll.js), and the
+// pending is still the one polled.
+function interactionFrom(res: Response, publishedUrl?: string, polledUrl?: string): Interaction | undefined {
   const parsed = parseRequirement(res.headers.get('aauth-requirement'))
-  const pollUrl = res.headers.get('location') ?? ''
+  const pollUrl = res.headers.get('location') ?? polledUrl ?? ''
   if (parsed?.requirement !== 'interaction' || !parsed.code || !pollUrl) return undefined
   const url = parsed.url ?? publishedUrl
   return url ? { url, code: parsed.code, pollUrl } : undefined
@@ -382,7 +385,7 @@ async function drivePending(
 ): Promise<{ kind: 'done'; body: unknown; res: Response } | { kind: 'interaction'; interaction: Interaction } | { kind: 'pending' } | { kind: 'result'; status: number; body: unknown }> {
   const res = await pollUntilDone(makeAgentPoll(cfg), pollUrl, timeoutMs, undefined, advertisesInteraction)
   if (res.status === 202) {
-    const interaction = interactionFrom(res, publishedUrl)
+    const interaction = interactionFrom(res, publishedUrl, pollUrl)
     return interaction ? { kind: 'interaction', interaction } : { kind: 'pending' }
   }
   if (!res.ok) return { kind: 'result', status: res.status, body: await safeBody(res) }
@@ -1412,8 +1415,22 @@ export type ConnectOutcome =
    * when the person has a URL to open; absent while the PS is reaching them by
    * its own channels (an open wallet tab, a device) — a later poll may
    * advertise one.
+   *
+   * From `pollConnection`, the PS's own word on the pending: `advertised` when
+   * the last poll answer carried `requirement=interaction` (the PS could not
+   * reach the person and wants the URL opened), and the -11 deferred-response
+   * `status` (`interacting` once a browser holds the code, else `pending`) with
+   * the person's queue, when the PS sends them.
    */
-  | { kind: 'still_pending'; pollUrl: string; interaction?: Interaction }
+  | {
+      kind: 'still_pending'
+      pollUrl: string
+      interaction?: Interaction
+      advertised?: boolean
+      status?: string
+      queuePosition?: number
+      queueDepth?: number
+    }
   | { kind: 'error'; status: number; body: unknown }
 
 /**
@@ -1468,22 +1485,51 @@ export async function connectAtResource(cfg: ProxyConfig, l1: L1Entry, args: Con
  * advertises, if the PS gave up reaching the person itself), and `error` on a
  * terminal failure. `pollUrl` may be the URL or a prior `Interaction`.
  */
-export async function pollConnection(cfg: ProxyConfig, pending: string | Interaction, budgetMs: number, onPoll?: (elapsedMs: number) => void | Promise<void>): Promise<ConnectOutcome> {
+export async function pollConnection(
+  cfg: ProxyConfig,
+  pending: string | Interaction,
+  budgetMs: number,
+  onPoll?: (elapsedMs: number) => void | Promise<void>,
+  opts: { stopOnAdvertise?: boolean } = {},
+): Promise<ConnectOutcome> {
   const pollUrl = typeof pending === 'string' ? pending : pending.pollUrl
   const prior = typeof pending === 'string' ? undefined : pending
-  // With no interaction known yet, one the PS starts advertising ends the wait:
-  // the person needs its URL now, not at the end of the slice.
-  const res = await pollUntilDone(makeAgentPoll(cfg), pollUrl, budgetMs, onPoll, prior ? undefined : advertisesInteraction)
+  // An interaction the PS starts advertising ends the wait: the person needs
+  // its URL now, not at the end of the slice. By default only when no
+  // interaction is known yet; the caller says otherwise when the URL it knows
+  // has not reached the person (a PS that re-advertises on every poll would
+  // otherwise end every slice at once).
+  const stop = opts.stopOnAdvertise ?? !prior
+  const res = await pollUntilDone(makeAgentPoll(cfg), pollUrl, budgetMs, onPoll, stop ? advertisesInteraction : undefined)
   if (res.status === 202) {
-    const advertised = interactionFrom(res, prior?.url ?? (await psMetadata(cfg.psUrl).catch(() => undefined))?.interaction_endpoint)
+    const advertised = interactionFrom(res, prior?.url ?? (await psMetadata(cfg.psUrl).catch(() => undefined))?.interaction_endpoint, pollUrl)
     const interaction = advertised ?? prior
-    return { kind: 'still_pending', pollUrl, ...(interaction ? { interaction } : {}) }
+    return {
+      kind: 'still_pending',
+      pollUrl,
+      ...(interaction ? { interaction } : {}),
+      ...(advertised ? { advertised: true } : {}),
+      ...deferredFrom(await safeBody(res)),
+    }
   }
   if (res.status >= 200 && res.status < 300) {
     const access = res.headers.get('aauth-access')
     return { kind: 'connected', body: await safeBody(res), ...(access ? { access } : {}) }
   }
   return { kind: 'error', status: res.status, body: await safeBody(res) }
+}
+
+// The -11 deferred-response body of a 202 poll answer: `status` and, from a PS
+// that queues a person's pendings, where this one sits. Absent fields are left
+// out; a body that is not an object yields nothing.
+function deferredFrom(body: unknown): { status?: string; queuePosition?: number; queueDepth?: number } {
+  if (!body || typeof body !== 'object') return {}
+  const b = body as { status?: unknown; queue_position?: unknown; queue_depth?: unknown }
+  return {
+    ...(typeof b.status === 'string' ? { status: b.status } : {}),
+    ...(typeof b.queue_position === 'number' ? { queuePosition: b.queue_position } : {}),
+    ...(typeof b.queue_depth === 'number' ? { queueDepth: b.queue_depth } : {}),
+  }
 }
 
 /**

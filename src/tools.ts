@@ -24,12 +24,20 @@
 // that do not. Two items are live at a time, finished items are answered from
 // connectState instead of the resource, and a URL is handed over once, at once.
 //
+// 5.7.0: one URL per person server per connect. Both live items are started
+// before any URL goes out (the host's onInteraction no longer ends the call by
+// throwing), the head's URL is handed over, and the other live codes are
+// covered by it — the PS queues them for the person and the wallet tab works
+// through the queue. A covered code gets its own URL only when the PS
+// re-advertises it or no browser has taken it from the head of the queue.
+// invoke hands its URL over natively too.
+//
 // Transport-agnostic: no fs, no stdio, no child_process. The stdio bin
 // (server.ts) supplies fs/local-keys deps + a browser-launch onInteraction;
 // other hosts supply their own backends and surface interaction URLs however
 // their transport allows.
 
-import { UrlElicitationRequiredError, inputRequired } from '@modelcontextprotocol/server'
+import { CLIENT_CAPABILITIES_META_KEY, UrlElicitationRequiredError, inputRequired } from '@modelcontextprotocol/server'
 import type { ClientCapabilities, Icon, McpServer, RegisteredTool, ServerContext, StandardSchemaWithJSON, ToolAnnotations, ToolCallback } from '@modelcontextprotocol/server'
 import { renderUnicodeCompact } from 'uqr'
 import { z } from 'zod'
@@ -65,12 +73,18 @@ export interface ProxyDeps {
   // Optional shared/persistent L3 vocab-doc cache. Defaults (inside resource.ts)
   // to a process-wide in-memory cache when omitted.
   docCache?: DocCache
-  // Called when invoke or connect encounters an interaction (authorization
-  // URL). May throw to initiate a native protocol-level flow (e.g. MCP URL
-  // elicitation for cloud hosts). For stdio hosts: open the OS browser and
-  // return; the tool falls back to returning the URL as text. onComplete is
-  // called by the host when authorization finishes, resolving any waiters
-  // registered via authPending.
+  // Called when invoke or connect_resources hands an authorization URL to the
+  // person — once per URL handed over, not once per code minted
+  // (connect_resources covers the codes queued behind it). The tool then hands
+  // it to the client itself: an MCP URL elicitation when the client declared
+  // one, else the URL and a QR code as text. For stdio hosts: open the OS
+  // browser and return. For cloud hosts: arm whatever runs in the background
+  // and return. onComplete is called by the host when authorization finishes,
+  // resolving any waiters registered via authPending.
+  //
+  // Before 5.7.0 a cloud host threw a URL elicitation from here. A throw is
+  // still passed through (the URL is recorded as handed over first), but the
+  // tool's own elicitation is the supported path.
   onInteraction?: (url: string, code: string, pollUrl: string, onComplete?: () => void | Promise<void>) => void | Promise<void>
   // Tracks in-flight authorization per resource. Implementations should survive
   // across MCP session DO instances (e.g. backed by a longer-lived UserStore DO).
@@ -100,6 +114,10 @@ export interface ProxyDeps {
   // progressToken. The call walks the whole list and reports progress as items
   // land; this only bounds a runaway (each item already times out on its own).
   connectProgressBudgetMs?: number
+  // How long an item covered by another item's URL may sit at the head of the
+  // person's queue with no browser holding it before its own URL is handed
+  // over. Default DEFAULT_CONNECT_DRAIN_MS; tests shorten it.
+  connectDrainMs?: number
   // In-flight connects, per resource host, so a repeat connect_resources call
   // resumes the same PS pending record instead of starting a new flow. A host
   // that builds a fresh server per request (the hosted MCP) MUST back this
@@ -145,6 +163,16 @@ export interface ConnectFlight {
   startedAt: number
   /** The interaction code last handed back to the client, so a resumed call does not hand it back again. */
   surfaced?: string
+  /**
+   * The code of another item's URL, already handed over, that reaches this
+   * one too: the PS queues every pending interaction per person, and the
+   * wallet tab that URL opens works through the queue. This item's own URL is
+   * handed over only if the PS re-advertises it, or it reaches the head of the
+   * queue and no browser picks it up (`headAt`).
+   */
+  coveredBy?: string
+  /** When a poll first found this covered item at the head of the person's queue, not yet held by a browser. */
+  headAt?: number
 }
 
 // An item that finished connecting: `connected`, or the resource said it
@@ -194,6 +222,20 @@ const MAX_CONNECT_ITEMS = 64
 // is already waiting at the PS when the person finishes the one in front of
 // them, and at most one code counts down behind it.
 const MAX_LIVE_CONNECTS = 2
+// One URL per person server per connect (5.7.0). The PS queues every pending
+// interaction for the person and drains the queue into the tab the first URL
+// opened, so a second URL is a second tab for codes the first already holds
+// (prod, 2026-09-28: four items, two URL elicitations, the wallet tab already
+// held both codes). An item covered by a URL gets its own only when the PS
+// re-advertises it, or when it has been at the head of the queue this long
+// with no browser holding it (poll `status: 'pending'`, not `'interacting'`).
+// The PS sends a waiting tab every queued code when it connects and the tab
+// acks them within a second (16:17:19.8 → 16:17:20 in that incident), but a
+// poll held open by `Prefer: wait=20` answers with the record as it was when
+// the poll arrived — up to 20 s old. Thirty seconds after first seeing the item
+// at the head, a `pending` answer is from at least ten seconds after it got
+// there: long enough for an open tab to have taken it.
+const DEFAULT_CONNECT_DRAIN_MS = 30_000
 
 const BOOTSTRAP_GUIDANCE = `The agent proxy has no AAuth identity on this machine yet.
 
@@ -283,6 +325,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
   const { l1, registryCache, identity, docCache } = deps
   const budgetMs = deps.connectBudgetMs ?? DEFAULT_CONNECT_BUDGET_MS
   const progressBudgetMs = deps.connectProgressBudgetMs ?? DEFAULT_CONNECT_PROGRESS_BUDGET_MS
+  const drainMs = deps.connectDrainMs ?? DEFAULT_CONNECT_DRAIN_MS
 
   // Identity is resolved lazily per call; the provider owns any caching (which
   // must be per-principal — a shared process-global cache would leak identities
@@ -320,8 +363,14 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       const started = Date.now()
       const fields = toolFields(name, cbArgs.length > 1 ? cbArgs[0] : undefined)
       try {
-        const result = (await (handler as (...a: unknown[]) => unknown)(...cbArgs)) as { isError?: boolean }
-        deps.log?.('tool.call', { ...fields, ok: !result?.isError, duration_ms: Date.now() - started })
+        const result = (await (handler as (...a: unknown[]) => unknown)(...cbArgs)) as { isError?: boolean; resultType?: string }
+        deps.log?.('tool.call', {
+          ...fields,
+          ok: !result?.isError,
+          // A URL elicitation on the 2026-07-28 revision: the client opens it and calls again.
+          ...(result?.resultType === 'input_required' ? { outcome: 'input_required' } : {}),
+          duration_ms: Date.now() - started,
+        })
         return result
       } catch (e) {
         const error = e instanceof UrlElicitationRequiredError ? 'url_elicitation' : ((e as Error)?.name ?? 'error')
@@ -472,14 +521,16 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
   //     a bare `elicitation:{}`), so a declared `elicitation` key is enough.
   // Form mode is deliberately not attempted: it is gated on `elicitation.form`
   // the same way, and handing over a link is not what form mode is for.
-  function surfaceNatively(ctx: ServerContext, interaction: Interaction, host: string) {
+  function surfaceNatively(ctx: ServerContext, interaction: Interaction, message: string) {
     const url = `${interaction.url}?code=${interaction.code}`
-    const message = `Authorize ${host} — open this URL to connect, then the agent continues.`
-    // Deprecated accessor, but the supported per-request one: the SDK backfills
-    // it from the validated envelope on instances that never see an initialize.
-    let caps: ClientCapabilities | undefined
+    // On 2026-07-28 the request's own envelope says what the client declared.
+    // serveStdio does not backfill the instance from it (the stdio bin saw
+    // `undefined` here and fell back to text); createMcpHandler does.
+    const envelope = ctx.mcpReq.envelope as Record<string, unknown> | undefined
+    let caps = envelope?.[CLIENT_CAPABILITIES_META_KEY] as ClientCapabilities | undefined
+    // Deprecated accessor, but the supported per-request one otherwise.
     try {
-      caps = server.server.getClientCapabilities()
+      caps ??= server.server.getClientCapabilities()
     } catch {
       return undefined
     }
@@ -578,10 +629,12 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       type Slot = { host: string; item: ConnectItem; row: Record<string, unknown>; entry: L1Entry }
       const rows: Record<string, unknown>[] = []
       const waiting: Slot[] = []
-      // The first item that needs the person at a URL. Only one can be surfaced
-      // — the PS shows its queue one at a time — and it is the head of that queue.
-      let toSurface: Interaction | undefined
-      let surfaceHost: string | undefined
+      // Items started or polled in this call: only these can need a URL. A
+      // resumed flight's stored code can die before CONNECT_MAX_MS, so it is
+      // not handed over until a poll in this call shows it is still pending.
+      const seen = new Set<string>()
+      // The deferred-response status of each item's last poll in this call.
+      const lastStatus = new Map<string, string | undefined>()
 
       const rowFor = (entry: L1Entry, account?: string): Record<string, unknown> => ({
         resource: entry.resource,
@@ -665,13 +718,20 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
               pollUrl: outcome.pollUrl,
               ...(outcome.interaction ? { interaction: outcome.interaction } : {}),
             }
+            if (outcome.advertised) {
+              // The PS could not reach the person with this code (its reach
+              // fallback, or the tab that held it went away) and wants its URL
+              // opened: no other URL covers it now.
+              delete next.coveredBy
+              delete next.headAt
+            } else if (next.coveredBy && notHeld(outcome.status) && atHead(host, outcome.queuePosition)) {
+              next.headAt ??= Date.now()
+            }
+            seen.add(host)
+            lastStatus.set(host, outcome.status)
             await inflight.set(host, next)
             row.outcome = 'still_pending'
             row.waiting_on = entry.connection?.upstream_name ?? 'the upstream'
-            if (next.interaction && !toSurface) {
-              toSurface = next.interaction
-              surfaceHost = host
-            }
             return
           }
           case 'error': {
@@ -694,6 +754,82 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
         }
       }
 
+      // No browser holds the code. A PS that sends no deferred-response status
+      // gives no evidence one does, so a covered code there gets its own URL
+      // after the bound instead of waiting out CONNECT_MAX_MS.
+      const notHeld = (status: string | undefined): boolean => status === undefined || status === 'pending'
+
+      // Whether a covered item is at the head of the person's queue: from the
+      // PS's queue_position when it sends one, else no live item of this call
+      // is ahead of it.
+      const atHead = (host: string, queuePosition: number | undefined): boolean => {
+        if (queuePosition !== undefined) return queuePosition <= 1
+        const at = waiting.findIndex((w) => w.host === host)
+        return !waiting.slice(0, Math.max(at, 0)).some((w) => w.row.outcome === 'still_pending')
+      }
+
+      // The code of a URL already out at this interaction endpoint (one person
+      // server) that a new code there is covered by: a live item's own handed-
+      // over URL, or the one covering it.
+      const coveringCode = async (url: string, except: string): Promise<string | undefined> => {
+        for (const w of waiting) {
+          if (w.host === except || w.row.outcome !== 'still_pending') continue
+          const f = await inflight.get(w.host)
+          if (!f?.interaction || f.interaction.url !== url) continue
+          if (f.surfaced === f.interaction.code) return f.interaction.code
+          if (f.coveredBy) return f.coveredBy
+        }
+        return undefined
+      }
+
+      // Whether the person needs this item's own URL now. Not when the client
+      // has it already, nor while another URL covers it — unless it has sat at
+      // the head of the queue for drainMs with no browser holding it.
+      const needsUrl = (host: string, f: InFlight | undefined): f is InFlight & { interaction: Interaction } => {
+        if (!f?.interaction || !seen.has(host)) return false
+        if (f.surfaced === f.interaction.code) return false
+        if (!f.coveredBy) return true
+        return notHeld(lastStatus.get(host)) && f.headAt !== undefined && Date.now() - f.headAt >= drainMs
+      }
+
+      // The first live item, in list order, whose URL the person needs.
+      const nextUrl = async (): Promise<{ host: string; interaction: Interaction } | undefined> => {
+        for (const w of waiting) {
+          if (w.row.outcome !== 'still_pending') continue
+          const f = await inflight.get(w.host)
+          if (needsUrl(w.host, f)) return { host: w.host, interaction: f.interaction }
+        }
+        return undefined
+      }
+
+      // Record a URL as handed over, and every other live code at the same
+      // person server as covered by it: the wallet tab it opens is handed the
+      // rest of the person's queue.
+      const handOver = async (host: string, interaction: Interaction): Promise<void> => {
+        const own = await inflight.get(host)
+        if (own) {
+          const { coveredBy: _c, headAt: _h, ...rest } = own
+          await inflight.set(host, { ...rest, surfaced: interaction.code })
+        }
+        for (const w of waiting) {
+          if (w.host === host || w.row.outcome !== 'still_pending') continue
+          const f = await inflight.get(w.host)
+          if (!f?.interaction || f.interaction.url !== interaction.url || f.surfaced === f.interaction.code) continue
+          const { headAt: _h, ...rest } = f
+          await inflight.set(w.host, { ...rest, coveredBy: interaction.code })
+        }
+      }
+
+      // A live item whose own URL the client was handed: what the person is on.
+      const handedLive = async (): Promise<{ resource: string; url: string } | undefined> => {
+        for (const w of waiting) {
+          if (w.row.outcome !== 'still_pending') continue
+          const f = await inflight.get(w.host)
+          if (f?.interaction && f.surfaced === f.interaction.code) return { resource: w.host, url: `${f.interaction.url}?code=${f.interaction.code}` }
+        }
+        return undefined
+      }
+
       // Start one connect and account for it. Returns true when the item now
       // holds a live slot (the person, or the PS reaching the person, still has
       // to act) and has been added to `waiting`; false when it settled on the
@@ -713,33 +849,23 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
         }
 
         if (outcome.kind === 'interaction') {
+          // Not handed over here: pass 1 starts every live item first, and the
+          // call hands over one URL at the end (5.7.0). A code started while a
+          // URL at the same person server is out is covered by it.
           const { interaction } = outcome
-          const flight: InFlight = {
+          const cover = await coveringCode(interaction.url, host)
+          await inflight.set(host, {
             pollUrl: interaction.pollUrl,
             interaction,
             ...(item.account ? { account: item.account } : {}),
             ...(item.scopes ? { scopes: item.scopes } : {}),
             startedAt: Date.now(),
-          }
-          await inflight.set(host, flight)
-          try {
-            await deps.onInteraction?.(interaction.url, interaction.code, interaction.pollUrl, () =>
-              deps.authPending?.resolve(host),
-            )
-          } catch (err) {
-            // The host handed the URL over natively (a cloud host throws a URL
-            // elicitation). Record it, so the retry waits on this code instead
-            // of handing it over a second time.
-            await inflight.set(host, { ...flight, surfaced: interaction.code })
-            throw err
-          }
+            ...(cover ? { coveredBy: cover } : {}),
+          })
           await deps.authPending?.register(host)
+          seen.add(host)
           row.outcome = 'still_pending'
           row.waiting_on = entry.connection?.upstream_name ?? 'the upstream'
-          if (!toSurface) {
-            toSurface = interaction
-            surfaceHost = host
-          }
           waiting.push({ host, item, row, entry })
           return true
         }
@@ -873,20 +999,14 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
         }
       }
 
-      // A URL the person must open that the client has not been handed yet. A
-      // resumed flight's interaction was handed over by an earlier call.
-      const unsurfaced = async (): Promise<boolean> => {
-        if (!toSurface || !surfaceHost) return false
-        return (await inflight.get(surfaceHost))?.surfaced !== toSurface.code
-      }
-
       // Pass 2 — wait on the live items until the list is finished, the
       // deadline passes, or the person has a URL to open that the client has
       // not been handed. Each live item is polled for at most a slice, in turn,
       // so a stuck head does not starve the item behind it and progress goes
       // out at least once a slice. Each item that lands frees its slot for the
-      // next held item without a round trip through the model.
-      while (!(await unsurfaced()) && Date.now() < deadline) {
+      // next held item without a round trip through the model. A retry after a
+      // URL was handed over waits here, on the codes that URL covers.
+      while (!(await nextUrl()) && Date.now() < deadline) {
         const active = waiting.filter((w) => w.row.outcome === 'still_pending')
         if (active.length === 0) break
         for (const { host, item, row, entry } of active) {
@@ -902,22 +1022,27 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
             row.detail = 'the person did not finish; include this item again to start over'
             delete row.waiting_on
           } else {
-            const polled = await pollConnection(cfg, flight.interaction ?? flight.pollUrl, Math.min(remaining, POLL_SLICE_MS))
+            // Stop early on an advertised code unless this item's own URL is
+            // already out: a covered code the PS advertises needs its URL now.
+            // A covered code is polled in shorter slices: the drain bound is
+            // judged from poll answers, and a 25 s slice would push the second
+            // URL rounds past it.
+            const handed = !!flight.interaction && flight.surfaced === flight.interaction.code
+            const slice = flight.coveredBy && !handed ? Math.min(POLL_SLICE_MS, drainMs / 2) : POLL_SLICE_MS
+            const polled = await pollConnection(cfg, flight.interaction ?? flight.pollUrl, Math.min(remaining, slice), undefined, {
+              stopOnAdvertise: !handed,
+            })
             await settle(row, entry, item, polled, flight)
           }
           if (row.outcome !== 'still_pending') {
-            // This one landed (or failed): it no longer holds a slot, and it is
-            // no longer what the person should be looking at.
+            // This one landed (or failed): it no longer holds a slot.
             live -= 1
-            if (surfaceHost === host) {
-              toSurface = undefined
-              surfaceHost = undefined
-            }
             await fill()
             await report(`${host}: ${row.outcome as string}. ${status()}`)
           }
-          // A newly started item may need the person at a URL: hand it over now.
-          if (await unsurfaced()) break
+          // A newly started item, a re-advertised code, or a covered code no
+          // browser took may need the person at a URL: hand it over now.
+          if (await nextUrl()) break
         }
         await report(status())
       }
@@ -936,25 +1061,27 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
           : {}),
       }
 
-      // Nothing for the person to open: either everything landed, or the PS is
-      // reaching them by its own channels (an open wallet tab, a device).
-      if (pending === 0 || !toSurface || !surfaceHost) return json(summary)
-
-      // A URL an earlier call handed over: the client has shown it already, so
-      // it rides along for reference rather than as an instruction.
-      if (!(await unsurfaced())) {
-        return json({ ...summary, awaiting: { resource: surfaceHost, url: `${toSurface.url}?code=${toSurface.code}` } })
+      const surface = pending > 0 ? await nextUrl() : undefined
+      if (!surface) {
+        // Nothing new for the person to open: everything landed, the PS is
+        // reaching them by its own channels (an open wallet tab, a device), or
+        // the URL is out already — then it rides along for reference rather
+        // than as an instruction.
+        const awaiting = pending > 0 ? await handedLive() : undefined
+        return json(awaiting ? { ...summary, awaiting } : summary)
       }
 
-      // The person must open a URL. Hand it over once: the next call resumes
-      // the flight and waits instead of returning it again.
-      const flight = await inflight.get(surfaceHost)
-      if (flight) await inflight.set(surfaceHost, { ...flight, surfaced: toSurface.code })
+      // The person must open a URL. Hand it over once, and cover the other
+      // live codes at the same person server with it: the next call waits on
+      // them instead of handing over another.
+      const { host: surfaceHost, interaction: toSurface } = surface
+      await handOver(surfaceHost, toSurface)
+      // The host's hook: stdio opens a browser; a cloud host arms its
+      // background poll. A host that throws its own elicitation ends the call
+      // here, with the URL already recorded as handed over.
+      await deps.onInteraction?.(toSurface.url, toSurface.code, toSurface.pollUrl, () => deps.authPending?.resolve(surfaceHost))
 
-      // Prefer a native prompt; the host may already have taken over (stdio
-      // opens a browser, a cloud host may throw its own elicitation), in which
-      // case onInteraction never returned here.
-      const native = surfaceNatively(ctx, toSurface, surfaceHost)
+      const native = surfaceNatively(ctx, toSurface, `Authorize ${surfaceHost} — open this URL to connect, then the agent continues.`)
       if (native) return native
 
       return text(
@@ -1211,17 +1338,22 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       }
 
       if (result.kind === 'interaction') {
-        // Record the flight FIRST: onInteraction may throw (cloud hosts raise
-        // an MCP URL elicitation) and the retry must find it either way.
-        await inflight.set(host, { pollUrl: result.interaction.pollUrl, interaction: result.interaction, startedAt: Date.now() })
+        // Record the flight FIRST, as handed over: the URL goes to the client
+        // below (or the host throws its own elicitation), and the retry must
+        // find the flight either way.
+        await inflight.set(host, {
+          pollUrl: result.interaction.pollUrl,
+          interaction: result.interaction,
+          startedAt: Date.now(),
+          surfaced: result.interaction.code,
+        })
         // onComplete resolves the UserStore pending-auth waiter when the poll finishes.
         const onComplete = () => deps.authPending?.resolve(found.l1.resource)
-
-        // onInteraction may throw (cloud: MCP URL elicitation) or return (stdio/fallback).
         await deps.onInteraction?.(result.interaction.url, result.interaction.code, result.interaction.pollUrl, onComplete)
-
-        // Only reached if onInteraction returned (fallback path, not elicitation).
         await deps.authPending?.register(found.l1.resource)
+
+        const native = surfaceNatively(ctx, result.interaction, `Authorize ${host} — open this URL, then call invoke again.`)
+        if (native) return native
 
         return text(
           `Authorization required for ${found.l1.resource}.\n\n` +
