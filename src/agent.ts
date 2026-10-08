@@ -356,11 +356,12 @@ function interactionFrom(res: Response, publishedUrl?: string, polledUrl?: strin
   return url ? { url, code: parsed.code, pollUrl } : undefined
 }
 
-// A 202 that advertises an interaction code. The URL may still come from
-// metadata; this is only whether to stop polling and surface it.
-function advertisesInteraction(res: Response): boolean {
+// A 202 that advertises an interaction code — other than `except`, the one
+// already handed over. The URL may still come from metadata; this is only
+// whether to stop polling and surface it.
+function advertisesInteraction(res: Response, except?: string): boolean {
   const parsed = parseRequirement(res.headers.get('aauth-requirement'))
-  return parsed?.requirement === 'interaction' && !!parsed.code
+  return parsed?.requirement === 'interaction' && !!parsed.code && parsed.code !== except
 }
 
 // A 202 that carries no interaction code: the PS is reaching the person by
@@ -1490,7 +1491,7 @@ export async function pollConnection(
   pending: string | Interaction,
   budgetMs: number,
   onPoll?: (elapsedMs: number) => void | Promise<void>,
-  opts: { stopOnAdvertise?: boolean } = {},
+  opts: { stopOnAdvertise?: boolean; except?: string; signal?: AbortSignal } = {},
 ): Promise<ConnectOutcome> {
   const pollUrl = typeof pending === 'string' ? pending : pending.pollUrl
   const prior = typeof pending === 'string' ? undefined : pending
@@ -1498,9 +1499,18 @@ export async function pollConnection(
   // its URL now, not at the end of the slice. By default only when no
   // interaction is known yet; the caller says otherwise when the URL it knows
   // has not reached the person (a PS that re-advertises on every poll would
-  // otherwise end every slice at once).
+  // otherwise end every slice at once). `except` names a code already handed
+  // over: re-advertising it does not end the wait, a different code does.
+  // An aborted `signal` (the client went away) ends it too, as still pending.
   const stop = opts.stopOnAdvertise ?? !prior
-  const res = await pollUntilDone(makeAgentPoll(cfg), pollUrl, budgetMs, onPoll, stop ? advertisesInteraction : undefined)
+  const { signal } = opts
+  const res = await pollUntilDone(
+    makeAgentPoll(cfg),
+    pollUrl,
+    budgetMs,
+    onPoll,
+    stop || signal ? (r) => signal?.aborted === true || (stop && advertisesInteraction(r, opts.except)) : undefined,
+  )
   if (res.status === 202) {
     const advertised = interactionFrom(res, prior?.url ?? (await psMetadata(cfg.psUrl).catch(() => undefined))?.interaction_endpoint, pollUrl)
     const interaction = advertised ?? prior

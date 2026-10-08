@@ -44,6 +44,9 @@ export type { BootstrapStatus, IdentityProvider } from './identity.js'
 
 export type { ProxyLog, ProxyLogFields } from './log.js'
 
+export { MAX_MRTR_ROUNDS } from './mrtr.js'
+export type { MrtrCodec, MrtrState } from './mrtr.js'
+
 export { canonicalizeHost } from './host.js'
 export type { CanonicalHost } from './host.js'
 
