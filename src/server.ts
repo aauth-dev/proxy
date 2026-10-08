@@ -9,10 +9,11 @@ import { createWriteStream, mkdirSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { McpServer } from '@modelcontextprotocol/server'
+import { McpServer, createRequestStateCodec } from '@modelcontextprotocol/server'
 import { serveStdio } from '@modelcontextprotocol/server/stdio'
 import { createLocalKeysIdentityProvider } from './identity-local.js'
 import { createFsRegistryCache } from './registry.js'
+import type { MrtrState } from './mrtr.js'
 import { createFsL1Store } from './store.js'
 import { buildProxyTools } from './tools.js'
 
@@ -111,12 +112,25 @@ function setupFrameLog(): void {
 }
 
 setupFrameLog()
+// The multi-round-trip `requestState` codec (2026-07-28). One process serves
+// every round of a call over stdio, so a random key per process is enough.
+// One principal per process: the binding is the method alone.
+const requestStateCodec = createRequestStateCodec<MrtrState>({
+  key: crypto.getRandomValues(new Uint8Array(32)),
+  ttlSeconds: 900,
+  bind: (ctx) => ctx.mcpReq.method,
+})
+
 // serveStdio owns the transport and the protocol-era decision: the opening
 // exchange pins one server instance from this factory to the connection and
 // serves both the 2026-07-28 revision and the 2025-era initialize handshake.
 serveStdio(async () => {
-  const server = new McpServer({ name: 'aauth-connector', title: 'AAuth Connector', version: PKG_VERSION })
+  const server = new McpServer(
+    { name: 'aauth-connector', title: 'AAuth Connector', version: PKG_VERSION },
+    { requestState: { verify: requestStateCodec.verify } },
+  )
   await buildProxyTools(server, {
+    requestStateCodec,
     l1: createFsL1Store(),
     registryCache: createFsRegistryCache(),
     identity: createLocalKeysIdentityProvider(),

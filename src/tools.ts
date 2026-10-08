@@ -32,13 +32,24 @@
 // re-advertises it or no browser has taken it from the head of the queue.
 // invoke hands its URL over natively too.
 //
+// 5.8.0 (MRTR-PLAN.md): answer the client only when the person has a URL to
+// open that the client has not been handed, or when the work is finished.
+// invoke holds a call with a progressToken until the authorization settles,
+// as connect_resources already did. A declined or cancelled URL ends the wait
+// at once. A 2025-era client that declared URL elicitation on `initialize`
+// gets the -32042 error even when this server never saw that initialize (the
+// host remembers it: `clientCapabilities`). A 2026-07-28 client that sends no
+// progressToken is held across keepalive rounds — `input_required` with a
+// `requestState` and nothing to fulfil — instead of `next` text. Every event
+// on that path is logged (log.ts), so production says which clients follow it.
+//
 // Transport-agnostic: no fs, no stdio, no child_process. The stdio bin
 // (server.ts) supplies fs/local-keys deps + a browser-launch onInteraction;
 // other hosts supply their own backends and surface interaction URLs however
 // their transport allows.
 
 import { CLIENT_CAPABILITIES_META_KEY, UrlElicitationRequiredError, inputRequired } from '@modelcontextprotocol/server'
-import type { ClientCapabilities, Icon, McpServer, RegisteredTool, ServerContext, StandardSchemaWithJSON, ToolAnnotations, ToolCallback } from '@modelcontextprotocol/server'
+import type { ClientCapabilities, Icon, InputRequiredResult, McpServer, RegisteredTool, ServerContext, StandardSchemaWithJSON, ToolAnnotations, ToolCallback } from '@modelcontextprotocol/server'
 import { renderUnicodeCompact } from 'uqr'
 import { z } from 'zod'
 import { planAccessMode } from './access-mode.js'
@@ -50,6 +61,8 @@ import { agentTokenPs } from './jwt.js'
 import type { IdentityProvider } from './identity.js'
 import { toolFields } from './log.js'
 import type { ProxyLog } from './log.js'
+import { MAX_MRTR_ROUNDS, inputResponseActions, readState, urlAction } from './mrtr.js'
+import type { MrtrCodec, MrtrState } from './mrtr.js'
 import { fetchRegistry, findEntry, isComing, orderCatalog } from './registry.js'
 import type { RegistryCache, RegistryEntry, RegistryIndex } from './registry.js'
 import {
@@ -151,6 +164,25 @@ export interface ProxyDeps {
   // other side of it. Copied onto the resolved ProxyConfig when the identity
   // provider left `cfg.log` unset.
   log?: ProxyLog
+  // What the client declared on `initialize`, for a request that carries no
+  // 2026-07-28 envelope (5.8.0). A host that builds a fresh server per
+  // request never saw that initialize, so a 2025-era client that declared URL
+  // elicitation got its URL back as text (Codex, opencode). Consulted before
+  // the server's own getClientCapabilities(), never on a 2026-07-28 request —
+  // the envelope is authoritative there. A declared `elicitation.url` sends
+  // the URL as the -32042 URL elicitation error. Answer undefined when unsure: a
+  // wrong "yes" turns a link into an error the person never sees, a wrong
+  // "no" only costs a model turn.
+  clientCapabilities?: (ctx: ServerContext) => Promise<ClientCapabilities | undefined>
+  // The `requestState` codec: createRequestStateCodec<MrtrState>() from the
+  // SDK (5.8.0). The host MUST pass the same codec's `verify` as
+  // ServerOptions.requestState.verify on the McpServer, and the key must
+  // reach every instance that may serve a retry. With it, every
+  // `input_required` carries a state that counts rounds, and a 2026-07-28
+  // client that sent no progressToken is held across keepalive rounds
+  // (`input_required` with only a `requestState`) instead of answered with
+  // `next`, up to MAX_MRTR_ROUNDS. Without it, neither.
+  requestStateCodec?: MrtrCodec
 }
 
 export interface ConnectFlight {
@@ -173,6 +205,13 @@ export interface ConnectFlight {
   coveredBy?: string
   /** When a poll first found this covered item at the head of the person's queue, not yet held by a browser. */
   headAt?: number
+  /**
+   * When this item's URL went to a 2025-era client as the -32042 error, and
+   * from which tool. The next call that resumes the flight logs
+   * `legacy.followup` and clears it: whether those clients retry is not known.
+   */
+  urlErrorAt?: number
+  urlErrorTool?: string
 }
 
 // An item that finished connecting: `connected`, or the resource said it
@@ -326,6 +365,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
   const budgetMs = deps.connectBudgetMs ?? DEFAULT_CONNECT_BUDGET_MS
   const progressBudgetMs = deps.connectProgressBudgetMs ?? DEFAULT_CONNECT_PROGRESS_BUDGET_MS
   const drainMs = deps.connectDrainMs ?? DEFAULT_CONNECT_DRAIN_MS
+  const codec = deps.requestStateCodec
 
   // Identity is resolved lazily per call; the provider owns any caching (which
   // must be per-principal — a shared process-global cache would leak identities
@@ -504,6 +544,174 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     return next
   }
 
+  // ── One call's waits (5.8.0) ──
+  //
+  // What a tool call that may hold carries across its waits: the progress it
+  // has sent, the round it is on, and whether the client has stopped
+  // listening. `waiting` brackets a hold or a poll, so an abort inside one is
+  // logged as `call.aborted` — how long each client lets a call run is not
+  // known, and this is how it is measured.
+  type Call = Awaited<ReturnType<typeof beginCall>>
+  async function beginCall(tool: string, ctx: ServerContext) {
+    const started = Date.now()
+    const progressToken = ctx.mcpReq._meta?.progressToken
+    const state = await readState(ctx, codec, tool)
+    if (state) {
+      const actions = inputResponseActions(ctx)
+      deps.log?.('mrtr.retry', {
+        tool,
+        round: state.round,
+        ms_since_previous: started - state.at,
+        ...(actions ? { input_responses: actions } : {}),
+      })
+    }
+    let sent = 0
+    let lastSentAt: number | undefined
+    let waitingOn: string[] | undefined
+    ctx.mcpReq.signal?.addEventListener(
+      'abort',
+      () => {
+        if (!waitingOn) return
+        const now = Date.now()
+        deps.log?.('call.aborted', {
+          tool,
+          hosts: waitingOn,
+          ms_since_start: now - started,
+          progress_sent: sent,
+          ...(lastSentAt !== undefined ? { last_progress_ms_ago: now - lastSentAt } : {}),
+        })
+      },
+      { once: true },
+    )
+    return {
+      tool,
+      ctx,
+      started,
+      progressToken,
+      // A 2026-07-28 request: it carries the per-request envelope.
+      modern: ctx.mcpReq.envelope !== undefined,
+      state,
+      // The round an `input_required` returned now would be.
+      round: (state?.round ?? 0) + 1,
+      get sent() {
+        return sent
+      },
+      // Progress, for a client that asked for it. `progress` counts
+      // notifications, not items: the spec requires it to increase with
+      // every notification, and a heartbeat moves no item.
+      async report(message: string): Promise<void> {
+        if (progressToken === undefined) return
+        sent += 1
+        lastSentAt = Date.now()
+        await ctx.mcpReq.notify({ method: 'notifications/progress', params: { progressToken, progress: sent, message } }).catch(() => {})
+      },
+      waiting(hosts: string[] | undefined): void {
+        waitingOn = hosts
+      },
+      aborted: (): boolean => ctx.mcpReq.signal?.aborted === true,
+    }
+  }
+
+  // A 2026-07-28 client that sent no progressToken has no way to keep a call
+  // open past its own timeout; a keepalive round ends the HTTP request but not
+  // the call — its MCP client retries at once with the state.
+  const keepsAlive = (call: Call): boolean =>
+    codec !== undefined && call.modern && call.progressToken === undefined && call.round <= MAX_MRTR_ROUNDS
+
+  // The state an `input_required` returned now carries.
+  async function mint(call: Call, hosts: string[], codes: string[], kind: 'url' | 'keepalive'): Promise<string | undefined> {
+    if (!codec) return undefined
+    const now = Date.now()
+    const startedAt = call.state?.started_at ?? now
+    const state: MrtrState = { tool: call.tool, hosts, codes, round: call.round, started_at: startedAt, at: now }
+    deps.log?.('mrtr.input_required', { tool: call.tool, kind, round: call.round, hosts, codes, ms_since_round_1: now - startedAt })
+    return codec.mint(state, call.ctx)
+  }
+
+  // The keepalive round: nothing for the client to fulfil, only the state.
+  async function keepalive(call: Call, hosts: string[], codes: string[]): Promise<InputRequiredResult> {
+    const requestState = (await mint(call, hosts, codes, 'keepalive')) as string
+    return inputRequired({ requestState })
+  }
+
+  // A later call resumed a flight whose URL went out as -32042: the client
+  // came back. Logged once per flight.
+  async function followup(call: Call, inflight: FlightStore, host: string, flight: InFlight): Promise<InFlight> {
+    if (flight.urlErrorAt === undefined) return flight
+    deps.log?.('legacy.followup', {
+      tool: call.tool,
+      hosts: [host],
+      ms_since_url_error: Date.now() - flight.urlErrorAt,
+      same_tool: flight.urlErrorTool === call.tool,
+    })
+    const { urlErrorAt: _a, urlErrorTool: _t, ...rest } = flight
+    await inflight.set(host, rest)
+    return rest
+  }
+
+  // invoke's wait on an in-flight authorization. Held, for a client that sent
+  // a progressToken: a slice at a time with progress after each, until the
+  // pending settles, the PS advertises a code the client has not been handed
+  // (a new URL for the person), CONNECT_MAX_MS from the flight's start, or the
+  // client goes away. Otherwise one bounded slice, as before 5.8.0.
+  async function waitOnFlight(
+    call: Call,
+    cfg: ProxyConfig,
+    inflight: FlightStore,
+    host: string,
+    flight: InFlight,
+  ): Promise<{ kind: 'outcome'; outcome: ConnectOutcome } | { kind: 'timed_out' } | { kind: 'aborted' }> {
+    call.waiting([host])
+    try {
+      if (call.progressToken === undefined) {
+        return { kind: 'outcome', outcome: await pollConnection(cfg, flight.interaction ?? flight.pollUrl, budgetMs, undefined, { signal: call.ctx.mcpReq.signal }) }
+      }
+      const started = Date.now()
+      let slices = 0
+      let end = 'settled'
+      deps.log?.('hold.start', { tool: call.tool, hosts: [host], progress_token: true })
+      try {
+        let current = flight
+        for (;;) {
+          if (call.aborted()) {
+            end = 'aborted'
+            return { kind: 'aborted' }
+          }
+          const remaining = current.startedAt + CONNECT_MAX_MS - Date.now()
+          if (remaining <= 0) {
+            end = 'timed_out'
+            return { kind: 'timed_out' }
+          }
+          // Stop early on an advertised code the client has not been handed.
+          // A PS may re-advertise a handed-over code on every poll, and that
+          // is not a new URL.
+          const handed = !!current.interaction && current.surfaced === current.interaction.code
+          const polled = await pollConnection(cfg, current.interaction ?? current.pollUrl, Math.min(remaining, POLL_SLICE_MS), undefined, {
+            stopOnAdvertise: true,
+            ...(handed ? { except: current.surfaced } : {}),
+            signal: call.ctx.mcpReq.signal,
+          })
+          slices += 1
+          if (polled.kind !== 'still_pending') {
+            end = polled.kind === 'connected' ? 'settled' : 'gone'
+            return { kind: 'outcome', outcome: polled }
+          }
+          if (polled.advertised && polled.interaction && polled.interaction.code !== current.surfaced) {
+            end = 'url'
+            return { kind: 'outcome', outcome: polled }
+          }
+          current = { ...current, pollUrl: polled.pollUrl, ...(polled.interaction ? { interaction: polled.interaction } : {}) }
+          await inflight.set(host, current)
+          await call.report(`Waiting for the person to authorize ${host}`)
+        }
+      } finally {
+        deps.log?.('hold.end', { tool: call.tool, hosts: [host], slices, progress_sent: call.sent, outcome: end, duration_ms: Date.now() - started })
+      }
+    } finally {
+      call.waiting(undefined)
+    }
+  }
+
   // Hand an authorization URL to the client as a native prompt, or answer
   // undefined to let the caller fall back to text + QR.
   //
@@ -514,37 +722,67 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
   //     the SDK refuses it with -32021 unless the client declared
   //     `elicitation.url`. A refusal is worse than text — the person would see
   //     an error instead of a link — so check first and fall back instead.
+  //     The result carries a `requestState` that counts the round; past
+  //     MAX_MRTR_ROUNDS the URL goes back as text, inside the client's cap.
   //   * 2025-era connections still take the push model: the SDK rethrows
   //     UrlElicitationRequiredError (-32042) unmodified, with no capability
   //     gate of its own. Clients that implement -32042 handle it even when they
   //     under-declare (Claude Code 2.1.268 ships the retry loop while declaring
   //     a bare `elicitation:{}`), so a declared `elicitation` key is enough.
+  //     What was declared comes from the host's `clientCapabilities` (it
+  //     remembers `initialize` for a server built per request), else from this
+  //     server's own initialize. A remembered declaration counts only with
+  //     `elicitation.url`. The error's message carries the URL and code, so a
+  //     client that only shows the error still gives the model a link.
   // Form mode is deliberately not attempted: it is gated on `elicitation.form`
   // the same way, and handing over a link is not what form mode is for.
-  function surfaceNatively(ctx: ServerContext, interaction: Interaction, message: string) {
+  async function surfaceNatively(
+    call: Call,
+    inflight: FlightStore,
+    host: string,
+    interaction: Interaction,
+    message: string,
+  ): Promise<InputRequiredResult | undefined> {
+    const { ctx } = call
     const url = `${interaction.url}?code=${interaction.code}`
-    // On 2026-07-28 the request's own envelope says what the client declared.
-    // serveStdio does not backfill the instance from it (the stdio bin saw
-    // `undefined` here and fell back to text); createMcpHandler does.
-    const envelope = ctx.mcpReq.envelope as Record<string, unknown> | undefined
-    let caps = envelope?.[CLIENT_CAPABILITIES_META_KEY] as ClientCapabilities | undefined
-    // Deprecated accessor, but the supported per-request one otherwise.
-    try {
-      caps ??= server.server.getClientCapabilities()
-    } catch {
-      return undefined
-    }
-    const elicitation = caps?.elicitation as { url?: unknown } | undefined
-    if (ctx.mcpReq.envelope !== undefined) {
-      if (elicitation?.url === undefined) return undefined
+    if (call.modern) {
+      // On 2026-07-28 the request's own envelope says what the client
+      // declared. serveStdio does not backfill the instance from it (the stdio
+      // bin saw `undefined` here and fell back to text); createMcpHandler does.
+      const envelope = ctx.mcpReq.envelope as Record<string, unknown> | undefined
+      const caps = envelope?.[CLIENT_CAPABILITIES_META_KEY] as ClientCapabilities | undefined
+      if ((caps?.elicitation as { url?: unknown } | undefined)?.url === undefined) return undefined
+      if (codec && call.round > MAX_MRTR_ROUNDS) return undefined
+      const requestState = await mint(call, [host], [interaction.code], 'url')
       return inputRequired({
         inputRequests: { connect: inputRequired.elicitUrl({ message, url }) },
+        ...(requestState ? { requestState } : {}),
       })
     }
-    if (!elicitation) return undefined
-    throw new UrlElicitationRequiredError([
-      { mode: 'url' as const, message, elicitationId: crypto.randomUUID(), url },
-    ])
+    // Remembered by the host: only a declared `elicitation.url` counts. The
+    // record may be a client that declared form mode only (Cursor), and a
+    // -32042 it does not handle is a link the person never sees.
+    const remembered = await deps.clientCapabilities?.(ctx)
+    if (remembered !== undefined) {
+      if ((remembered.elicitation as { url?: unknown } | undefined)?.url === undefined) return undefined
+    } else {
+      // This server's own initialize. Deprecated accessor, but the supported
+      // per-request one otherwise.
+      let caps: ClientCapabilities | undefined
+      try {
+        caps = server.server.getClientCapabilities()
+      } catch {
+        return undefined
+      }
+      if (!caps?.elicitation) return undefined
+    }
+    const flight = await inflight.get(host)
+    if (flight) await inflight.set(host, { ...flight, urlErrorAt: Date.now(), urlErrorTool: call.tool })
+    deps.log?.('legacy.url_error', { tool: call.tool, hosts: [host], code: interaction.code, caps_source: 'initialize' })
+    throw new UrlElicitationRequiredError(
+      [{ mode: 'url' as const, message, elicitationId: crypto.randomUUID(), url }],
+      `${message} URL: ${url} (code ${interaction.code})`,
+    )
   }
 
   // ── Resource lifecycle ──
@@ -596,7 +834,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     {
       description: describeWithL1(
         'Connect one or more AAuth resources for this person in ONE call. Pass `items`, each `{resource, account?, scopes?}` — a bare host, host:port, or full URL; the agent proxy canonicalizes.\n\n' +
-          'ONE CALL, ONE RESULT (D14): the call waits until every item has finished, reporting progress as each lands. The person works through connections one at a time in their wallet, so the proxy keeps two live at once and starts the next as each finishes — a long list does not mint many short-lived codes that expire before the person reaches them. Each item answers `connected`, `ready`, `account_required`, `still_pending`, `queued` (accepted, waiting for a live slot), `timed_out` or `error`. The call returns early in two cases: the person must open a URL (show it, then call again with the SAME items), or the wait ran out (the result carries `next`: call again with the SAME items). A repeat call resumes live items, starts queued ones, and answers finished ones without asking the resource again. Do not invoke these resources until the call has returned; if your client moves a long call to the background, wait for its result.\n\n' +
+          'ONE CALL, ONE RESULT (D14): the call waits until every item has finished, reporting progress as each lands. The person works through connections one at a time in their wallet, so the proxy keeps two live at once and starts the next as each finishes — a long list does not mint many short-lived codes that expire before the person reaches them. Each item answers `connected`, `ready`, `account_required`, `still_pending`, `queued` (accepted, waiting for a live slot), `declined` (the person declined or cancelled the authorization URL — do not include it again unless they ask), `timed_out` or `error`. The call returns early in two cases: the person must open a URL (show it, then call again with the SAME items), or the wait ran out (the result carries `next`: call again with the SAME items). A repeat call resumes live items, starts queued ones, and answers finished ones without asking the resource again. Do not invoke these resources until the call has returned; if your client moves a long call to the background, wait for its result.\n\n' +
           'Before calling: ask the person which services and which accounts. When a resource declares `account_description` (find_resources shows it), you MUST pass `account` for that item (the identifier it describes — a Google email, a GitHub username); when it does not, you MUST NOT (the account is chosen in the provider\'s own UI). An item without `account` at a resource that needs one answers `account_required` with its `account_description`, and nothing is started: call again with `account` on that item — the account the person named, or ask them which. One item per (resource × account); an already-linked account answers `ready`. `scopes` optionally narrows or widens within the resource\'s declared `connection.scopes[]` (defaults are the read set; write scopes ride the first write). Agent-token resources need no link and answer `ready`. A resource the registry lists as coming (`availability` in find_resources) is still tried; its row carries `availability`, the likely reason if it fails or if calls are later refused.',
       ),
       inputSchema: z.object({
@@ -617,10 +855,12 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       if (!c.ok) return text(BOOTSTRAP_GUIDANCE)
       const cfg = c.cfg
       const inflight = deps.connectState ?? memoryFlights(cfg)
+      const call = await beginCall('connect_resources', ctx)
       // A client that sent a progressToken gets one call for the whole list:
       // the progress notifications keep it from abandoning the call. One that
-      // did not gets the bounded slice and `next`.
-      const progressToken = ctx.mcpReq._meta?.progressToken
+      // did not gets the bounded slice, then a keepalive round (2026-07-28,
+      // with a codec) or `next`.
+      const progressToken = call.progressToken
       const deadline = Date.now() + (progressToken === undefined ? budgetMs : progressBudgetMs)
 
       // One row per item, in the order asked. `waiting` holds the items that
@@ -643,18 +883,9 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
         ...(account ? { account } : {}),
       })
 
-      // Progress, for a client that asked for it. `progress` counts
-      // notifications, not items: the spec requires it to increase with every
-      // notification, and a heartbeat moves no item. The message carries the
-      // count.
-      let sent = 0
-      const report = async (message: string): Promise<void> => {
-        if (progressToken === undefined) return
-        sent += 1
-        await ctx.mcpReq
-          .notify({ method: 'notifications/progress', params: { progressToken, progress: sent, message } })
-          .catch(() => {})
-      }
+      // Progress, for a client that asked for it. The message carries the
+      // count of finished items.
+      const report = (message: string): Promise<void> => call.report(message)
       const status = (): string => {
         const finished = rows.filter((r) => r.outcome !== 'still_pending' && r.outcome !== 'queued').length
         const on = waiting.find((w) => w.row.outcome === 'still_pending')
@@ -880,6 +1111,32 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
         return true
       }
 
+      // Pass 0 — the person declined or cancelled the URL the last round
+      // handed over (2026-07-28 `inputResponses`). Every live item that URL
+      // covered ends here, `declined`: its flight is dropped and nothing waits
+      // on it. The round's state names the code it handed over; without
+      // state, every live item whose URL went out, or is covered by one, is
+      // taken as declined. The other items continue.
+      const declined = new Set<string>()
+      const action = urlAction(ctx, 'connect')
+      if (action === 'decline' || action === 'cancel') {
+        for (const item of items) {
+          const host = canonicalizeHost(item.resource)?.host
+          if (!host || declined.has(host)) continue
+          const f = await inflight.get(host)
+          if (!f?.interaction) continue
+          const codes = call.state?.codes
+          const covered = codes
+            ? codes.includes(f.interaction.code) || (f.coveredBy !== undefined && codes.includes(f.coveredBy))
+            : f.surfaced === f.interaction.code || f.coveredBy !== undefined
+          if (!covered) continue
+          await inflight.clear(host)
+          await deps.authPending?.resolve(host)
+          declined.add(host)
+        }
+        deps.log?.('connect.declined', { tool: call.tool, hosts: [...declined], action, round: call.state?.round ?? 0 })
+      }
+
       // Pass 1 — resolve trivial items, answer finished ones, resume live ones,
       // and start new connects only up to MAX_LIVE_CONNECTS. Beyond the window
       // an item is accepted but marked `queued` and NOT started, so its
@@ -944,6 +1201,11 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
         }
 
         const host = entry.resource
+        if (declined.has(host)) {
+          row.outcome = 'declined'
+          row.detail = 'the person declined the authorization URL; include this item again only if they ask'
+          continue
+        }
         // Finished recently — answered from connectState, not the resource,
         // whose own answer may not have caught up with what it stored.
         if (inflight.getDone && doneFor(await inflight.getDone(host), item, Date.now())) {
@@ -952,7 +1214,8 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
           continue
         }
 
-        const existing = await inflight.get(host)
+        const stored = await inflight.get(host)
+        const existing = stored && (await followup(call, inflight, host, stored))
         if (existing) {
           if (Date.now() - existing.startedAt > CONNECT_MAX_MS) {
             await inflight.clear(host)
@@ -1006,12 +1269,21 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       // out at least once a slice. Each item that lands frees its slot for the
       // next held item without a round trip through the model. A retry after a
       // URL was handed over waits here, on the codes that URL covers.
-      while (!(await nextUrl()) && Date.now() < deadline) {
+      const liveHosts = (): string[] => waiting.filter((w) => w.row.outcome === 'still_pending').map((w) => w.host)
+      const holdStarted = Date.now()
+      let holding = false
+      let slices = 0
+      while (!(await nextUrl()) && Date.now() < deadline && !call.aborted()) {
         const active = waiting.filter((w) => w.row.outcome === 'still_pending')
         if (active.length === 0) break
+        if (!holding) {
+          holding = true
+          deps.log?.('hold.start', { tool: call.tool, hosts: liveHosts(), progress_token: progressToken !== undefined })
+        }
+        call.waiting(liveHosts())
         for (const { host, item, row, entry } of active) {
           const remaining = deadline - Date.now()
-          if (remaining <= 0) break
+          if (remaining <= 0 || call.aborted()) break
           const flight = await inflight.get(host)
           if (!flight || Date.now() - flight.startedAt > CONNECT_MAX_MS) {
             // Gone (cleared elsewhere, or dropped by the store's own TTL) or
@@ -1022,16 +1294,21 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
             row.detail = 'the person did not finish; include this item again to start over'
             delete row.waiting_on
           } else {
-            // Stop early on an advertised code unless this item's own URL is
-            // already out: a covered code the PS advertises needs its URL now.
+            // Stop early on an advertised code the client has not been
+            // handed: a covered code the PS advertises needs its URL now, and
+            // so does a new code in place of a handed-over one (5.8.0). The
+            // handed-over code advertised again is not a reason to stop.
             // A covered code is polled in shorter slices: the drain bound is
             // judged from poll answers, and a 25 s slice would push the second
             // URL rounds past it.
             const handed = !!flight.interaction && flight.surfaced === flight.interaction.code
             const slice = flight.coveredBy && !handed ? Math.min(POLL_SLICE_MS, drainMs / 2) : POLL_SLICE_MS
             const polled = await pollConnection(cfg, flight.interaction ?? flight.pollUrl, Math.min(remaining, slice), undefined, {
-              stopOnAdvertise: !handed,
+              stopOnAdvertise: true,
+              ...(handed ? { except: flight.surfaced } : {}),
+              signal: ctx.mcpReq.signal,
             })
+            slices += 1
             await settle(row, entry, item, polled, flight)
           }
           if (row.outcome !== 'still_pending') {
@@ -1046,6 +1323,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
         }
         await report(status())
       }
+      call.waiting(undefined)
 
       const pending = rows.filter((r) => r.outcome === 'still_pending').length
       // Accepted but not started yet — held out of the live window. They still
@@ -1062,11 +1340,39 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       }
 
       const surface = pending > 0 ? await nextUrl() : undefined
+      if (holding) {
+        deps.log?.('hold.end', {
+          tool: call.tool,
+          hosts: waiting.map((w) => w.host),
+          slices,
+          progress_sent: call.sent,
+          outcome: call.aborted() ? 'aborted' : surface ? 'url' : pending > 0 || queued > 0 ? 'deadline' : 'finished',
+          duration_ms: Date.now() - holdStarted,
+        })
+      }
+      // The client has gone: nothing is handed over that it will not see, so
+      // the next call hands the URL over itself.
+      if (call.aborted()) return json(summary)
       if (!surface) {
         // Nothing new for the person to open: everything landed, the PS is
         // reaching them by its own channels (an open wallet tab, a device), or
         // the URL is out already — then it rides along for reference rather
         // than as an instruction.
+        //
+        // Still waiting, for a 2026-07-28 client that sent no progressToken:
+        // a keepalive round instead of `next`. Its MCP client retries the
+        // same call at once and this call resumes the live items — the model
+        // never sees the wait. Up to MAX_MRTR_ROUNDS, then `next`.
+        if ((pending > 0 || queued > 0) && keepsAlive(call)) {
+          const hosts = rows.filter((r) => r.outcome === 'still_pending' || r.outcome === 'queued').map((r) => r.resource as string)
+          const codes: string[] = []
+          for (const w of waiting) {
+            if (w.row.outcome !== 'still_pending') continue
+            const code = (await inflight.get(w.host))?.interaction?.code
+            if (code) codes.push(code)
+          }
+          return keepalive(call, hosts, codes)
+        }
         const awaiting = pending > 0 ? await handedLive() : undefined
         return json(awaiting ? { ...summary, awaiting } : summary)
       }
@@ -1081,7 +1387,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       // here, with the URL already recorded as handed over.
       await deps.onInteraction?.(toSurface.url, toSurface.code, toSurface.pollUrl, () => deps.authPending?.resolve(surfaceHost))
 
-      const native = surfaceNatively(ctx, toSurface, `Authorize ${surfaceHost} — open this URL to connect, then the agent continues.`)
+      const native = await surfaceNatively(call, inflight, surfaceHost, toSurface, `Authorize ${surfaceHost} — open this URL to connect, then the agent continues.`)
       if (native) return native
 
       return text(
@@ -1246,129 +1552,165 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       const invokeArgs = { pathParams: path_params, query, body }
       const host = found.l1.resource
       const inflight = deps.connectState ?? memoryFlights(c.cfg)
+      const call = await beginCall('invoke', ctx)
 
-      // Resume before re-requesting. A flight for this host means the PS (or
-      // the resource) is already waiting on the person for it — the same
-      // store connect_resources uses, so a connect and an invoke never race
-      // each other for one host. Poll that pending for the bounded slice
-      // instead of calling again: every fresh call minted a new interaction
-      // code (four for one approval, 2026-09-14), and the code the person
-      // was looking at died under them.
-      const existing = await inflight.get(host)
-      let resumedAuthToken: string | undefined
-      if (existing) {
-        if (Date.now() - existing.startedAt > CONNECT_MAX_MS) {
-          deps.log?.('invoke.resume', { resource: host, op_id, outcome: 'abandoned', age_ms: Date.now() - existing.startedAt })
-          await inflight.clear(host)
-          await deps.authPending?.resolve(host)
-        } else {
-          const polled = await pollConnection(c.cfg, existing.interaction ?? existing.pollUrl, budgetMs)
-          if (polled.kind === 'still_pending') {
-            deps.log?.('invoke.resume', { resource: host, op_id, outcome: 'still_pending' })
-            const next: InFlight = {
-              ...existing,
-              pollUrl: polled.pollUrl,
-              ...(polled.interaction ? { interaction: polled.interaction } : {}),
-            }
-            await inflight.set(host, next)
-            return text(
-              `Authorization for ${host} is still in progress.\n\n` +
-                (next.interaction
-                  ? `The person has not finished yet. Show them the SAME authorization URL and QR code again — do not start over.\n\n${interactionText(next.interaction)}\n\nRetry invoke after they approve.`
-                  : `The person server is reaching the person directly. Retry invoke in a moment.`),
-            )
-          }
-          // Approved, or the pending is gone (declined, expired): either way
-          // the wait is over. On approval the poll response IS the delivery —
-          // keep the token it carries, or the call below asks the PS again and
-          // Hellō answers with a new code (4.5.0, 2026-09-15: every approval
-          // produced another). A dead pending starts a fresh one below.
-          if (polled.kind === 'connected') {
-            const { adopted, authToken } = await adoptSettled(c.cfg, found.l1, polled)
-            resumedAuthToken = authToken
-            deps.log?.('invoke.resume', { resource: host, op_id, outcome: 'settled', adopted })
-          } else {
-            deps.log?.('invoke.resume', { resource: host, op_id, outcome: 'gone', ...(polled.kind === 'error' ? { status: polled.status } : {}) })
-          }
-          await inflight.clear(host)
-          await deps.authPending?.resolve(host)
-        }
+      // The person declined or cancelled the URL the last round handed over:
+      // nothing is waited on, and the call ends here (5.8.0). Before, the
+      // retry waited out the slice on a refused flight.
+      const action = urlAction(ctx, 'connect')
+      if (action === 'decline' || action === 'cancel') {
+        if (await inflight.get(host)) await inflight.clear(host)
+        await deps.authPending?.resolve(host)
+        deps.log?.('invoke.declined', { tool: call.tool, hosts: [host], action, round: call.state?.round ?? 0 })
+        return text(`The person declined authorization for ${host}. Do not retry unless they ask.`)
       }
 
-      // Belt and braces for hosts without a durable flight store: an in-memory
-      // pending marker registered by the fallback path below.
-      if (await deps.authPending?.checkAndWait(host, 30_000) === 'waiting') {
-        return text(
-          `Authorization for ${host} is still in progress.\n\n` +
-          `The user has not yet completed authorization. Try again in a moment.`,
-        )
-      }
-
-      let result: InvokeResult
-      try {
-        result = await invokeAtResource(c.cfg, found.l1, op_id, invokeArgs, {
-          ...(account ? { account } : {}),
-          ...(resumedAuthToken ? { authToken: resumedAuthToken } : {}),
-        })
-      } catch (err) {
-        return text(`invoke error: ${(err as Error).message}`)
-      }
-
-      // Case (c) of the access_mode plan: recognized, and this agent cannot
-      // complete it. No request was made and none will be — say why and let the
-      // LLM route around the resource rather than retry into a 401.
-      if (result.kind === 'skipped') {
-        return text(
-          `Skipped ${result.resource} / ${result.opId}: ${result.reason}.\n\n` +
-            `This operation's access_mode is "${result.mode}". Retrying will not help. ` +
-            `Use a different resource or operation, or bootstrap an agent identity bound to a person server.`,
-        )
-      }
-
-      if (result.kind === 'pending') {
-        // The PS is reaching the person itself and had not answered in the
-        // in-call wait. Record the flight so the retry polls this pending —
-        // it delivers the token, and it re-advertises the interaction code
-        // if the PS falls back to one.
-        await inflight.set(host, { pollUrl: result.pollUrl, startedAt: Date.now() })
-        return text(
-          `Authorization for ${host} is in progress.\n\n` +
-            `The person server is asking the person directly (an open wallet tab or a device). Retry invoke now; if the person server falls back to a link, the retry returns the authorization URL to show them.`,
-        )
-      }
-
-      if (result.kind === 'interaction') {
-        // Record the flight FIRST, as handed over: the URL goes to the client
-        // below (or the host throws its own elicitation), and the retry must
-        // find the flight either way.
-        await inflight.set(host, {
-          pollUrl: result.interaction.pollUrl,
-          interaction: result.interaction,
-          startedAt: Date.now(),
-          surfaced: result.interaction.code,
-        })
+      // Hand the person a URL they have not been handed: recorded on the
+      // flight first, so the retry finds it, then natively or as text.
+      const handOverUrl = async (interaction: Interaction, startedAt: number): Promise<InputRequiredResult | ReturnType<typeof text>> => {
+        await inflight.set(host, { pollUrl: interaction.pollUrl, interaction, startedAt, surfaced: interaction.code })
         // onComplete resolves the UserStore pending-auth waiter when the poll finishes.
-        const onComplete = () => deps.authPending?.resolve(found.l1.resource)
-        await deps.onInteraction?.(result.interaction.url, result.interaction.code, result.interaction.pollUrl, onComplete)
-        await deps.authPending?.register(found.l1.resource)
+        const onComplete = () => deps.authPending?.resolve(host)
+        await deps.onInteraction?.(interaction.url, interaction.code, interaction.pollUrl, onComplete)
+        await deps.authPending?.register(host)
 
-        const native = surfaceNatively(ctx, result.interaction, `Authorize ${host} — open this URL, then call invoke again.`)
+        const native = await surfaceNatively(call, inflight, host, interaction, `Authorize ${host} — open this URL, then call invoke again.`)
         if (native) return native
 
         return text(
-          `Authorization required for ${found.l1.resource}.\n\n` +
+          `Authorization required for ${host}.\n\n` +
           `IMPORTANT: You MUST do all of the following in your response:\n` +
           `1. Display the QR code below verbatim so the user can scan it.\n` +
           `2. Show the authorization URL so the user can open it.\n` +
           `3. Offer to open the URL using browser tools if available.\n` +
           `4. After showing the URL and QR code, automatically retry invoke — the server will wait up to 30 seconds for authorization to complete before responding.\n\n` +
-          interactionText(result.interaction) + `\n\nRetry invoke now.`,
+          interactionText(interaction) + `\n\nRetry invoke now.`,
         )
       }
 
-      if (result.status >= 200 && result.status < 300) await l1.touch(found.l1.resource)
-      // budget before body: the balance stays readable when the body is large.
-      return json({ status: result.status, ...(result.budget ? { budget: result.budget } : {}), body: result.body })
+      // Resume before re-requesting. A flight for this host means the PS (or
+      // the resource) is already waiting on the person for it — the same
+      // store connect_resources uses, so a connect and an invoke never race
+      // each other for one host. Poll that pending instead of calling again:
+      // every fresh call minted a new interaction code (four for one
+      // approval, 2026-09-14), and the code the person was looking at died
+      // under them.
+      //
+      // A client that sent a progressToken is held until the pending settles
+      // (5.8.0): polled a slice at a time with progress after each, up to
+      // CONNECT_MAX_MS from the flight's start. It is answered early only
+      // when the PS advertises a code the client has not been handed — a new
+      // URL for the person. Without a progressToken, one bounded slice.
+      //
+      // Twice at most: a pending the call below leaves is held the same way.
+      let resumedAuthToken: string | undefined
+      for (let pass = 0; pass < 2; pass += 1) {
+        const stored = await inflight.get(host)
+        const existing = stored && (await followup(call, inflight, host, stored))
+        if (existing) {
+          if (Date.now() - existing.startedAt > CONNECT_MAX_MS) {
+            deps.log?.('invoke.resume', { resource: host, op_id, outcome: 'abandoned', age_ms: Date.now() - existing.startedAt })
+            await inflight.clear(host)
+            await deps.authPending?.resolve(host)
+          } else {
+            const held = await waitOnFlight(call, c.cfg, inflight, host, existing)
+            if (held.kind === 'aborted') return text(`The call was cancelled while authorization for ${host} was in progress.`)
+            if (held.kind === 'timed_out') {
+              deps.log?.('invoke.resume', { resource: host, op_id, outcome: 'abandoned', age_ms: Date.now() - existing.startedAt })
+              await inflight.clear(host)
+              await deps.authPending?.resolve(host)
+              return text(`The person did not finish authorizing ${host}. Call invoke again to start over.`)
+            }
+            const polled = held.outcome
+            if (polled.kind === 'still_pending') {
+              deps.log?.('invoke.resume', { resource: host, op_id, outcome: 'still_pending' })
+              const next: InFlight = {
+                ...(await inflight.get(host) ?? existing),
+                pollUrl: polled.pollUrl,
+                ...(polled.interaction ? { interaction: polled.interaction } : {}),
+              }
+              // The PS advertises a code the client was not handed: the person
+              // needs its URL now.
+              if (polled.advertised && next.interaction && next.interaction.code !== next.surfaced) {
+                return handOverUrl(next.interaction, next.startedAt)
+              }
+              await inflight.set(host, next)
+              return text(
+                `Authorization for ${host} is still in progress.\n\n` +
+                  (next.interaction
+                    ? `The person has not finished yet. Show them the SAME authorization URL and QR code again — do not start over.\n\n${interactionText(next.interaction)}\n\nRetry invoke after they approve.`
+                    : `The person server is reaching the person directly. Retry invoke in a moment.`),
+              )
+            }
+            // Approved, or the pending is gone (declined, expired): either way
+            // the wait is over. On approval the poll response IS the delivery —
+            // keep the token it carries, or the call below asks the PS again and
+            // Hellō answers with a new code (4.5.0, 2026-09-15: every approval
+            // produced another). A dead pending starts a fresh one below.
+            if (polled.kind === 'connected') {
+              const { adopted, authToken } = await adoptSettled(c.cfg, found.l1, polled)
+              resumedAuthToken = authToken
+              deps.log?.('invoke.resume', { resource: host, op_id, outcome: 'settled', adopted })
+            } else {
+              deps.log?.('invoke.resume', { resource: host, op_id, outcome: 'gone', ...(polled.kind === 'error' ? { status: polled.status } : {}) })
+            }
+            await inflight.clear(host)
+            await deps.authPending?.resolve(host)
+          }
+        }
+
+        // Belt and braces for hosts without a durable flight store: an in-memory
+        // pending marker registered by the fallback path below.
+        if (await deps.authPending?.checkAndWait(host, 30_000) === 'waiting') {
+          return text(
+            `Authorization for ${host} is still in progress.\n\n` +
+            `The user has not yet completed authorization. Try again in a moment.`,
+          )
+        }
+
+        let result: InvokeResult
+        try {
+          result = await invokeAtResource(c.cfg, found.l1, op_id, invokeArgs, {
+            ...(account ? { account } : {}),
+            ...(resumedAuthToken ? { authToken: resumedAuthToken } : {}),
+          })
+        } catch (err) {
+          return text(`invoke error: ${(err as Error).message}`)
+        }
+        resumedAuthToken = undefined
+
+        // Case (c) of the access_mode plan: recognized, and this agent cannot
+        // complete it. No request was made and none will be — say why and let the
+        // LLM route around the resource rather than retry into a 401.
+        if (result.kind === 'skipped') {
+          return text(
+            `Skipped ${result.resource} / ${result.opId}: ${result.reason}.\n\n` +
+              `This operation's access_mode is "${result.mode}". Retrying will not help. ` +
+              `Use a different resource or operation, or bootstrap an agent identity bound to a person server.`,
+          )
+        }
+
+        if (result.kind === 'pending') {
+          // The PS is reaching the person itself and had not answered in the
+          // in-call wait. Record the flight so the retry polls this pending —
+          // it delivers the token, and it re-advertises the interaction code
+          // if the PS falls back to one. A call that is held waits on it here.
+          await inflight.set(host, { pollUrl: result.pollUrl, startedAt: Date.now() })
+          if (call.progressToken !== undefined && pass === 0) continue
+          return text(
+            `Authorization for ${host} is in progress.\n\n` +
+              `The person server is asking the person directly (an open wallet tab or a device). Retry invoke now; if the person server falls back to a link, the retry returns the authorization URL to show them.`,
+          )
+        }
+
+        if (result.kind === 'interaction') return handOverUrl(result.interaction, Date.now())
+
+        if (result.status >= 200 && result.status < 300) await l1.touch(found.l1.resource)
+        // budget before body: the balance stays readable when the body is large.
+        return json({ status: result.status, ...(result.budget ? { budget: result.budget } : {}), body: result.body })
+      }
+      // Unreachable: the second pass returns on every branch.
+      return text(`Authorization for ${host} is still in progress. Retry invoke in a moment.`)
     },
   )
 

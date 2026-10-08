@@ -50,6 +50,31 @@
 //                       delivered — names only), status? (gone), age_ms?
 //                       (abandoned)
 //
+// The waits around an authorization (5.8.0, MRTR-PLAN.md). `hosts` are the
+// resource hosts the call waits on; `round` is the multi-round-trip round
+// (0 before the first `input_required`).
+//
+//   mrtr.input_required — an `input_required` result goes back. tool, kind
+//                       (url | keepalive), round, hosts, codes, ms_since_round_1
+//   mrtr.retry        — a request echoes the proxy's requestState. tool,
+//                       round (the echoed one), ms_since_previous,
+//                       input_responses? (key → accept | decline | cancel)
+//   legacy.url_error  — the URL goes to a 2025-era client as -32042. tool,
+//                       hosts, code, caps_source (initialize)
+//   legacy.followup   — a later call resumes a flight whose URL went out as
+//                       -32042. tool, hosts, ms_since_url_error, same_tool
+//   hold.start        — a call starts holding on the person. tool, hosts,
+//                       progress_token (boolean)
+//   hold.end          — tool, hosts, slices (polls), progress_sent, outcome
+//                       (invoke: settled | gone | url | timed_out | aborted;
+//                       connect_resources: finished | url | deadline |
+//                       aborted), duration_ms
+//   call.aborted      — the request's abort signal fired during a hold or a
+//                       poll: the client stopped listening. tool, hosts,
+//                       ms_since_start, progress_sent, last_progress_ms_ago?
+//   connect.declined / invoke.declined — the person declined or cancelled
+//                       the URL; the wait ends. tool, hosts, action, round
+//
 // `aauth.call` carries the call's content: bodies up to 8 KB and the query
 // (Dick, 2026-09-28: the call log sends bodies if small). A token in it is
 // `{ type, payload }` — the claims, never the JWT — and the opaque session
