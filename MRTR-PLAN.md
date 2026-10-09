@@ -1,7 +1,7 @@
 # Holding the tool call until the work is done
 
-Status: steps 1–3 implemented in `@aauth/proxy` 5.8.0 and `hellocoop/aauth-mcp`,
-2026-10-08. They ship together, straight to production; no beta trial. Repos:
+Status: steps 1–3 implemented in `@aauth/proxy` 5.8.0, published as 5.8.1, and
+`hellocoop/aauth-mcp`, 2026-10-08. They ship together, straight to production; no beta trial. Repos:
 `aauth-dev/proxy` and `hellocoop/aauth-mcp`. No SDK fork. See "Implementation
 notes" at the end for where the code differs from this design.
 
@@ -283,4 +283,7 @@ need a redesign.
   only at the end of its slice.
 - **An aborted call stops polling** within one poll (`pollConnection`
   `signal`) and hands nothing over.
+- **Published as 5.8.1.** The v5.8.0 publish run failed on a test-harness
+  race (the 60 s hold test's fake clock outran real async work on CI), so
+  5.8.0 never reached npm. 5.8.1 is 5.8.0 with that test fixed.
 

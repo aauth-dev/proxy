@@ -32,7 +32,7 @@
 // re-advertises it or no browser has taken it from the head of the queue.
 // invoke hands its URL over natively too.
 //
-// 5.8.0 (MRTR-PLAN.md): answer the client only when the person has a URL to
+// 5.8.0 (MRTR-PLAN.md; first published as 5.8.1): answer the client only when the person has a URL to
 // open that the client has not been handed, or when the work is finished.
 // invoke holds a call with a progressToken until the authorization settles,
 // as connect_resources already did. A declined or cancelled URL ends the wait

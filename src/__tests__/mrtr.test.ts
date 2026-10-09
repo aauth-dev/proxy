@@ -91,8 +91,8 @@ function memoryL1(entries: L1Entry[]): L1Store {
  * `personToken` issues person tokens at once, so only the connect's own
  * exchange mints a code.
  */
-function fakePS(opts: { interaction?: boolean; personToken?: boolean; poll: (code: string, n: number) => Response }) {
-  const state = { codes: 0, called: 0 }
+function fakePS(opts: { interaction?: boolean; personToken?: boolean; latency?: () => Promise<void>; poll: (code: string, n: number) => Response }) {
+  const state = { codes: 0, called: 0, polls: 0 }
   const polls = new Map<string, number>()
   const mint = () => {
     state.codes += 1
@@ -109,6 +109,8 @@ function fakePS(opts: { interaction?: boolean; personToken?: boolean; poll: (cod
       return (init?.method ?? 'GET') === 'POST' ? makeResponse(200, { resource_token: 'rt' }) : makeResponse(200, { connections: [] })
     }
     if (url.startsWith(`${PS}/pending/`)) {
+      await opts.latency?.()
+      state.polls += 1
       const n = (polls.get(url) ?? 0) + 1
       polls.set(url, n)
       return opts.poll(url.slice(`${PS}/pending/`.length), n)
@@ -311,10 +313,20 @@ describe('step 1: capabilities a 2025-era client declared on initialize', () => 
 })
 
 describe('step 2: invoke holds the call; a declined URL ends it', () => {
+  // The clock is fake, but the work between timers is not: signing, the call
+  // log's hashing and the state's HMAC finish on real time. The clock moves
+  // one poll interval only after the poll before it has landed — advancing it
+  // freely let fake time outrun a slow runner (CI, Node 24) and time the call
+  // out before the first progress went out. The PS answers each poll a few
+  // real milliseconds late to keep the test honest about that.
   it('holds across a 60 s approval with progress: one URL, one result', async () => {
+    const realSetTimeout = globalThis.setTimeout
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] })
     const approveAt = Date.now() + 60_000
-    const ps = fakePS({ poll: () => (Date.now() >= approveAt ? approved() : stillPending()) })
+    const ps = fakePS({
+      latency: () => new Promise((r) => realSetTimeout(r, 5)),
+      poll: () => (Date.now() >= approveAt ? approved() : stillPending()),
+    })
     const codec = newCodec()
     const { client, opened, logged, wire, close } = await connect({
       era: 'modern',
@@ -330,7 +342,17 @@ describe('step 2: invoke holds the call; a declined URL ends it', () => {
       const pending = client
         .callTool(invokeWhoami, { onprogress: (p) => void progress.push(p.message ?? ''), timeout: 60_000, resetTimeoutOnProgress: true })
         .finally(() => void (settled = true))
-      while (!settled) await vi.advanceTimersByTimeAsync(1_000)
+      // Real time passes until `done` holds or the call settles.
+      const until = async (done: () => boolean): Promise<void> => {
+        const giveUp = performance.now() + 10_000
+        while (!done() && !settled && performance.now() < giveUp) await new Promise((r) => setImmediate(r))
+      }
+      await until(() => ps.polls >= 1)
+      while (!settled) {
+        const before = ps.polls
+        await vi.advanceTimersByTimeAsync(1_000)
+        await until(() => ps.polls > before)
+      }
       const result = await pending
 
       expect(JSON.parse(textOf(result))).toEqual({ status: 200, body: { ok: true } })
