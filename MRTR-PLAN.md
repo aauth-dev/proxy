@@ -203,6 +203,7 @@ protocol era, and `commit`.
 | `mrtr.retry` | a request arrives carrying our state | tool, round, ms since the previous round, `input_responses` actions |
 | `legacy.url_error` | proxy throws -32042 | tool, hosts, code, `caps_source` |
 | `legacy.followup` | a fresh call resumes a flight whose URL went out as -32042 | ms since the -32042, same tool (bool) |
+| `mrtr.url_unanswered` | a fresh 2026-07-28 call resumes a flight whose URL went out as an `input_required` elicitation the client never answered (5.8.2) | tool, hosts, ms since the elicitation |
 | `hold.start` / `hold.end` | `invoke` or `connect_resources` holds a call | tool, hosts, slices, progress sent, outcome, duration ms |
 | `call.aborted` | `ctx.mcpReq.signal` fires during a hold or poll | tool, ms since start, progress sent (count), last progress ms ago |
 | `connect.declined` / `invoke.declined` | a decline or cancel ends a wait | tool, hosts, action, round |
@@ -287,3 +288,19 @@ need a redesign.
   race (the 60 s hold test's fake clock outran real async work on CI), so
   5.8.0 never reached npm. 5.8.1 is 5.8.0 with that test fixed.
 
+## 5.8.2: clients that cannot read the URL elicitation
+
+Codex 0.162 with its `mcp_2026_07_28` feature on (2026-10-09) failed every
+`connect_resources` that handed it a URL: rmcp, its MCP library, requires
+`elicitationId` on a URL elicitation (`elicitation_id: String`), and
+2026-07-28 dropped the field. The call failed before any prompt; the model
+called again 2 s later with no state, and that call waited on a URL the
+person never saw.
+
+- **`elicitationId` is sent anyway**, set to the interaction code. A
+  2026-07-28 client ignores it; a client that requires it can read the prompt.
+- **An unanswered URL is handed over again, as text.** A URL elicitation marks
+  its flight (`elicitedAt`). A call that answers the round (requestState or
+  inputResponses) clears the mark. A fresh 2026-07-28 call that finds the mark
+  logs `mrtr.url_unanswered` and hands the URL over again as text with a QR
+  code, for `connect_resources` and `invoke`.

@@ -212,6 +212,13 @@ export interface ConnectFlight {
    */
   urlErrorAt?: number
   urlErrorTool?: string
+  /**
+   * When this item's URL went to a 2026-07-28 client as an `input_required`
+   * URL elicitation. A call that answers the round (requestState or
+   * inputResponses) clears it; a fresh call that does not means the client
+   * never showed the prompt, and the URL is handed over again as text.
+   */
+  elicitedAt?: number
 }
 
 // An item that finished connecting: `connected`, or the resource said it
@@ -593,6 +600,14 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       state,
       // The round an `input_required` returned now would be.
       round: (state?.round ?? 0) + 1,
+      // This request answers an `input_required` round: it echoes a
+      // requestState (verifiable or not) or carries inputResponses.
+      answersRound:
+        ctx.mcpReq.requestState<unknown>() !== undefined ||
+        ctx.mcpReq.inputResponses !== undefined ||
+        (ctx.mcpReq.droppedInputResponseKeys?.length ?? 0) > 0,
+      // Set when this call hands its URL over as text, not natively.
+      urlAsText: false,
       get sent() {
         return sent
       },
@@ -647,6 +662,27 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
     const { urlErrorAt: _a, urlErrorTool: _t, ...rest } = flight
     await inflight.set(host, rest)
     return rest
+  }
+
+  // A flight whose URL went out as an `input_required` URL elicitation. A call
+  // that answers the round clears the mark. A fresh 2026-07-28 call that does
+  // not means the client never showed the prompt: Codex 0.162 with
+  // `mcp_2026_07_28` failed the whole call on a URL elicitation without
+  // `elicitationId` and its model called again (2026-10-09), and the resumed
+  // call waited on a URL the person never saw. The URL is handed over again,
+  // as text.
+  async function unanswered(call: Call, inflight: FlightStore, host: string, flight: InFlight): Promise<InFlight> {
+    if (flight.elicitedAt === undefined) return flight
+    const { elicitedAt, ...rest } = flight
+    if (call.answersRound || !call.modern) {
+      await inflight.set(host, rest)
+      return rest
+    }
+    deps.log?.('mrtr.url_unanswered', { tool: call.tool, hosts: [host], ms_since_elicited: Date.now() - elicitedAt })
+    call.urlAsText = true
+    const { surfaced: _s, ...again } = rest
+    await inflight.set(host, again)
+    return again
   }
 
   // invoke's wait on an in-flight authorization. Held, for a client that sent
@@ -745,6 +781,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
   ): Promise<InputRequiredResult | undefined> {
     const { ctx } = call
     const url = `${interaction.url}?code=${interaction.code}`
+    if (call.urlAsText) return undefined
     if (call.modern) {
       // On 2026-07-28 the request's own envelope says what the client
       // declared. serveStdio does not backfill the instance from it (the stdio
@@ -754,8 +791,14 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       if ((caps?.elicitation as { url?: unknown } | undefined)?.url === undefined) return undefined
       if (codec && call.round > MAX_MRTR_ROUNDS) return undefined
       const requestState = await mint(call, [host], [interaction.code], 'url')
+      const flight = await inflight.get(host)
+      if (flight) await inflight.set(host, { ...flight, elicitedAt: Date.now() })
+      // 2026-07-28 dropped `elicitationId` from URL mode; clients built on
+      // rmcp (Codex) still require it and fail the call without it. Sent
+      // anyway: a client of either revision reads it or ignores it.
+      const elicit = inputRequired.elicitUrl({ message, url, elicitationId: interaction.code } as Parameters<typeof inputRequired.elicitUrl>[0])
       return inputRequired({
-        inputRequests: { connect: inputRequired.elicitUrl({ message, url }) },
+        inputRequests: { connect: elicit },
         ...(requestState ? { requestState } : {}),
       })
     }
@@ -1215,7 +1258,7 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
         }
 
         const stored = await inflight.get(host)
-        const existing = stored && (await followup(call, inflight, host, stored))
+        const existing = stored && (await unanswered(call, inflight, host, await followup(call, inflight, host, stored)))
         if (existing) {
           if (Date.now() - existing.startedAt > CONNECT_MAX_MS) {
             await inflight.clear(host)
@@ -1236,6 +1279,9 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
           row.outcome = 'still_pending'
           row.waiting_on = entry.connection.upstream_name ?? 'the upstream'
           waiting.push({ host, item, row, entry })
+          // The client never showed the URL it was handed (unanswered): the
+          // person needs it now, not after a poll slice.
+          if (call.urlAsText && existing.interaction && existing.surfaced === undefined) seen.add(host)
           continue
         }
 
@@ -1606,12 +1652,15 @@ export async function buildProxyTools(server: McpServer, deps: ProxyDeps): Promi
       let resumedAuthToken: string | undefined
       for (let pass = 0; pass < 2; pass += 1) {
         const stored = await inflight.get(host)
-        const existing = stored && (await followup(call, inflight, host, stored))
+        const existing = stored && (await unanswered(call, inflight, host, await followup(call, inflight, host, stored)))
         if (existing) {
           if (Date.now() - existing.startedAt > CONNECT_MAX_MS) {
             deps.log?.('invoke.resume', { resource: host, op_id, outcome: 'abandoned', age_ms: Date.now() - existing.startedAt })
             await inflight.clear(host)
             await deps.authPending?.resolve(host)
+          } else if (call.urlAsText && existing.interaction && existing.surfaced === undefined) {
+            // The client never showed the URL it was handed (unanswered).
+            return handOverUrl(existing.interaction, existing.startedAt)
           } else {
             const held = await waitOnFlight(call, c.cfg, inflight, host, existing)
             if (held.kind === 'aborted') return text(`The call was cancelled while authorization for ${host} was in progress.`)

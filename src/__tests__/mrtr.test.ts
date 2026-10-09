@@ -142,7 +142,9 @@ async function connect(opts: {
   era: 'modern' | 'legacy'
   l1: L1Store
   capabilities?: ClientCapabilities
-  elicit?: 'accept' | 'decline' | 'cancel'
+  // `fail`: the client cannot read the elicitation and fails the call, as
+  // Codex 0.162 did with no `elicitationId` (rmcp requires it).
+  elicit?: 'accept' | 'decline' | 'cancel' | 'fail'
   codec?: ReturnType<typeof newCodec>
   clientCapabilities?: (ctx: ServerContext) => Promise<ClientCapabilities | undefined>
 }) {
@@ -177,6 +179,7 @@ async function connect(opts: {
   const opened: string[] = []
   if (opts.capabilities?.elicitation) {
     client.setRequestHandler('elicitation/create' as never, (async (req: { params: { url?: string } }) => {
+      if (opts.elicit === 'fail') throw new Error('invalid MCP tool input request')
       opened.push(req.params.url ?? '')
       return { action: opts.elicit ?? 'accept' }
     }) as never)
@@ -598,6 +601,105 @@ describe('step 3: keepalive rounds for a 2026-07-28 client that sent no progress
       vi.setSystemTime(now + 901_000)
       const expired = (await callWith(minted)) as { code?: number }
       expect(expired.code).toBe(-32602)
+    } finally {
+      await close()
+    }
+  })
+})
+
+describe('5.8.2: clients that cannot read the URL elicitation', () => {
+  const one = { name: 'connect_resources', arguments: { items: [{ resource: 'gmail.example' }] } }
+
+  // What rmcp (Codex's MCP library) requires of a URL elicitation: its
+  // `ElicitRequestParamsWire::Url` has `elicitation_id: String`, not optional.
+  const rmcpReadsUrl = (req: unknown): boolean => {
+    const r = req as { method?: unknown; params?: Record<string, unknown> }
+    const p = r.params ?? {}
+    return r.method === 'elicitation/create' && p.mode === 'url' &&
+      typeof p.message === 'string' && typeof p.url === 'string' && typeof p.elicitationId === 'string'
+  }
+
+  it('a URL elicitation carries elicitationId (the code), so rmcp can read it', async () => {
+    fakePS({ poll: () => stillPending() })
+    const { client, wire, close } = await connect({
+      era: 'modern',
+      l1: memoryL1([entry('gmail.example', true)]),
+      capabilities: URL_CAPS,
+      elicit: 'decline',
+      codec: newCodec(),
+    })
+    try {
+      await client.callTool(one)
+      const [round] = inputRequiredResults(wire)
+      const request = (round.inputRequests as Record<string, unknown>).connect
+      expect(rmcpReadsUrl(request)).toBe(true)
+      expect(request).toMatchObject({ params: { url: `${PS}/auth?code=CODE-1`, elicitationId: 'CODE-1' } })
+    } finally {
+      await close()
+    }
+  })
+
+  it('connect_resources: a client that failed the prompt and calls again gets the URL as text', async () => {
+    fakePS({ poll: () => stillPending() })
+    const { client, logged, wire, close } = await connect({
+      era: 'modern',
+      l1: memoryL1([entry('gmail.example', true)]),
+      capabilities: URL_CAPS,
+      elicit: 'fail',
+      codec: newCodec(),
+    })
+    try {
+      await expect(client.callTool(one)).rejects.toThrow()
+      expect(inputRequiredResults(wire)).toHaveLength(1)
+      // The model calls again, fresh: no requestState, no inputResponses.
+      const result = await client.callTool(one)
+      expect(textOf(result)).toContain(`${PS}/auth?code=CODE-1`)
+      expect(inputRequiredResults(wire)).toHaveLength(1)
+      expect(events(logged, 'mrtr.url_unanswered')).toEqual([
+        { event: 'mrtr.url_unanswered', tool: 'connect_resources', hosts: ['gmail.example'], ms_since_elicited: expect.any(Number) },
+      ])
+      // Handed over again, it is marked handed: a third call waits on it.
+      const third = await client.callTool(one)
+      expect(summaryOf(third).results.map((r) => r.outcome)).toEqual(['still_pending'])
+      expect(textOf(third)).not.toContain('IMPORTANT')
+    } finally {
+      await close()
+    }
+  }, 20_000)
+
+  it('invoke: a client that failed the prompt and calls again gets the URL as text', async () => {
+    fakePS({ poll: () => stillPending() })
+    const { client, logged, wire, close } = await connect({
+      era: 'modern',
+      l1: memoryL1([entry('gmail.example')]),
+      capabilities: URL_CAPS,
+      elicit: 'fail',
+      codec: newCodec(),
+    })
+    try {
+      await expect(client.callTool(invokeWhoami)).rejects.toThrow()
+      const result = await client.callTool(invokeWhoami)
+      expect(textOf(result)).toContain(`${PS}/auth?code=CODE-1`)
+      expect(inputRequiredResults(wire)).toHaveLength(1)
+      expect(events(logged, 'mrtr.url_unanswered')).toHaveLength(1)
+    } finally {
+      await close()
+    }
+  })
+
+  it('a client that answers the round is not taken as unanswered', async () => {
+    fakePS({ poll: (_c, n) => (n < 2 ? stillPending() : approved()) })
+    const { client, logged, close } = await connect({
+      era: 'modern',
+      l1: memoryL1([entry('gmail.example')]),
+      capabilities: URL_CAPS,
+      elicit: 'accept',
+      codec: newCodec(),
+    })
+    try {
+      const result = await client.callTool(invokeWhoami)
+      expect(JSON.parse(textOf(result))).toMatchObject({ status: 200 })
+      expect(events(logged, 'mrtr.url_unanswered')).toEqual([])
     } finally {
       await close()
     }
